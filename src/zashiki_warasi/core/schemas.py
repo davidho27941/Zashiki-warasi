@@ -1,1 +1,48 @@
-"""Shared data models (email payloads, agent state, etc.)."""
+"""Shared data models passed between Gmail layer and agents."""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class AttachmentMeta(BaseModel):
+    """Metadata for an attachment; bytes fetched on demand via GmailClient."""
+
+    model_config = ConfigDict(frozen=True)
+
+    attachment_id: str
+    filename: str
+    mime_type: str
+    size: int
+
+
+class EmailMessage(BaseModel):
+    """Parsed Gmail message ready for agent consumption."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: str
+    thread_id: str
+    history_id: int
+    from_address: str
+    to_addresses: list[str] = Field(default_factory=list)
+    cc_addresses: list[str] = Field(default_factory=list)
+    subject: str = ""
+    snippet: str = ""
+    body_plain: str | None = None
+    body_html: str | None = None
+    received_at: datetime
+    labels: list[str] = Field(default_factory=list)
+    attachments: list[AttachmentMeta] = Field(default_factory=list)
+    raw_headers: dict[str, str] = Field(default_factory=dict)
+
+
+class ProfileInfo(BaseModel):
+    """Gmail account profile used to baseline history polling."""
+
+    model_config = ConfigDict(frozen=True)
+
+    email: str
+    history_id: int
