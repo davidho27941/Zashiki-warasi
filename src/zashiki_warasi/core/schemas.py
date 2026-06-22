@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -46,3 +47,26 @@ class ProfileInfo(BaseModel):
 
     email: str
     history_id: int
+
+
+class EmailAnalysis(BaseModel):
+    """LLM-produced summary and classification of a single email.
+
+    Used as the structured output schema for the analyze node; the same
+    fields are persisted to the `email_analyses` table.
+    """
+
+    category: Literal[
+        "work",
+        "personal",
+        "promotional",
+        "newsletter",
+        "transactional",
+        "other",
+    ] = Field(description="High-level intent / kind of message.")
+    importance: Literal["high", "medium", "low"] = Field(
+        description="How urgently the user should act on this email."
+    )
+    summary: str = Field(
+        description="One to two sentences capturing the key point.",
+    )

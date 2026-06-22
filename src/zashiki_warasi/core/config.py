@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -50,3 +51,18 @@ class DatabaseSettings(BaseSettings):
         default="postgresql+psycopg://localhost/zashiki_warasi",
         alias="DATABASE_URL",
     )
+
+
+class LLMSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="LLM_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    provider: Literal["llamacpp", "openai", "anthropic"] = "llamacpp"
+    base_url: str = "http://localhost:8080/v1"
+    api_key: str = "not-needed"
+    model: str = "local-model"
+    temperature: float = 0.2
