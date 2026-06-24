@@ -53,3 +53,6 @@ Thumbs.db
 
 # Local notes / lessons learned (kept out of public repo)
 docs/lessons/
+
+# Local debugging / diagnostic scripts
+scripts/
