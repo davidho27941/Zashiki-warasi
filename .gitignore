@@ -50,3 +50,6 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local notes / lessons learned (kept out of public repo)
+docs/lessons/
