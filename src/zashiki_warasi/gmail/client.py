@@ -98,7 +98,7 @@ class GmailClient:
             )
             .execute()
         )
-        return base64.urlsafe_b64decode(raw["data"])
+        return base64.urlsafe_b64decode(raw["data"] + "==")
 
     # ---------- Infrastructure (used by poller) ----------
 
