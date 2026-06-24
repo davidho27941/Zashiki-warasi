@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEFAULT_SCOPES: list[str] = [
     "https://www.googleapis.com/auth/gmail.readonly",
@@ -25,7 +25,9 @@ class GmailSettings(BaseSettings):
     token_path: Path = Field(
         default=Path("~/.config/zashiki-warasi/token.json"),
     )
-    scopes: list[str] = Field(default_factory=lambda: list(DEFAULT_SCOPES))
+    scopes: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: list(DEFAULT_SCOPES)
+    )
 
     @field_validator("credentials_path", "token_path")
     @classmethod
