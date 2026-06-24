@@ -2,11 +2,16 @@
 
 Wires Gmail credentials -> GmailClient -> EmailAgent (with LangGraph
 PostgresSaver checkpointer) -> Poller, then blocks on the polling loop.
+SIGINT / SIGTERM are caught and turned into a graceful shutdown so the
+message currently being processed always gets its `processed_messages`
+row written before exit.
 """
 
 from __future__ import annotations
 
 import logging
+import signal
+import threading
 
 from langgraph.checkpoint.postgres import PostgresSaver
 
@@ -25,11 +30,43 @@ def _libpq_url(sqlalchemy_url: str) -> str:
     return sqlalchemy_url.replace("postgresql+psycopg://", "postgresql://", 1)
 
 
+def _install_shutdown_handlers(stop_event: threading.Event) -> None:
+    """SIGINT/SIGTERM -> set `stop_event`; second SIGINT forces exit."""
+    state = {"sigint_count": 0}
+
+    def handler(signum: int, _frame) -> None:
+        name = signal.Signals(signum).name
+        if signum == signal.SIGINT:
+            state["sigint_count"] += 1
+            if state["sigint_count"] >= 2:
+                logger.warning(
+                    f"{name} received again; restoring default handler "
+                    "and forcing exit"
+                )
+                signal.signal(signal.SIGINT, signal.default_int_handler)
+                raise KeyboardInterrupt
+            logger.warning(
+                f"{name} received; finishing current message, then "
+                "exiting. Press Ctrl+C again to force quit."
+            )
+        else:
+            logger.warning(
+                f"{name} received; finishing current message, then exiting"
+            )
+        stop_event.set()
+
+    signal.signal(signal.SIGINT, handler)
+    signal.signal(signal.SIGTERM, handler)
+
+
 def run() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    stop_event = threading.Event()
+    _install_shutdown_handlers(stop_event)
 
     credentials = get_credentials()
     client = GmailClient(credentials)
@@ -46,5 +83,6 @@ def run() -> None:
             client=client,
             session_factory=session_factory,
             handler=agent.handle_email,
+            stop_event=stop_event,
         )
         poller.run()

@@ -8,7 +8,7 @@ LangGraph's checkpointer keyed by message_id to make this true).
 from __future__ import annotations
 
 import logging
-import time
+import threading
 from typing import Callable
 
 from sqlalchemy.orm import sessionmaker
@@ -47,20 +47,35 @@ class Poller:
         session_factory: sessionmaker,
         handler: EmailHandler,
         interval_seconds: int = 30,
+        stop_event: threading.Event | None = None,
     ) -> None:
         self._client = client
         self._session_factory = session_factory
         self._handler = handler
         self._interval = interval_seconds
+        # Exposed publicly so the app entry point can `stop_event.set()`
+        # from a signal handler without holding a reference to a private
+        # attribute.
+        self.stop_event = stop_event or threading.Event()
 
     def run(self) -> None:
-        """Block forever, polling Gmail at the configured interval."""
+        """Poll Gmail until `stop_event` is set, then return cleanly.
+
+        Shutdown points:
+          - before each tick
+          - between messages within a tick
+          - during the inter-tick sleep (Event.wait wakes immediately
+            when the event is set)
+
+        The message currently being processed always runs to completion
+        so its `processed_messages` row is written before exit.
+        """
         profile = self._client.get_profile()
         email = profile.email
         logger.info(f"Poller starting for {email}")
         self._baseline_if_needed(email, profile.history_id)
 
-        while True:
+        while not self.stop_event.is_set():
             try:
                 self._tick(email)
             except HistoryExpiredError as exc:
@@ -71,7 +86,10 @@ class Poller:
                 self._rebaseline(email)
             except Exception:
                 logger.exception("Unhandled error during tick; will retry")
-            time.sleep(self._interval)
+            if self.stop_event.wait(timeout=self._interval):
+                break
+
+        logger.info(f"Poller stopped for {email}")
 
     # ----- Branch A: first-run baseline -----
 
@@ -107,6 +125,11 @@ class Poller:
         max_history_id = start
         processed_count = 0
         for msg_id in self._client.list_history(start):
+            if self.stop_event.is_set():
+                logger.info(
+                    "Stop requested; aborting tick before next message"
+                )
+                break
             message = self._process_message(msg_id)
             if message is not None:
                 processed_count += 1

@@ -388,3 +388,152 @@ class TestProcessMessage:
             "msg-x"
         )
         assert poller._process_message("msg-x") is None
+
+
+# ---------- graceful shutdown ----------
+
+
+class TestGracefulShutdown:
+    def test_default_stop_event_created_when_none_passed(
+        self, mock_client, session_factory, mock_handler
+    ):
+        import threading
+
+        poller = Poller(
+            client=mock_client,
+            session_factory=session_factory,
+            handler=mock_handler,
+        )
+        assert isinstance(poller.stop_event, threading.Event)
+        assert not poller.stop_event.is_set()
+
+    def test_external_stop_event_is_used(
+        self, mock_client, session_factory, mock_handler
+    ):
+        import threading
+
+        event = threading.Event()
+        poller = Poller(
+            client=mock_client,
+            session_factory=session_factory,
+            handler=mock_handler,
+            stop_event=event,
+        )
+        assert poller.stop_event is event
+
+    def test_run_exits_immediately_when_stop_event_preset(
+        self, mock_client, session_factory, mock_handler
+    ):
+        import threading
+
+        event = threading.Event()
+        event.set()  # request shutdown before run starts
+        poller = Poller(
+            client=mock_client,
+            session_factory=session_factory,
+            handler=mock_handler,
+            interval_seconds=999,  # would hang for ages if not for event
+            stop_event=event,
+        )
+
+        # Baseline still happens (it precedes the loop check), but the
+        # loop body must not execute and run() must return.
+        poller.run()
+
+        mock_client.get_profile.assert_called()  # baseline
+        mock_client.list_history.assert_not_called()  # no tick
+
+    def test_tick_stops_between_messages_when_event_set(
+        self, mock_client, session_factory, mock_handler
+    ):
+        # Baseline so _tick has a cursor to read.
+        with session_factory() as session:
+            session.add(
+                GmailSyncState(email_address=EMAIL, history_id=500)
+            )
+            session.commit()
+
+        mock_client.list_history.return_value = iter(
+            ["msg-1", "msg-2", "msg-3"]
+        )
+        mock_client.get_message.side_effect = [
+            _make_email("msg-1", 600),
+            _make_email("msg-2", 601),
+            _make_email("msg-3", 602),
+        ]
+
+        import threading
+
+        event = threading.Event()
+        poller = Poller(
+            client=mock_client,
+            session_factory=session_factory,
+            handler=mock_handler,
+            stop_event=event,
+        )
+        # Set stop after the handler processes msg-1.
+        mock_handler.side_effect = lambda _email: event.set()
+
+        poller._tick(EMAIL)
+
+        # msg-1 fully processed (handler called, processed_messages row).
+        # msg-2 and msg-3 skipped — handler called exactly once.
+        assert mock_handler.call_count == 1
+        assert "msg-1" in _processed_ids(session_factory)
+        assert "msg-2" not in _processed_ids(session_factory)
+
+    def test_run_loop_does_not_start_new_tick_after_stop(
+        self, mock_client, session_factory, mock_handler
+    ):
+        import threading
+
+        event = threading.Event()
+        poller = Poller(
+            client=mock_client,
+            session_factory=session_factory,
+            handler=mock_handler,
+            interval_seconds=999,
+            stop_event=event,
+        )
+
+        tick_count = {"n": 0}
+        real_tick = poller._tick
+
+        def counting_tick(email):
+            tick_count["n"] += 1
+            event.set()  # ask to stop after this tick
+            return real_tick(email)
+
+        poller._tick = counting_tick  # type: ignore[assignment]
+        poller.run()
+
+        assert tick_count["n"] == 1  # exactly one tick, then exit
+
+    def test_stop_event_wakes_inter_tick_sleep(
+        self, mock_client, session_factory, mock_handler
+    ):
+        """If the loop is sleeping between ticks, setting the event must
+        wake Event.wait() instead of waiting out the full interval."""
+        import threading
+        import time
+
+        event = threading.Event()
+        poller = Poller(
+            client=mock_client,
+            session_factory=session_factory,
+            handler=mock_handler,
+            interval_seconds=30,  # huge — should NOT wait this long
+            stop_event=event,
+        )
+
+        # Set the event from a background thread shortly after run starts.
+        threading.Timer(0.1, event.set).start()
+
+        start = time.monotonic()
+        poller.run()
+        elapsed = time.monotonic() - start
+
+        assert elapsed < 2.0, (
+            f"run() took {elapsed:.2f}s — sleep was not interrupted by the "
+            "stop event"
+        )
