@@ -68,3 +68,29 @@ class LLMSettings(BaseSettings):
     api_key: str = "not-needed"
     model: str = "local-model"
     temperature: float = 0.2
+
+
+class TelegramSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="TELEGRAM_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    bot_token: str = Field(
+        default="",
+        description="Bot token from BotFather (e.g. 1234567890:ABC...).",
+    )
+    chat_id: str = Field(
+        default="",
+        description=(
+            "Destination chat: a numeric user/group id, a negative "
+            "channel id, or '@channelusername'."
+        ),
+    )
+    api_base: str = Field(
+        default="https://api.telegram.org",
+        description="Override only for testing or self-hosted bridges.",
+    )
+    timeout_seconds: float = 10.0

@@ -1,7 +1,8 @@
-"""LangGraph email agent: classify + summarize, checkpointed per message."""
+"""LangGraph email agent: classify + summarize + notify, checkpointed per message."""
 
 from __future__ import annotations
 
+import html
 import logging
 from typing import TypedDict
 
@@ -13,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from zashiki_warasi.agents.llm import get_chat_model
 from zashiki_warasi.core.models import EmailAnalysis as EmailAnalysisORM
 from zashiki_warasi.core.schemas import EmailAnalysis, EmailMessage
+from zashiki_warasi.notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -38,24 +40,30 @@ class EmailAgent:
 
     Each email is processed in its own thread (thread_id = email.id).
     On crash, restarting with the same email replays from the last
-    checkpoint — the analyze node is skipped if its result is already
-    saved, so the LLM is never billed twice.
+    checkpoint — completed nodes are skipped, so the LLM is never billed
+    twice and a successful notify is never re-sent.
+
+    Graph: START -> analyze -> notify -> END
     """
 
     def __init__(
         self,
         checkpointer: PostgresSaver,
         session_factory: sessionmaker,
+        notifier: TelegramNotifier,
     ) -> None:
         self._session_factory = session_factory
+        self._notifier = notifier
         self._model = get_chat_model().with_structured_output(EmailAnalysis)
         self._graph = self._build_graph(checkpointer)
 
     def _build_graph(self, checkpointer: PostgresSaver):
         builder = StateGraph(AgentState)
         builder.add_node("analyze", self._analyze)
+        builder.add_node("notify", self._notify)
         builder.add_edge(START, "analyze")
-        builder.add_edge("analyze", END)
+        builder.add_edge("analyze", "notify")
+        builder.add_edge("notify", END)
         return builder.compile(checkpointer=checkpointer)
 
     def _analyze(self, state: AgentState) -> dict:
@@ -75,20 +83,48 @@ class EmailAgent:
         )
         return {"analysis": analysis}
 
+    def _notify(self, state: AgentState) -> dict:
+        analysis = state["analysis"]
+        if analysis is None:
+            logger.warning(
+                f"notify: skipping {state['email'].id} — no analysis"
+            )
+            return {}
+        text = _format_telegram_message(state["email"], analysis)
+        self._notifier.send_message(text)
+        return {}
+
     def handle_email(self, email: EmailMessage) -> None:
         """Run the agent on one email and persist the analysis.
 
         Designed to be passed as the `handler` callback to `Poller`.
-        Re-invoking with the same email is safe: LangGraph's checkpoint
-        keyed by `email.id` makes analyze idempotent, and persistence
-        uses an existence check to avoid duplicate rows.
+
+        Idempotency contract — three cases keyed by `email.id`:
+          - No prior state: invoke the graph fresh.
+          - Prior state, graph completed (no pending next node): reuse
+            the cached analysis; do NOT re-invoke (avoids re-billing the
+            LLM and re-sending Telegram).
+          - Prior state, graph interrupted: invoke with no input so
+            LangGraph resumes from where it stopped.
         """
         config = {"configurable": {"thread_id": email.id}}
-        result = self._graph.invoke(
-            {"email": email, "analysis": None},
-            config=config,
-        )
-        analysis = result.get("analysis")
+        snapshot = self._graph.get_state(config)
+
+        if snapshot.values.get("analysis") is not None and not snapshot.next:
+            analysis = snapshot.values["analysis"]
+            logger.info(
+                f"Reusing cached analysis for {email.id} "
+                "(graph already complete)"
+            )
+        else:
+            graph_input = (
+                None
+                if snapshot.values
+                else {"email": email, "analysis": None}
+            )
+            result = self._graph.invoke(graph_input, config=config)
+            analysis = result.get("analysis")
+
         if analysis is None:
             logger.warning(f"Agent returned no analysis for {email.id}")
             return
@@ -111,3 +147,25 @@ class EmailAgent:
                 )
             )
             session.commit()
+
+
+_IMPORTANCE_ICON = {"high": "🔴", "medium": "🟡", "low": "⚪"}
+
+
+def _format_telegram_message(
+    email: EmailMessage, analysis: EmailAnalysis
+) -> str:
+    """Build the HTML payload for Telegram sendMessage.
+
+    All user-controlled fields are HTML-escaped because Gmail headers
+    can legitimately contain `<` `>` `&` (display names, encoded
+    subjects).
+    """
+    icon = _IMPORTANCE_ICON.get(analysis.importance, "")
+    return (
+        f"{icon} <b>[{analysis.importance.upper()}] "
+        f"{html.escape(analysis.category)}</b>\n"
+        f"<b>From:</b> {html.escape(email.from_address)}\n"
+        f"<b>Subject:</b> {html.escape(email.subject)}\n\n"
+        f"{html.escape(analysis.summary)}"
+    )
