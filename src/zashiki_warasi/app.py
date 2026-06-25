@@ -21,6 +21,7 @@ from zashiki_warasi.core.db import get_session_factory
 from zashiki_warasi.gmail.auth import get_credentials
 from zashiki_warasi.gmail.client import GmailClient
 from zashiki_warasi.gmail.poller import Poller
+from zashiki_warasi.notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ def run() -> None:
     credentials = get_credentials()
     client = GmailClient(credentials)
     session_factory = get_session_factory()
+    notifier = TelegramNotifier()
 
     db_url = _libpq_url(DatabaseSettings().database_url)
     with PostgresSaver.from_conn_string(db_url) as checkpointer:
@@ -78,6 +80,7 @@ def run() -> None:
         agent = EmailAgent(
             checkpointer=checkpointer,
             session_factory=session_factory,
+            notifier=notifier,
         )
         poller = Poller(
             client=client,

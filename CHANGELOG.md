@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Telegram notification node** in the email agent graph:
+  `analyze -> notify -> END`. Every analysed email produces a Telegram
+  message containing icon + importance + category + sender + subject +
+  summary (HTML formatted, all user-controlled fields escaped). The
+  notify node fails closed — if the Telegram API is unreachable, the
+  analyze result stays in the LangGraph checkpoint and the next tick
+  resumes at notify without re-billing the LLM.
+- `notifications/telegram.py`: `TelegramNotifier` wrapping the Bot
+  API `sendMessage` endpoint, with explicit `TelegramError` for
+  transport failures, non-2xx responses, and `ok: false` API
+  rejections.
+- `TelegramSettings` (env prefix `TELEGRAM_`): bot_token, chat_id,
+  api_base, timeout_seconds.
+- `agents/tools/registry.py`: `ToolRegistry` for `langchain_core.tools.BaseTool`
+  instances. Supports `register` (also usable as a decorator),
+  `get`, `all`, `names`, plus `in` / `len` / iteration. Rejects
+  duplicate names and non-BaseTool inputs with actionable error
+  messages. Module-level `default_registry` provided for code that
+  wants a shared instance. Subgraph-as-tool patterns are explicitly
+  out of scope — those stay with the agent that composes them.
+- `httpx` pinned as an explicit direct dependency
+  (previously transitive via `langchain-openai`).
+
+### Changed
+- `EmailAgent.__init__` now requires a `notifier: TelegramNotifier`.
+- `EmailAgent.handle_email` is now properly idempotent across
+  re-invocations: it inspects `graph.get_state(config)` first and
+  reuses the cached analysis when the thread is already complete,
+  so a second call (e.g. from the poller after an unrelated crash)
+  no longer re-bills the LLM or re-sends Telegram. Interrupted
+  threads are resumed via `invoke(None, config)`.
+
+### Tests
+- 36 new tests (169 total):
+  - `tests/notifications/test_telegram.py` (14): construction
+    guards, URL / payload shape, parse_mode handling, timeout
+    pass-through, and error mapping for transport / HTTP /
+    `ok: false` cases.
+  - `tests/agents/test_email_agent.py::TestNotifyNode` (7): notify
+    invoked exactly once, message contents, HTML escaping of
+    untrusted fields, fail-closed behaviour blocking persistence,
+    second-call idempotency, ordering relative to analyze.
+  - `tests/agents/tools/test_registry.py` (15): register /
+    decorator usage / duplicate guard / non-BaseTool guard /
+    lookup / `all()` snapshot semantics / dunder methods /
+    `default_registry` presence.
+
 ## [0.1.0] - 2026-06-25
 
 First public preview. End-to-end verified against a personal Gmail

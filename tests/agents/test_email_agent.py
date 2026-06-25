@@ -92,10 +92,17 @@ def mock_chat_model(monkeypatch, fixed_analysis) -> MockChat:
 
 
 @pytest.fixture
-def agent(session_factory, mock_chat_model) -> EmailAgent:
+def mock_notifier() -> MagicMock:
+    """Default mock for tests that don't care about telegram delivery."""
+    return MagicMock(name="notifier")
+
+
+@pytest.fixture
+def agent(session_factory, mock_chat_model, mock_notifier) -> EmailAgent:
     return EmailAgent(
         checkpointer=InMemorySaver(),
         session_factory=session_factory,
+        notifier=mock_notifier,
     )
 
 
@@ -234,8 +241,103 @@ class TestNoneAnalysis:
         agent = EmailAgent(
             checkpointer=InMemorySaver(),
             session_factory=session_factory,
+            notifier=MagicMock(),
         )
 
         # Must not raise
         agent.handle_email(fake_email)
         assert _count_analyses(session_factory) == 0
+
+
+# ---------- telegram notify node ----------
+
+
+class TestNotifyNode:
+    def test_notifier_called_once_per_email(
+        self, agent, fake_email, mock_notifier
+    ):
+        agent.handle_email(fake_email)
+        assert mock_notifier.send_message.call_count == 1
+
+    def test_message_contains_category_and_importance(
+        self, agent, fake_email, mock_notifier
+    ):
+        agent.handle_email(fake_email)
+        text = mock_notifier.send_message.call_args.args[0]
+        assert "work" in text
+        assert "HIGH" in text
+
+    def test_message_contains_from_subject_summary(
+        self, agent, fake_email, mock_notifier
+    ):
+        agent.handle_email(fake_email)
+        text = mock_notifier.send_message.call_args.args[0]
+        assert "alice@example.com" in text
+        assert "Quarterly report" in text
+        assert "needs review by Friday" in text
+
+    def test_message_escapes_html_in_user_fields(
+        self, agent, mock_chat_model, mock_notifier
+    ):
+        from zashiki_warasi.core.schemas import EmailAnalysis
+
+        # Inject analysis whose summary has HTML special chars.
+        mock_chat_model.structured.invoke.return_value = EmailAnalysis(
+            category="work",
+            importance="low",
+            summary="Review <code> blocks & semicolons",
+        )
+        email = EmailMessage(
+            id="msg-html",
+            thread_id="t",
+            history_id=1,
+            from_address="<script>@x.com",
+            subject="<b>injected</b>",
+            received_at=datetime(2026, 6, 22, tzinfo=timezone.utc),
+        )
+        agent.handle_email(email)
+
+        text = mock_notifier.send_message.call_args.args[0]
+        assert "<script>@x.com" not in text
+        assert "&lt;script&gt;@x.com" in text
+        assert "<b>injected</b>" not in text
+        assert "&lt;b&gt;injected&lt;/b&gt;" in text
+        assert "&lt;code&gt; blocks &amp; semicolons" in text
+
+    def test_notifier_failure_blocks_persistence(
+        self, agent, fake_email, session_factory, mock_notifier
+    ):
+        mock_notifier.send_message.side_effect = RuntimeError(
+            "telegram unreachable"
+        )
+
+        with pytest.raises(RuntimeError, match="telegram unreachable"):
+            agent.handle_email(fake_email)
+
+        # No analysis row written — handler exception aborts handle_email
+        # before _persist runs. Next tick will retry and (because the
+        # checkpoint cached analyze) skip LLM but re-run notify.
+        assert _count_analyses(session_factory) == 0
+
+    def test_second_call_after_notify_success_does_not_resend(
+        self, agent, fake_email, mock_notifier
+    ):
+        agent.handle_email(fake_email)
+        agent.handle_email(fake_email)
+        # Idempotency: LangGraph checkpoint short-circuits both analyze
+        # and notify on the second call.
+        assert mock_notifier.send_message.call_count == 1
+
+    def test_notify_runs_after_analyze_in_graph(
+        self, agent, fake_email, mock_chat_model, mock_notifier
+    ):
+        # Order assertion via MagicMock parent: attach both as children
+        # of a shared parent and inspect mock_calls.
+        parent = MagicMock()
+        parent.attach_mock(mock_chat_model.structured.invoke, "analyze")
+        parent.attach_mock(mock_notifier.send_message, "notify")
+
+        agent.handle_email(fake_email)
+
+        method_order = [c[0] for c in parent.mock_calls]
+        assert method_order.index("analyze") < method_order.index("notify")
