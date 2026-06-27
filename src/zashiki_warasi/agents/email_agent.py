@@ -30,6 +30,7 @@ from zashiki_warasi.core.schemas import (
     ExpenseLogged,
     ExpenseNeedsReview,
     SideEffect,
+    coerce_importance,
 )
 from zashiki_warasi.gmail.client import GmailClient
 from zashiki_warasi.notifications.telegram import TelegramNotifier
@@ -218,13 +219,20 @@ class EmailAgent:
         )
 
     def _persist(self, message_id: str, analysis: EmailAnalysis) -> None:
+        # Same defensive coercion as _format_message — state loaded
+        # from a LangGraph checkpoint may have bypassed the
+        # field_validator and arrive here with a string importance.
+        importance = coerce_importance(analysis.importance)
+        if not isinstance(importance, int):
+            importance = 3
+
         with self._session_factory() as session:
             if session.get(EmailAnalysisORM, message_id) is not None:
                 return
             session.add(
                 EmailAnalysisORM(
                     message_id=message_id,
-                    importance=analysis.importance,
+                    importance=importance,
                     urgency=analysis.urgency,
                     category=analysis.category,
                     summary=analysis.summary,
@@ -254,7 +262,14 @@ def _format_message(
 
     All user-controlled fields are HTML-escaped.
     """
-    stars = "★" * analysis.importance + "☆" * (5 - analysis.importance)
+    # Defensive: LangGraph's checkpoint deserializer uses
+    # `model_construct`, which bypasses pydantic validators, so a
+    # cached state with `importance` as a string can reach here even
+    # though the EmailAnalysis validator would normally coerce it.
+    importance = coerce_importance(analysis.importance)
+    if not isinstance(importance, int):
+        importance = 3  # opaque fallback
+    stars = "★" * importance + "☆" * (5 - importance)
     parts: list[str] = [
         f"<b>{stars} [{html.escape(analysis.category)}]</b>",
         "",

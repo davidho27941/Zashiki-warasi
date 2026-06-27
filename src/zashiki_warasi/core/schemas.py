@@ -105,27 +105,40 @@ class EmailAnalysis(BaseModel):
 
     @field_validator("importance", mode="before")
     @classmethod
-    def _coerce_importance(cls, value: object) -> object:
-        """Some llama.cpp + structured-output combinations let the LLM
-        return importance as a string ('4', '4 重要', '高'). Try to
-        coerce to int rather than 500-erroring the whole agent."""
-        if isinstance(value, str):
-            stripped = value.strip()
-            # Take leading digit run if the model added a label
-            # ('4 (重要)' -> '4').
-            head = stripped.split()[0] if stripped else stripped
-            if head.isdigit():
-                return int(head)
-            # Fall back to common Chinese / English labels.
-            label_map = {
-                "非常不重要": 1, "不重要": 2, "普通": 3,
-                "重要": 4, "非常重要": 5,
-                "very low": 1, "low": 2, "medium": 3,
-                "high": 4, "very high": 5,
-            }
-            if stripped in label_map:
-                return label_map[stripped]
-        return value
+    def _coerce_importance_validator(cls, value: object) -> object:
+        return coerce_importance(value)
+
+
+_IMPORTANCE_LABEL_MAP: dict[str, int] = {
+    "非常不重要": 1, "不重要": 2, "普通": 3,
+    "重要": 4, "非常重要": 5,
+    "very low": 1, "low": 2, "medium": 3,
+    "high": 4, "very high": 5,
+}
+
+
+def coerce_importance(value: object) -> object:
+    """Best-effort coercion of an `importance` value to int 1-5.
+
+    Used both by EmailAnalysis's field_validator (catches values at
+    construction time) AND by downstream consumers like notify
+    formatting (catches values that bypassed validation, e.g. state
+    loaded from a LangGraph checkpoint via `model_construct` which
+    skips validators).
+
+    Returns the value unchanged if it cannot be coerced — callers
+    that need a guaranteed int should int() the result themselves.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return value
+        head = stripped.split()[0]
+        if head.isdigit():
+            return int(head)
+        if stripped in _IMPORTANCE_LABEL_MAP:
+            return _IMPORTANCE_LABEL_MAP[stripped]
+    return value
 
 
 # ----- Expense vertical -----
