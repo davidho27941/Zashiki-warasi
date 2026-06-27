@@ -98,9 +98,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PostgreSQL still maps these to `JSONB` / `UUID` at the dialect
   layer.
 
+### Post-design adjustments (from live-run feedback)
+
+- `ExpenseSubgraph` is now a class (was `compile_expense_subgraph`
+  factory), matching the `EmailAgent` shape for project-internal
+  consistency. Exposes the compiled CompiledGraph as `.graph`.
+- **Migration 0003 wraps a `TRUNCATE TABLE email_analyses`**
+  before reshaping. Without it, the `ADD COLUMN importance
+  INTEGER NOT NULL` raised `psycopg.errors.NotNullViolation` on
+  any non-empty dev DB. The TRUNCATE makes the documented "dev
+  rows not preserved" behaviour actually happen.
+- **`importance` coercion at use-sites** (`_format_message` and
+  `_persist`). A pydantic `field_validator` alone is not enough
+  when LangGraph's checkpoint loader reconstructs state via
+  `BaseModel.model_construct`, which bypasses validators. The
+  shared `coerce_importance(value)` helper in `core.schemas`
+  accepts ints, digit strings ("4"), digit-with-label ("4
+  (重要)"), Chinese labels (非常不重要..非常重要), and English
+  labels (very low..very high). Unmappable values fall back to a
+  neutral 3 at the formatter rather than crashing the daemon.
+- **Full expense field rendering**: `ExpenseLogged` gains
+  `location` and `category`; the Telegram footer now always
+  renders all seven payment fields (金額 / 商家 / 地點 / 類別 /
+  時間 / 支付 / 編號) with `不明` for any field the LLM could
+  not extract. Distinguishes "extraction failed for this field"
+  from "format dropped this field".
+- **Auto-generated `transaction_id`** with an `AUTO-` prefix when
+  the email itself carries none — derived deterministically from
+  `sha256(message_id)[:12]` so resumes / retries never split a
+  single email across two ids. Telegram appends `(自動編號)` to
+  flag the synthetic value.
+
 ### Tests
 
-196 tests total (63 new over v0.1's 133):
+218 tests total (85 new over v0.1's 133):
 
 - **Notifications + registry (v0.2 batch, 36):**
   - `tests/notifications/test_telegram.py` (14): construction
@@ -128,9 +159,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `tests/agents/test_email_agent.py::TestNeedsReviewNotify` (2):
     image-PDF reason wording + filename listed, all-null reason
     wording.
-  - `tests/agents/test_email_agent.py::TestExpenseLoggedNotify` (3):
+  - `tests/agents/test_email_agent.py::TestExpenseLoggedNotify` (4):
     full-fields rendering, missing-amount shows 不明, `其他`
-    payment method gets a ⚠️ prefix.
+    payment method gets a ⚠️ prefix, AUTO- transaction id gets a
+    (自動編號) suffix.
+- **Post-design batch (22 new):**
+  - `tests/core/test_schemas.py::TestImportanceCoercion` (17):
+    int passthrough, digit-string coercion, digit-with-label,
+    Chinese / English label mapping, out-of-range rejection,
+    unmappable rejection.
+  - `tests/agents/verticals/test_expense.py::TestAutoTransactionId`
+    (4): LLM-provided id passes through, missing id triggers
+    AUTO- generation with stable length, helper is deterministic
+    and distinguishes inputs, auto-id reaches the persisted row.
+  - `TestExpenseLoggedNotify::test_auto_transaction_id_marked_in_message`
+    (1): (自動編號) suffix only on AUTO- ids.
 
 ## [0.1.0] - 2026-06-25
 

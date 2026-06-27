@@ -68,9 +68,19 @@ uv sync
 Create a database and apply migrations:
 
 ```bash
-createdb zashiki_warasi
+createdb --encoding=UTF8 --locale=C --template=template0 zashiki_warasi
 uv run alembic upgrade head
 ```
+
+> **The database must use UTF-8 encoding.** The agent stores Chinese
+> / Japanese keywords and summaries; on a `SQL_ASCII` cluster the
+> JSON column write fails with `psycopg.errors.UntranslatableCharacter`
+> because Postgres parses JSON server-side and cannot store code
+> points above U+007F. The `--template=template0` flag is required
+> because `template1` typically inherits the cluster's default
+> encoding, which on some macOS Postgres installs is `SQL_ASCII`.
+> Verify with `psql -d zashiki_warasi -c "SHOW server_encoding"`
+> — you should see `UTF8`.
 
 If your connection differs from the default, set `DATABASE_URL`:
 
