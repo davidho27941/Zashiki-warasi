@@ -6,7 +6,7 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 # ----- Gmail layer -----
@@ -102,6 +102,30 @@ class EmailAnalysis(BaseModel):
         max_length=5,
         description="至多 5 個關鍵字",
     )
+
+    @field_validator("importance", mode="before")
+    @classmethod
+    def _coerce_importance(cls, value: object) -> object:
+        """Some llama.cpp + structured-output combinations let the LLM
+        return importance as a string ('4', '4 重要', '高'). Try to
+        coerce to int rather than 500-erroring the whole agent."""
+        if isinstance(value, str):
+            stripped = value.strip()
+            # Take leading digit run if the model added a label
+            # ('4 (重要)' -> '4').
+            head = stripped.split()[0] if stripped else stripped
+            if head.isdigit():
+                return int(head)
+            # Fall back to common Chinese / English labels.
+            label_map = {
+                "非常不重要": 1, "不重要": 2, "普通": 3,
+                "重要": 4, "非常重要": 5,
+                "very low": 1, "low": 2, "medium": 3,
+                "high": 4, "very high": 5,
+            }
+            if stripped in label_map:
+                return label_map[stripped]
+        return value
 
 
 # ----- Expense vertical -----
