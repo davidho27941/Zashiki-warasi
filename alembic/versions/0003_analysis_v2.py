@@ -19,7 +19,15 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # importance: VARCHAR(16) → INTEGER (clean break — dev data not preserved)
+    # Wipe existing rows before reshaping. The schema change is not
+    # cleanly migratable (importance VARCHAR → INTEGER, plus two new
+    # NOT NULL columns with no semantically correct backfill value),
+    # and per the v0.3 CHANGELOG entry these are dev-only rows.
+    # Without the TRUNCATE the ADD COLUMN ... NOT NULL below would
+    # raise NotNullViolation on any non-empty table.
+    op.execute("TRUNCATE TABLE email_analyses")
+
+    # importance: VARCHAR(16) → INTEGER
     op.drop_column("email_analyses", "importance")
     op.add_column(
         "email_analyses",
