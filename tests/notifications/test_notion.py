@@ -106,13 +106,13 @@ class TestRequestShape:
 
 class TestPropertyMapping:
     def test_title_property_gets_llm_title(self):
-        # The Notion title property (default name `標題`) receives the
-        # LLM-generated short description of the expense.
+        # The Notion title property (configured here as `消費名稱`)
+        # receives the LLM-generated short description of the expense.
         recorder = _recorder_with_mock_client()
         recorder.record_expense(_record(title="拿鐵 + 摩卡星冰樂"))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["標題"] == {
+        assert props["消費名稱"] == {
             "title": [{"text": {"content": "拿鐵 + 摩卡星冰樂"}}]
         }
 
@@ -137,7 +137,7 @@ class TestPropertyMapping:
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
         # Notion title gets the vendor fallback.
-        assert props["標題"] == {
+        assert props["消費名稱"] == {
             "title": [{"text": {"content": "Starbucks"}}]
         }
         # 消費店家 still gets the vendor as well (independent column).
@@ -152,7 +152,7 @@ class TestPropertyMapping:
         recorder.record_expense(_record(title=None, vendor=None))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["標題"]["title"][0]["text"]["content"] == "(不明)"
+        assert props["消費名稱"]["title"][0]["text"]["content"] == "(不明)"
         # 消費店家 is skipped entirely when vendor is None.
         assert "消費店家" not in props
 

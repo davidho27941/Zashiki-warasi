@@ -135,7 +135,7 @@ about at runtime.
 
    | Property | Type | Notes |
    | --- | --- | --- |
-   | 標題 | Title | Required by Notion (every DB needs one Title-type property). Receives the LLM-generated short description of the expense (e.g. `拿鐵 + 摩卡星冰樂`, `Amazon Kindle 訂單`). Falls back to the vendor name, then `(不明)`. The default Notion title column is usually named "Name" / "標題" — rename it to `標題` if needed, or change `PROP_TITLE` in `notifications/notion.py`. |
+   | 消費名稱 | Title | Required by Notion (every DB needs one Title-type property). Receives the LLM-generated short description of the expense (e.g. `拿鐵 + 摩卡星冰樂`, `Amazon Kindle 訂單`). Falls back to the vendor name, then `(不明)`. The default Notion title column is usually named "Name"; rename it to `消費名稱` to match, or change `PROP_TITLE` in `notifications/notion.py`. |
    | 消費店家 | Rich text | The merchant name (e.g. `Starbucks 渋谷店`), separate from the title. Omitted when the LLM couldn't extract a vendor. |
    | 消費金額 | Number | |
    | 幣別 | Select | Predefine options: `日幣`, `台幣`, `美金` (the agent translates ISO codes from extraction) |

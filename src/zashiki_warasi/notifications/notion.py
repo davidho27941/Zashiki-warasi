@@ -32,7 +32,7 @@ class NotionExpenseRecorder:
     """
 
     # Property names — must match the Notion DB exactly.
-    PROP_TITLE = "標題"  # title (Notion's required title property)
+    PROP_TITLE = "消費名稱"  # title (Notion's required title property)
     PROP_VENDOR = "消費店家"  # rich_text (the merchant name)
     PROP_AMOUNT = "消費金額"  # number
     PROP_CURRENCY = "幣別"  # select
