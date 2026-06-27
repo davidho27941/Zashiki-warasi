@@ -515,6 +515,30 @@ class TestExpenseLoggedNotify:
         assert "2026-06-27 14:32" in text
         assert "SMBC Olive" in text
         assert "250-1234567" in text
+        # Real id (no AUTO- prefix) doesn't get the "(自動編號)" suffix
+        assert "(自動編號)" not in text
+
+    def test_auto_transaction_id_marked_in_message(self):
+        from decimal import Decimal
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_logged,
+        )
+        from zashiki_warasi.core.schemas import ExpenseLogged
+
+        effect = ExpenseLogged(
+            record_id="uuid-x",
+            amount=Decimal("100"),
+            currency="JPY",
+            vendor="V",
+            location=None,
+            category=None,
+            transacted_at=None,
+            payment_method=None,
+            transaction_id="AUTO-deadbeef1234",
+        )
+        text = _format_expense_logged(effect)
+        assert "AUTO-deadbeef1234" in text
+        assert "(自動編號)" in text
 
     def test_missing_amount_displays_buming(self):
         from zashiki_warasi.agents.email_agent import (

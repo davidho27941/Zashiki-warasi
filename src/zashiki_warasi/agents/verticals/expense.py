@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import TypedDict
 
@@ -26,6 +27,23 @@ from zashiki_warasi.core.schemas import (
 from zashiki_warasi.gmail.client import GmailClient
 
 logger = logging.getLogger(__name__)
+
+
+AUTO_TRANSACTION_ID_PREFIX = "AUTO-"
+
+
+def auto_transaction_id(message_id: str) -> str:
+    """Deterministic stand-in for transaction_id when the email itself
+    carries no order/receipt number.
+
+    Derived from a SHA256 of the Gmail message ID so a retry / LangGraph
+    resume always produces the same value (no risk of a second
+    persist attempt picking a different id and looking like a new
+    expense). The `AUTO-` prefix lets the user distinguish at a glance
+    between numbers we read from the email and numbers we made up.
+    """
+    digest = hashlib.sha256(message_id.encode("utf-8")).hexdigest()[:12]
+    return f"{AUTO_TRANSACTION_ID_PREFIX}{digest}"
 
 
 EXPENSE_EXTRACT_SYSTEM_PROMPT = """\
@@ -178,6 +196,10 @@ class ExpenseSubgraph:
                 )
             }
 
+        transaction_id = draft.transaction_id or auto_transaction_id(
+            state["email"].id
+        )
+
         with self._session_factory() as session:
             record = ExpenseRecord(
                 message_id=state["email"].id,
@@ -187,7 +209,7 @@ class ExpenseSubgraph:
                 vendor=draft.vendor,
                 location=draft.location,
                 category=draft.category,
-                transaction_id=draft.transaction_id,
+                transaction_id=transaction_id,
                 payment_method=draft.payment_method,
                 raw_extraction=draft.model_dump(mode="json"),
             )

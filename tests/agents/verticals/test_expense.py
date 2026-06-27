@@ -146,6 +146,88 @@ class TestHappyPath:
             assert row.raw_extraction["payment_method"] == "SMBC Olive"
 
 
+# ---------- auto transaction id ----------
+
+
+class TestAutoTransactionId:
+    def test_uses_llm_extracted_when_present(
+        self, session_factory, mock_client, fake_email, fake_analysis
+    ):
+        draft = _draft(transaction_id="REAL-FROM-EMAIL-001")
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=_build_model_returning(draft),
+        )
+
+        result = subgraph.graph.invoke(
+            _initial_state(fake_email, fake_analysis),
+            config={"configurable": {"thread_id": fake_email.id}},
+        )
+
+        assert result["side_effect"].transaction_id == "REAL-FROM-EMAIL-001"
+
+    def test_generates_auto_id_when_missing(
+        self, session_factory, mock_client, fake_email, fake_analysis
+    ):
+        draft = _draft(transaction_id=None)
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=_build_model_returning(draft),
+        )
+
+        result = subgraph.graph.invoke(
+            _initial_state(fake_email, fake_analysis),
+            config={"configurable": {"thread_id": fake_email.id}},
+        )
+
+        tid = result["side_effect"].transaction_id
+        assert tid is not None
+        assert tid.startswith("AUTO-")
+        assert len(tid) == 17  # "AUTO-" + 12 hex chars
+
+    def test_auto_id_is_deterministic_for_same_email(self):
+        """Crash-resume safety: two persist attempts on the same email
+        must yield the same auto-id (not a random value each time)."""
+        from zashiki_warasi.agents.verticals.expense import (
+            auto_transaction_id,
+        )
+
+        assert auto_transaction_id("msg-abc") == auto_transaction_id(
+            "msg-abc"
+        )
+        assert auto_transaction_id("msg-abc") != auto_transaction_id(
+            "msg-xyz"
+        )
+
+    def test_auto_id_persisted_to_db(
+        self, session_factory, mock_client, fake_email, fake_analysis
+    ):
+        draft = _draft(transaction_id=None)
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=_build_model_returning(draft),
+        )
+
+        subgraph.graph.invoke(
+            _initial_state(fake_email, fake_analysis),
+            config={"configurable": {"thread_id": fake_email.id}},
+        )
+
+        with session_factory() as session:
+            row = session.scalar(
+                select(ExpenseRecord).where(
+                    ExpenseRecord.message_id == fake_email.id
+                )
+            )
+            assert row.transaction_id.startswith("AUTO-")
+
+
 # ---------- early bail: image PDF only ----------
 
 

@@ -327,10 +327,18 @@ def _format_expense_logged(effect: ExpenseLogged) -> str:
         lines.append("  支付: 不明")
 
     if effect.transaction_id:
+        suffix = (
+            " (自動編號)"
+            if effect.transaction_id.startswith("AUTO-")
+            else ""
+        )
         lines.append(
             f"  編號: <code>{html.escape(effect.transaction_id)}</code>"
+            f"{suffix}"
         )
     else:
+        # persist always sets transaction_id (real or AUTO-), so we
+        # should never hit this branch in practice.
         lines.append("  編號: 不明")
 
     return "\n".join(lines)
