@@ -209,7 +209,12 @@ class ExpenseDraft(BaseModel):
 
 
 class ExpenseLogged(BaseModel):
-    """SideEffect payload when an ExpenseRecord was successfully written."""
+    """SideEffect payload when an ExpenseRecord was successfully written.
+
+    Carries every field the notify formatter renders to Telegram so the
+    user sees a complete record (with 不明 placeholders for fields the
+    LLM could not extract) rather than a sparse subset.
+    """
 
     model_config = ConfigDict(frozen=True)
 
@@ -219,6 +224,8 @@ class ExpenseLogged(BaseModel):
     amount: Decimal | None
     currency: Currency | None
     vendor: str | None
+    location: str | None
+    category: str | None
     transacted_at: datetime | None
     payment_method: PaymentMethod | None
     transaction_id: str | None

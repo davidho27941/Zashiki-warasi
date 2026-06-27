@@ -211,6 +211,8 @@ class ExpenseSubgraph:
                 amount=record.amount,
                 currency=record.currency,  # type: ignore[arg-type]
                 vendor=record.vendor,
+                location=record.location,
+                category=record.category,
                 transacted_at=record.transacted_at,
                 payment_method=record.payment_method,  # type: ignore[arg-type]
                 transaction_id=record.transaction_id,

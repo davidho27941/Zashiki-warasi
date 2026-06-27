@@ -500,6 +500,8 @@ class TestExpenseLoggedNotify:
             amount=Decimal("3200"),
             currency="JPY",
             vendor="Amazon.co.jp",
+            location="東京都渋谷区",
+            category="購物",
             transacted_at=datetime(2026, 6, 27, 14, 32, tzinfo=timezone.utc),
             payment_method="SMBC Olive",
             transaction_id="250-1234567",
@@ -508,6 +510,8 @@ class TestExpenseLoggedNotify:
         assert "已記帳" in text
         assert "3200 JPY" in text
         assert "Amazon.co.jp" in text
+        assert "東京都渋谷区" in text
+        assert "購物" in text
         assert "2026-06-27 14:32" in text
         assert "SMBC Olive" in text
         assert "250-1234567" in text
@@ -523,12 +527,16 @@ class TestExpenseLoggedNotify:
             amount=None,
             currency=None,
             vendor="某店",
+            location=None,
+            category=None,
             transacted_at=None,
             payment_method=None,
             transaction_id=None,
         )
         text = _format_expense_logged(effect)
-        assert "不明" in text
+        # Every nullable field should fall back to 不明
+        assert text.count("不明") >= 6  # amount, location, category,
+                                        # time, payment, transaction_id
 
     def test_other_payment_method_shown_with_warning(self):
         from decimal import Decimal
@@ -542,6 +550,8 @@ class TestExpenseLoggedNotify:
             amount=Decimal("100"),
             currency="JPY",
             vendor="V",
+            location=None,
+            category=None,
             transacted_at=None,
             payment_method="其他",
             transaction_id=None,

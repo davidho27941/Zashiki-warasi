@@ -298,6 +298,9 @@ def _format_message(
 
 
 def _format_expense_logged(effect: ExpenseLogged) -> str:
+    """Render every payment field. Missing values show as 不明 so the
+    user sees a complete frame rather than guessing whether a field was
+    "not present in email" vs. "we forgot to display it"."""
     lines = ["💰 <b>已記帳</b>"]
 
     if effect.amount is not None:
@@ -307,20 +310,28 @@ def _format_expense_logged(effect: ExpenseLogged) -> str:
     lines.append(f"  金額: {html.escape(amt)}")
 
     lines.append(f"  商家: {html.escape(effect.vendor or '不明')}")
+    lines.append(f"  地點: {html.escape(effect.location or '不明')}")
+    lines.append(f"  類別: {html.escape(effect.category or '不明')}")
 
     if effect.transacted_at:
-        lines.append(f"  時間: {effect.transacted_at:%Y-%m-%d %H:%M}")
+        time_str = f"{effect.transacted_at:%Y-%m-%d %H:%M}"
+    else:
+        time_str = "不明"
+    lines.append(f"  時間: {time_str}")
 
-    if effect.payment_method:
-        if effect.payment_method == "其他":
-            lines.append("  支付: ⚠️ 其他 (請檢查信件確認)")
-        else:
-            lines.append(f"  支付: {html.escape(effect.payment_method)}")
+    if effect.payment_method == "其他":
+        lines.append("  支付: ⚠️ 其他 (請檢查信件確認)")
+    elif effect.payment_method:
+        lines.append(f"  支付: {html.escape(effect.payment_method)}")
+    else:
+        lines.append("  支付: 不明")
 
     if effect.transaction_id:
         lines.append(
             f"  編號: <code>{html.escape(effect.transaction_id)}</code>"
         )
+    else:
+        lines.append("  編號: 不明")
 
     return "\n".join(lines)
 
