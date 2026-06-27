@@ -423,7 +423,7 @@ class TestRouting:
 
         model = MagicMock(name="chat_model")
         # First call wraps EmailAnalysis (in EmailAgent.__init__),
-        # second wraps ExpenseDraft (in compile_expense_subgraph).
+        # second wraps ExpenseDraft (in ExpenseSubgraph).
         model.with_structured_output.side_effect = [
             analyze_runnable,
             extract_runnable,

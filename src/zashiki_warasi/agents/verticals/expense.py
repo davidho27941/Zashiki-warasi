@@ -9,6 +9,7 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -92,35 +93,40 @@ class ExpenseState(TypedDict):
     extracted: ExpenseDraft | None
 
 
-def _build_user_prompt(email: EmailMessage, combined_text: str) -> str:
-    return (
-        f"寄件者: {email.from_address}\n"
-        f"主旨: {email.subject}\n"
-        f"收件時間: {email.received_at.isoformat()}\n"
-        f"\n"
-        f"信件內容 (含 PDF 附件抽出文字,若有):\n"
-        f"{combined_text}"
-    )
+class ExpenseSubgraph:
+    """Expense vertical packaged as a class for symmetry with EmailAgent.
 
-
-def compile_expense_subgraph(
-    *,
-    checkpointer: PostgresSaver | None,
-    session_factory: sessionmaker,
-    client: GmailClient,
-    model: BaseChatModel,
-):
-    """Compile the expense subgraph.
-
-    `model` should already be the chat model returned by
-    `get_chat_model()`; we apply `with_structured_output(ExpenseDraft)`
-    inside so the subgraph owns its own structured runnable.
+    Builds its own compiled StateGraph in `__init__`; consumers wire
+    `.graph` into the parent graph via `add_node("expense_sg", sg.graph)`.
     """
-    structured_model = model.with_structured_output(ExpenseDraft)
 
-    def extract_node(state: ExpenseState) -> dict:
+    def __init__(
+        self,
+        *,
+        checkpointer: PostgresSaver | None,
+        session_factory: sessionmaker,
+        client: GmailClient,
+        model: BaseChatModel,
+    ) -> None:
+        self._session_factory = session_factory
+        self._client = client
+        self._structured_model = model.with_structured_output(ExpenseDraft)
+        self.graph = self._build_graph(checkpointer)
+
+    def _build_graph(self, checkpointer: PostgresSaver | None):
+        builder = StateGraph(ExpenseState)
+        builder.add_node("extract", self._extract_node)
+        builder.add_node("persist", self._persist_node)
+        builder.add_edge(START, "extract")
+        builder.add_edge("extract", "persist")
+        builder.add_edge("persist", END)
+        return builder.compile(checkpointer=checkpointer)
+
+    # ----- nodes -----
+
+    def _extract_node(self, state: ExpenseState) -> dict:
         email = state["email"]
-        text, unreadable_pdfs = collect_text(email, client)
+        text, unreadable_pdfs = collect_text(email, self._client)
 
         # Early bail: PDF present but unreadable AND no body text — no
         # signal to extract from; do not hallucinate.
@@ -145,8 +151,8 @@ def compile_expense_subgraph(
                 "extracted": None,
             }
 
-        user_prompt = _build_user_prompt(email, text)
-        draft: ExpenseDraft = structured_model.invoke(
+        user_prompt = self._build_user_prompt(email, text)
+        draft: ExpenseDraft = self._structured_model.invoke(
             [
                 SystemMessage(content=EXPENSE_EXTRACT_SYSTEM_PROMPT),
                 HumanMessage(content=user_prompt),
@@ -154,7 +160,7 @@ def compile_expense_subgraph(
         )
         return {"extracted": draft}
 
-    def persist_node(state: ExpenseState) -> dict:
+    def _persist_node(self, state: ExpenseState) -> dict:
         # If extract already set a side_effect (needs_review), nothing
         # to persist — pass through.
         if state.get("side_effect") is not None:
@@ -172,7 +178,7 @@ def compile_expense_subgraph(
                 )
             }
 
-        with session_factory() as session:
+        with self._session_factory() as session:
             record = ExpenseRecord(
                 message_id=state["email"].id,
                 amount=draft.amount,
@@ -193,8 +199,6 @@ def compile_expense_subgraph(
                 # prior tick (LangGraph resume scenario). Use the
                 # existing row for the SideEffect.
                 session.rollback()
-                from sqlalchemy import select
-
                 record = session.scalar(
                     select(ExpenseRecord).where(
                         ExpenseRecord.message_id == state["email"].id
@@ -213,10 +217,15 @@ def compile_expense_subgraph(
             )
         }
 
-    builder = StateGraph(ExpenseState)
-    builder.add_node("extract", extract_node)
-    builder.add_node("persist", persist_node)
-    builder.add_edge(START, "extract")
-    builder.add_edge("extract", "persist")
-    builder.add_edge("persist", END)
-    return builder.compile(checkpointer=checkpointer)
+    # ----- prompt construction -----
+
+    @staticmethod
+    def _build_user_prompt(email: EmailMessage, combined_text: str) -> str:
+        return (
+            f"寄件者: {email.from_address}\n"
+            f"主旨: {email.subject}\n"
+            f"收件時間: {email.received_at.isoformat()}\n"
+            f"\n"
+            f"信件內容 (含 PDF 附件抽出文字,若有):\n"
+            f"{combined_text}"
+        )

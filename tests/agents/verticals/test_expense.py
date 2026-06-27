@@ -11,7 +11,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
-from zashiki_warasi.agents.verticals.expense import compile_expense_subgraph
+from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
 from zashiki_warasi.core.models import Base, ExpenseRecord
 from zashiki_warasi.core.schemas import (
     AttachmentMeta,
@@ -106,7 +106,7 @@ class TestHappyPath:
     ):
         draft = _draft()
         model = _build_model_returning(draft)
-        subgraph = compile_expense_subgraph(
+        subgraph = ExpenseSubgraph(
             checkpointer=InMemorySaver(),
             session_factory=session_factory,
             client=mock_client,
@@ -114,7 +114,7 @@ class TestHappyPath:
         )
         config = {"configurable": {"thread_id": fake_email.id}}
 
-        result = subgraph.invoke(
+        result = subgraph.graph.invoke(
             _initial_state(fake_email, fake_analysis),
             config=config,
         )
@@ -182,13 +182,13 @@ class TestImagePdfFallback:
         model = MagicMock(name="chat_model")
         model.with_structured_output.return_value = structured
 
-        subgraph = compile_expense_subgraph(
+        subgraph = ExpenseSubgraph(
             checkpointer=InMemorySaver(),
             session_factory=session_factory,
             client=mock_client,
             model=model,
         )
-        result = subgraph.invoke(
+        result = subgraph.graph.invoke(
             _initial_state(email, fake_analysis),
             config={"configurable": {"thread_id": email.id}},
         )
@@ -217,14 +217,14 @@ class TestNullFallback:
         # LLM returns a draft with neither amount nor vendor.
         empty_draft = ExpenseDraft()  # all None
         model = _build_model_returning(empty_draft)
-        subgraph = compile_expense_subgraph(
+        subgraph = ExpenseSubgraph(
             checkpointer=InMemorySaver(),
             session_factory=session_factory,
             client=mock_client,
             model=model,
         )
 
-        result = subgraph.invoke(
+        result = subgraph.graph.invoke(
             _initial_state(fake_email, fake_analysis),
             config={"configurable": {"thread_id": fake_email.id}},
         )
@@ -242,14 +242,14 @@ class TestNullFallback:
     ):
         draft = _draft(vendor=None, location=None, transaction_id=None)
         model = _build_model_returning(draft)
-        subgraph = compile_expense_subgraph(
+        subgraph = ExpenseSubgraph(
             checkpointer=InMemorySaver(),
             session_factory=session_factory,
             client=mock_client,
             model=model,
         )
 
-        result = subgraph.invoke(
+        result = subgraph.graph.invoke(
             _initial_state(fake_email, fake_analysis),
             config={"configurable": {"thread_id": fake_email.id}},
         )
@@ -261,14 +261,14 @@ class TestNullFallback:
     ):
         draft = _draft(amount=None, currency=None, transaction_id=None)
         model = _build_model_returning(draft)
-        subgraph = compile_expense_subgraph(
+        subgraph = ExpenseSubgraph(
             checkpointer=InMemorySaver(),
             session_factory=session_factory,
             client=mock_client,
             model=model,
         )
 
-        result = subgraph.invoke(
+        result = subgraph.graph.invoke(
             _initial_state(fake_email, fake_analysis),
             config={"configurable": {"thread_id": fake_email.id}},
         )
@@ -285,7 +285,7 @@ class TestIdempotency:
     ):
         draft = _draft()
         model = _build_model_returning(draft)
-        subgraph = compile_expense_subgraph(
+        subgraph = ExpenseSubgraph(
             checkpointer=InMemorySaver(),
             session_factory=session_factory,
             client=mock_client,
@@ -309,7 +309,7 @@ class TestIdempotency:
             session.commit()
             existing_id = str(existing.id)
 
-        result = subgraph.invoke(
+        result = subgraph.graph.invoke(
             _initial_state(fake_email, fake_analysis),
             config={"configurable": {"thread_id": fake_email.id}},
         )
@@ -350,14 +350,14 @@ class TestExtractPrompt:
 
         draft = _draft()
         model = _build_model_returning(draft)
-        subgraph = compile_expense_subgraph(
+        subgraph = ExpenseSubgraph(
             checkpointer=InMemorySaver(),
             session_factory=session_factory,
             client=mock_client,
             model=model,
         )
 
-        subgraph.invoke(
+        subgraph.graph.invoke(
             _initial_state(email, fake_analysis),
             config={"configurable": {"thread_id": email.id}},
         )

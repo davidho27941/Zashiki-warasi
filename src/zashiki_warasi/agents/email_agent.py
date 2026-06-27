@@ -22,7 +22,7 @@ from langgraph.graph import END, START, StateGraph
 from sqlalchemy.orm import sessionmaker
 
 from zashiki_warasi.agents.llm import get_chat_model
-from zashiki_warasi.agents.verticals.expense import compile_expense_subgraph
+from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
 from zashiki_warasi.core.models import EmailAnalysis as EmailAnalysisORM
 from zashiki_warasi.core.schemas import (
     EmailAnalysis,
@@ -112,7 +112,7 @@ class EmailAgent:
 
         chat_model = get_chat_model()
         self._analyze_model = chat_model.with_structured_output(EmailAnalysis)
-        self._expense_subgraph = compile_expense_subgraph(
+        self._expense_subgraph = ExpenseSubgraph(
             checkpointer=checkpointer,
             session_factory=session_factory,
             client=client,
@@ -123,7 +123,7 @@ class EmailAgent:
     def _build_graph(self, checkpointer: PostgresSaver):
         builder = StateGraph(AgentState)
         builder.add_node("analyze", self._analyze)
-        builder.add_node("expense_sg", self._expense_subgraph)
+        builder.add_node("expense_sg", self._expense_subgraph.graph)
         builder.add_node("notify", self._notify)
 
         builder.add_edge(START, "analyze")
