@@ -76,31 +76,67 @@ def find_duplicate(
             )
         )
         if match is not None:
+            logger.info(
+                f"dedup: Stage 1 hit on transaction_id="
+                f"{draft.transaction_id!r} → existing {match.id}"
+            )
             return match
+        logger.debug(
+            f"dedup: Stage 1 miss (transaction_id="
+            f"{draft.transaction_id!r} not in DB)"
+        )
+    else:
+        logger.debug(
+            f"dedup: Stage 1 skipped (transaction_id="
+            f"{draft.transaction_id!r}, AUTO or null)"
+        )
 
     # Stage 2: (amount, currency, transacted_at ± window). Skip if any
     # of the three required signals is missing — we'd be guessing.
-    if (
+    if not (
         draft.amount is not None
         and draft.currency
         and draft.transacted_at is not None
     ):
-        delta = timedelta(minutes=window_minutes)
-        lo = draft.transacted_at - delta
-        hi = draft.transacted_at + delta
-        candidates = list(
-            session.scalars(
-                select(ExpenseRecord).where(
-                    ExpenseRecord.amount == draft.amount,
-                    ExpenseRecord.currency == draft.currency,
-                    ExpenseRecord.transacted_at.between(lo, hi),
-                )
-            ).all()
+        logger.info(
+            f"dedup: Stage 2 skipped (amount={draft.amount}, "
+            f"currency={draft.currency!r}, "
+            f"transacted_at={draft.transacted_at})"
         )
-        if len(candidates) == 1:
-            return candidates[0]
-        # 0 -> definitely new; >1 -> ambiguous, do not merge
+        return None
 
+    delta = timedelta(minutes=window_minutes)
+    lo = draft.transacted_at - delta
+    hi = draft.transacted_at + delta
+    candidates = list(
+        session.scalars(
+            select(ExpenseRecord).where(
+                ExpenseRecord.amount == draft.amount,
+                ExpenseRecord.currency == draft.currency,
+                ExpenseRecord.transacted_at.between(lo, hi),
+            )
+        ).all()
+    )
+    if len(candidates) == 1:
+        logger.info(
+            f"dedup: Stage 2 hit → existing {candidates[0].id} "
+            f"(amount={draft.amount} {draft.currency}, "
+            f"window ±{window_minutes}min around "
+            f"{draft.transacted_at.isoformat()})"
+        )
+        return candidates[0]
+    elif len(candidates) == 0:
+        logger.info(
+            f"dedup: Stage 2 no candidates (amount={draft.amount} "
+            f"{draft.currency}, window "
+            f"[{lo.isoformat()}, {hi.isoformat()}])"
+        )
+    else:
+        logger.warning(
+            f"dedup: Stage 2 ambiguous — {len(candidates)} candidates "
+            f"in window [{lo.isoformat()}, {hi.isoformat()}], "
+            f"inserting as new"
+        )
     return None
 
 
