@@ -26,6 +26,10 @@ from zashiki_warasi.core.schemas import (
     SideEffect,
 )
 from zashiki_warasi.gmail.client import GmailClient
+from zashiki_warasi.notifications.notion import (
+    NotionExpenseRecorder,
+    NotionSyncError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -193,9 +197,11 @@ class ExpenseSubgraph:
         session_factory: sessionmaker,
         client: GmailClient,
         model: BaseChatModel,
+        notion: NotionExpenseRecorder | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._client = client
+        self._notion = notion
         self._structured_model = model.with_structured_output(ExpenseDraft)
         self.graph = self._build_graph(checkpointer)
 
@@ -273,6 +279,7 @@ class ExpenseSubgraph:
             # transaction" (e.g. SMBC Olive confirmation + Starbucks
             # merchant receipt) before writing a second row.
             existing = find_duplicate(draft, session)
+            is_new_record = existing is None
             if existing is not None:
                 logger.info(
                     f"expense: {state['email'].id} matches existing record "
@@ -306,6 +313,33 @@ class ExpenseSubgraph:
                             ExpenseRecord.message_id == state["email"].id
                         )
                     )
+                    is_new_record = False
+
+            # Best-effort Notion sync. Only attempted for newly-written
+            # records — duplicates re-use the existing row's
+            # notion_page_id / notion_sync_error from the original
+            # write, no re-attempt here.
+            if (
+                self._notion is not None
+                and is_new_record
+                and record.notion_page_id is None
+                and record.notion_sync_error is None
+            ):
+                try:
+                    record.notion_page_id = self._notion.record_expense(record)
+                    logger.info(
+                        f"expense: synced {record.id} to Notion page "
+                        f"{record.notion_page_id}"
+                    )
+                except NotionSyncError as exc:
+                    err = str(exc)[:500]  # keep DB row size sane
+                    record.notion_sync_error = err
+                    logger.warning(
+                        f"expense: Notion sync failed for {record.id}: {err}"
+                    )
+                # record is attached to the open session; commit flushes
+                # whichever of notion_page_id / notion_sync_error we set.
+                session.commit()
 
         return {
             "side_effect": ExpenseLogged(
@@ -318,6 +352,8 @@ class ExpenseSubgraph:
                 transacted_at=record.transacted_at,
                 payment_method=record.payment_method,  # type: ignore[arg-type]
                 transaction_id=record.transaction_id,
+                notion_page_id=record.notion_page_id,
+                notion_sync_error=record.notion_sync_error,
             )
         }
 

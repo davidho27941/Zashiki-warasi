@@ -540,6 +540,94 @@ class TestExpenseLoggedNotify:
         assert "AUTO-deadbeef1234" in text
         assert "(自動編號)" in text
 
+
+class TestNotionLinkInNotify:
+    """`_format_expense_logged` renders Notion status from the
+    SideEffect: a clickable link on success, a warning line on failure,
+    nothing when Notion is not configured."""
+
+    def _logged(self, **overrides):
+        from decimal import Decimal
+        from zashiki_warasi.core.schemas import ExpenseLogged
+
+        base = dict(
+            record_id="uuid-x",
+            amount=Decimal("100"),
+            currency="JPY",
+            vendor="V",
+            location=None,
+            category=None,
+            transacted_at=None,
+            payment_method=None,
+            transaction_id="AUTO-deadbeef1234",
+            notion_page_id=None,
+            notion_sync_error=None,
+        )
+        base.update(overrides)
+        return ExpenseLogged(**base)
+
+    def test_notion_page_id_renders_as_link(self):
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_logged,
+        )
+
+        # Notion page ids in API responses come with dashes; the public
+        # URL is the same id with dashes stripped.
+        effect = self._logged(
+            notion_page_id="1234abcd-5678-ef90-1234-567890abcdef"
+        )
+        text = _format_expense_logged(effect)
+        assert "https://notion.so/1234abcd5678ef901234567890abcdef" in text
+        assert "🔗" in text
+
+    def test_notion_sync_error_renders_as_warning(self):
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_logged,
+        )
+
+        effect = self._logged(
+            notion_sync_error="connection reset by peer"
+        )
+        text = _format_expense_logged(effect)
+        assert "⚠️ Notion 同步失敗" in text
+        assert "connection reset by peer" in text
+
+    def test_long_error_message_truncated(self):
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_logged,
+        )
+
+        long_err = "x" * 500
+        effect = self._logged(notion_sync_error=long_err)
+        text = _format_expense_logged(effect)
+        # Truncated to 80 chars in the formatter to keep Telegram tidy.
+        assert "x" * 80 in text
+        assert "x" * 200 not in text
+
+    def test_neither_field_renders_nothing(self):
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_logged,
+        )
+
+        text = _format_expense_logged(self._logged())
+        assert "https://notion.so" not in text
+        assert "Notion 同步失敗" not in text
+
+    def test_page_id_takes_precedence_over_error(self):
+        # Defensive: in normal operation only one is set, but if both
+        # somehow appear we prefer the success link.
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_logged,
+        )
+
+        effect = self._logged(
+            notion_page_id="abcd1234",
+            notion_sync_error="should be ignored",
+        )
+        text = _format_expense_logged(effect)
+        assert "https://notion.so/abcd1234" in text
+        assert "Notion 同步失敗" not in text
+
     def test_missing_amount_displays_buming(self):
         from zashiki_warasi.agents.email_agent import (
             _format_expense_logged,

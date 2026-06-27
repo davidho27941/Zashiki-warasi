@@ -33,6 +33,7 @@ from zashiki_warasi.core.schemas import (
     coerce_importance,
 )
 from zashiki_warasi.gmail.client import GmailClient
+from zashiki_warasi.notifications.notion import NotionExpenseRecorder
 from zashiki_warasi.notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,7 @@ class EmailAgent:
         session_factory: sessionmaker,
         notifier: TelegramNotifier,
         client: GmailClient,
+        notion: NotionExpenseRecorder | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._notifier = notifier
@@ -118,6 +120,7 @@ class EmailAgent:
             session_factory=session_factory,
             client=client,
             model=chat_model,
+            notion=notion,
         )
         self._graph = self._build_graph(checkpointer)
 
@@ -340,6 +343,19 @@ def _format_expense_logged(effect: ExpenseLogged) -> str:
         # persist always sets transaction_id (real or AUTO-), so we
         # should never hit this branch in practice.
         lines.append("  編號: 不明")
+
+    # Notion mirror status. notion_page_id and notion_sync_error are
+    # mutually exclusive in normal operation; when both are None the
+    # Notion integration is simply not configured and we render
+    # nothing.
+    if effect.notion_page_id:
+        page_id_no_dashes = effect.notion_page_id.replace("-", "")
+        lines.append(
+            f"  🔗 https://notion.so/{page_id_no_dashes}"
+        )
+    elif effect.notion_sync_error:
+        err = html.escape(effect.notion_sync_error[:80])
+        lines.append(f"  ⚠️ Notion 同步失敗: {err}")
 
     return "\n".join(lines)
 

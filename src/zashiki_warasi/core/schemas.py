@@ -214,6 +214,10 @@ class ExpenseLogged(BaseModel):
     Carries every field the notify formatter renders to Telegram so the
     user sees a complete record (with 不明 placeholders for fields the
     LLM could not extract) rather than a sparse subset.
+
+    `notion_page_id` and `notion_sync_error` are mutually exclusive in
+    practice: one is set when Notion sync succeeded, the other when it
+    failed, both are None when Notion is not configured.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -229,6 +233,9 @@ class ExpenseLogged(BaseModel):
     transacted_at: datetime | None
     payment_method: PaymentMethod | None
     transaction_id: str | None
+
+    notion_page_id: str | None = None
+    notion_sync_error: str | None = None
 
 
 class ExpenseNeedsReview(BaseModel):

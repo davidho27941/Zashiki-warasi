@@ -128,6 +128,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sha256(message_id)[:12]` so resumes / retries never split a
   single email across two ids. Telegram appends `(自動編號)` to
   flag the synthetic value.
+- **Notion expense database mirror (optional, env-gated).** When
+  both `NOTION_TOKEN` and `NOTION_EXPENSE_DATABASE_ID` are set, every
+  newly persisted expense row is also written to the configured Notion
+  database via `notification/notion.py::NotionExpenseRecorder`. The
+  resulting `https://notion.so/<page_id>` link is appended to the
+  Telegram message; on dedup hit the existing row's link is reused
+  (no second page is created). Failures are best-effort: the Notion
+  exception is captured as `notion_sync_error` on the `expenses` row
+  and surfaced in Telegram as `⚠️ Notion 同步失敗: …` while Postgres
+  remains source of truth. Either env var missing → integration
+  completely disabled, no calls attempted. Two new columns on
+  `expenses` (`notion_page_id`, `notion_sync_error`) via migration
+  `0005_expenses_notion.py`. Required Notion DB schema documented in
+  the README. Adds `notion-client` dependency.
 - **Cross-email expense deduplication**: when two different emails
   describe the same real-world transaction (e.g. SMBC Olive's
   「承認番号」 confirmation arriving at the same minute as the
@@ -147,7 +161,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Tests
 
-225 tests total (92 new over v0.1's 133):
+256 tests total (123 new over v0.1's 133):
 
 - **Notifications + registry (v0.2 batch, 36):**
   - `tests/notifications/test_telegram.py` (14): construction
@@ -197,6 +211,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     leaves both rows, different-amount leaves both rows, multiple-
     candidates-in-window stays safe by inserting new, missing
     required fields skips Stage 2.
+  - `tests/notifications/test_notion.py` (22):
+    construction guards (token / database_id required), parent +
+    response shape, full property mapping (title fallback, amount
+    Decimal→float, currency/payment_method as `select`, category
+    as `rich_text`, transacted_at ISO 8601, transaction_id /
+    location as `rich_text`), per-field None-omit, error wrapping
+    into `NotionSyncError`, missing-id-in-response defensive raise.
+  - `tests/agents/verticals/test_expense.py::TestNotionSync` (4):
+    no notion → no fields set, success records page id on row +
+    SideEffect, failure is captured as `notion_sync_error` and
+    never raises, dedup hit does not re-attempt Notion.
+  - `tests/agents/test_email_agent.py::TestNotionLinkInNotify` (5):
+    page id renders as `https://notion.so/...` link with 🔗, error
+    renders as `⚠️ Notion 同步失敗: ...`, long error truncated to
+    80 chars, neither field renders nothing, page id takes
+    precedence over error.
 
 ## [0.1.0] - 2026-06-25
 

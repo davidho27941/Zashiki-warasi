@@ -113,7 +113,42 @@ llama-server -m /path/to/model.gguf --port 8080
 
 To point at OpenAI or another provider instead, see the env vars below.
 
-### 5. Run
+### 5. Notion (optional)
+
+Set `NOTION_TOKEN` and `NOTION_EXPENSE_DATABASE_ID` to mirror every
+recorded expense into a Notion database. Leave either empty and the
+agent skips Notion entirely — no calls, no extra dependency to think
+about at runtime.
+
+1. Create an internal integration at
+   [notion.so/my-integrations](https://www.notion.so/my-integrations);
+   copy the token (starts with `secret_`).
+2. Create a Notion database for expenses with the schema below
+   (property names are matched exactly):
+
+   | Property | Type | Notes |
+   | --- | --- | --- |
+   | 商家 | Title | Required by Notion (every DB needs one title) |
+   | 金額 | Number | |
+   | 幣別 | Select | Predefine options: `JPY`, `TWD`, `USD` |
+   | 時間 | Date | Date+time supported via ISO 8601 |
+   | 類別 | Rich text | Free-form; the LLM can output any Chinese label |
+   | 支付方式 | Select | Predefine options: `Rakuten Pay`, `SMBC Olive`, `三菱UFJ-JCB`, `PayPay`, `信用卡`, `現金`, `其他` |
+   | 編號 | Rich text | Both real transaction ids and `AUTO-…` placeholders |
+   | 地點 | Rich text | |
+
+3. Open the database as a full page → **Share** → invite your
+   integration so it can write.
+4. Copy the database id (the 32-char hex chunk in the URL, before
+   any `?v=`) into `NOTION_EXPENSE_DATABASE_ID`.
+
+Sync is **best-effort**: a failed Notion call (network down, schema
+mismatch, integration revoked) is captured as `notion_sync_error` on
+the `expenses` row and surfaced in the Telegram message as
+`⚠️ Notion 同步失敗: …`. The Postgres write is unaffected and
+remains the source of truth.
+
+### 6. Run
 
 ```bash
 uv run zashiki-warasi

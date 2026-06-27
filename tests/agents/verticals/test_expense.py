@@ -699,3 +699,177 @@ class TestCrossEmailDedup:
             assert session.scalar(
                 select(func.count()).select_from(ExpenseRecord)
             ) == 2
+
+
+# ---------- Notion sync ----------
+
+
+class TestNotionSync:
+    """ExpenseSubgraph + NotionExpenseRecorder integration.
+
+    Notion is best-effort: failures NEVER raise out of the subgraph;
+    they're captured as `notion_sync_error` on the SideEffect and the
+    Postgres row so the user can see what happened in Telegram and
+    the operator can reconcile from the DB.
+    """
+
+    def _make_notion(
+        self, *, page_id: str | None = "notion-page-uuid",
+        raises: Exception | None = None,
+    ) -> MagicMock:
+        notion = MagicMock(name="notion")
+        if raises is not None:
+            notion.record_expense.side_effect = raises
+        else:
+            notion.record_expense.return_value = page_id
+        return notion
+
+    def test_no_notion_passed_skips_sync(
+        self, session_factory, mock_client, fake_email, fake_analysis,
+    ):
+        draft = _draft()
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=_build_model_returning(draft),
+            notion=None,
+        )
+
+        result = subgraph.graph.invoke(
+            _initial_state(fake_email, fake_analysis),
+            config={"configurable": {"thread_id": fake_email.id}},
+        )
+
+        assert result["side_effect"].notion_page_id is None
+        assert result["side_effect"].notion_sync_error is None
+        with session_factory() as session:
+            row = session.scalar(
+                select(ExpenseRecord).where(
+                    ExpenseRecord.message_id == fake_email.id
+                )
+            )
+            assert row.notion_page_id is None
+            assert row.notion_sync_error is None
+
+    def test_successful_sync_records_page_id(
+        self, session_factory, mock_client, fake_email, fake_analysis,
+    ):
+        notion = self._make_notion(page_id="page-abc-123")
+        draft = _draft()
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=_build_model_returning(draft),
+            notion=notion,
+        )
+
+        result = subgraph.graph.invoke(
+            _initial_state(fake_email, fake_analysis),
+            config={"configurable": {"thread_id": fake_email.id}},
+        )
+
+        notion.record_expense.assert_called_once()
+        assert result["side_effect"].notion_page_id == "page-abc-123"
+        assert result["side_effect"].notion_sync_error is None
+        with session_factory() as session:
+            row = session.scalar(
+                select(ExpenseRecord).where(
+                    ExpenseRecord.message_id == fake_email.id
+                )
+            )
+            assert row.notion_page_id == "page-abc-123"
+            assert row.notion_sync_error is None
+
+    def test_failed_sync_captured_as_error_not_raised(
+        self, session_factory, mock_client, fake_email, fake_analysis,
+    ):
+        from zashiki_warasi.notifications.notion import NotionSyncError
+
+        notion = self._make_notion(
+            raises=NotionSyncError("connection reset by peer")
+        )
+        draft = _draft()
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=_build_model_returning(draft),
+            notion=notion,
+        )
+
+        result = subgraph.graph.invoke(
+            _initial_state(fake_email, fake_analysis),
+            config={"configurable": {"thread_id": fake_email.id}},
+        )
+
+        se = result["side_effect"]
+        assert se.notion_page_id is None
+        assert "connection reset" in (se.notion_sync_error or "")
+        with session_factory() as session:
+            row = session.scalar(
+                select(ExpenseRecord).where(
+                    ExpenseRecord.message_id == fake_email.id
+                )
+            )
+            assert row.notion_page_id is None
+            assert "connection reset" in (row.notion_sync_error or "")
+
+    def test_dedup_hit_does_not_attempt_notion(
+        self, session_factory, mock_client, fake_analysis,
+    ):
+        """Cross-email dedup re-uses an existing row, so we must NOT
+        write a second Notion page for the same transaction."""
+        existing_message = "msg-seed"
+        with session_factory() as session:
+            existing = ExpenseRecord(
+                message_id=existing_message,
+                amount=Decimal("3200"),
+                currency="JPY",
+                transacted_at=datetime(
+                    2026, 6, 27, 14, 32, tzinfo=timezone.utc
+                ),
+                vendor="Amazon.co.jp",
+                location=None,
+                category="購物",
+                transaction_id="250-1234567",
+                payment_method="SMBC Olive",
+                raw_extraction={},
+                notion_page_id="previously-synced-page",
+                notion_sync_error=None,
+            )
+            session.add(existing)
+            session.commit()
+            existing_id = str(existing.id)
+
+        notion = self._make_notion()
+        draft = _draft(transaction_id="250-1234567")
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=_build_model_returning(draft),
+            notion=notion,
+        )
+
+        email = EmailMessage(
+            id="msg-new",
+            thread_id="t",
+            history_id=2,
+            from_address="x@y.com",
+            subject="s",
+            body_plain="body",
+            received_at=datetime.now(timezone.utc),
+            attachments=[],
+        )
+        result = subgraph.graph.invoke(
+            _initial_state(email, fake_analysis),
+            config={"configurable": {"thread_id": email.id}},
+        )
+
+        notion.record_expense.assert_not_called()
+        assert result["side_effect"].record_id == existing_id
+        assert (
+            result["side_effect"].notion_page_id == "previously-synced-page"
+        )
