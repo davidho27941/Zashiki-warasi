@@ -166,6 +166,15 @@ class ExpenseDraft(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
+    title: str | None = Field(
+        default=None,
+        description=(
+            "這筆消費的「名稱」,30 字以內中文簡短描述。"
+            "優先用實際購買的商品為主 (e.g. '拿鐵 + 摩卡星冰樂'、"
+            "'Kindle Paperwhite'); 若無法判斷具體商品,用「商家 + "
+            "性質」(e.g. 'Amazon 訂單'、'JR 車票'); 連商家都不知道則 null。"
+        ),
+    )
     amount: Decimal | None = Field(
         default=None,
         description="決済金額。信件未提及請回傳 null。",
@@ -225,6 +234,7 @@ class ExpenseLogged(BaseModel):
     kind: Literal["expense"] = "expense"
     record_id: str  # uuid stringified
 
+    title: str | None
     amount: Decimal | None
     currency: Currency | None
     vendor: str | None

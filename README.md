@@ -128,7 +128,7 @@ about at runtime.
 
    | Property | Type | Notes |
    | --- | --- | --- |
-   | 消費店家 | Title | Required by Notion (every DB needs one title) |
+   | 消費店家 | Title | Required by Notion (every DB needs one title). Receives the LLM-generated short description of the expense (e.g. `拿鐵 + 摩卡星冰樂`, `Amazon Kindle 訂單`), NOT the merchant name. Falls back to the vendor name, then `(不明)`. |
    | 消費金額 | Number | |
    | 幣別 | Select | Predefine options: `日幣`, `台幣`, `美金` (the agent translates ISO codes from extraction) |
    | 消費日期 | Date | Date+time supported via ISO 8601 |

@@ -53,6 +53,7 @@ def _record(**overrides) -> ExpenseRecord:
     base = dict(
         id=uuid.uuid4(),
         message_id="m-1",
+        title="Starbucks 拿鐵",
         amount=Decimal("1198"),
         currency="JPY",
         transacted_at=datetime(2026, 6, 21, 15, 13, 3, tzinfo=timezone.utc),
@@ -104,20 +105,33 @@ class TestRequestShape:
 
 
 class TestPropertyMapping:
-    def test_vendor_becomes_title(self):
+    def test_title_becomes_notion_title(self):
+        # The Notion `消費店家` column (which IS the title) gets the
+        # LLM-extracted descriptive title, e.g. "拿鐵 + 摩卡星冰樂".
         recorder = _recorder_with_mock_client()
-        recorder.record_expense(_record(vendor="Coffee Place"))
+        recorder.record_expense(_record(title="拿鐵 + 摩卡星冰樂"))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
         assert props["消費店家"] == {
-            "title": [{"text": {"content": "Coffee Place"}}]
+            "title": [{"text": {"content": "拿鐵 + 摩卡星冰樂"}}]
         }
 
-    def test_none_vendor_falls_back_to_buming_title(self):
-        # Notion requires the title to exist; we never send a missing
-        # title even when the LLM couldn't extract a vendor.
+    def test_title_none_falls_back_to_vendor(self):
+        # When the LLM couldn't extract a title, use the vendor name as
+        # a sensible row label so the Notion DB stays readable.
         recorder = _recorder_with_mock_client()
-        recorder.record_expense(_record(vendor=None))
+        recorder.record_expense(_record(title=None, vendor="Starbucks"))
+
+        props = recorder._client.pages.create.call_args.kwargs["properties"]
+        assert props["消費店家"] == {
+            "title": [{"text": {"content": "Starbucks"}}]
+        }
+
+    def test_title_and_vendor_both_none_falls_back_to_buming(self):
+        # Notion requires the title to exist; we never send a missing
+        # title even when neither title nor vendor were extracted.
+        recorder = _recorder_with_mock_client()
+        recorder.record_expense(_record(title=None, vendor=None))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
         assert props["消費店家"]["title"][0]["text"]["content"] == "(不明)"

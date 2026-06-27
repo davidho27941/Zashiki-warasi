@@ -497,6 +497,7 @@ class TestExpenseLoggedNotify:
 
         effect = ExpenseLogged(
             record_id="uuid-x",
+            title="Kindle Paperwhite",
             amount=Decimal("3200"),
             currency="JPY",
             vendor="Amazon.co.jp",
@@ -508,6 +509,7 @@ class TestExpenseLoggedNotify:
         )
         text = _format_expense_logged(effect)
         assert "已記帳" in text
+        assert "Kindle Paperwhite" in text  # title in headline
         assert "3200 JPY" in text
         assert "Amazon.co.jp" in text
         assert "東京都渋谷区" in text
@@ -527,6 +529,7 @@ class TestExpenseLoggedNotify:
 
         effect = ExpenseLogged(
             record_id="uuid-x",
+            title=None,
             amount=Decimal("100"),
             currency="JPY",
             vendor="V",
@@ -540,6 +543,53 @@ class TestExpenseLoggedNotify:
         assert "AUTO-deadbeef1234" in text
         assert "(自動編號)" in text
 
+    def test_title_renders_in_headline(self):
+        from decimal import Decimal
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_logged,
+        )
+        from zashiki_warasi.core.schemas import ExpenseLogged
+
+        effect = ExpenseLogged(
+            record_id="uuid-x",
+            title="拿鐵 + 摩卡星冰樂",
+            amount=Decimal("1198"),
+            currency="JPY",
+            vendor="Starbucks",
+            location=None,
+            category="飲食",
+            transacted_at=None,
+            payment_method="現金",
+            transaction_id=None,
+        )
+        text = _format_expense_logged(effect)
+        # Title is appended to the "💰 已記帳" headline (HTML tag
+        # closes before the colon).
+        assert "💰 <b>已記帳</b>: 拿鐵 + 摩卡星冰樂" in text
+
+    def test_no_title_keeps_plain_headline(self):
+        from decimal import Decimal
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_logged,
+        )
+        from zashiki_warasi.core.schemas import ExpenseLogged
+
+        effect = ExpenseLogged(
+            record_id="uuid-x",
+            title=None,  # LLM didn't extract one
+            amount=Decimal("100"),
+            currency="JPY",
+            vendor="V",
+            location=None,
+            category=None,
+            transacted_at=None,
+            payment_method=None,
+            transaction_id=None,
+        )
+        text = _format_expense_logged(effect)
+        assert "已記帳:" not in text  # no trailing colon when no title
+        assert "💰 <b>已記帳</b>" in text
+
 
 class TestNotionLinkInNotify:
     """`_format_expense_logged` renders Notion status from the
@@ -552,6 +602,7 @@ class TestNotionLinkInNotify:
 
         base = dict(
             record_id="uuid-x",
+            title=None,
             amount=Decimal("100"),
             currency="JPY",
             vendor="V",
@@ -636,6 +687,7 @@ class TestNotionLinkInNotify:
 
         effect = ExpenseLogged(
             record_id="uuid-x",
+            title=None,
             amount=None,
             currency=None,
             vendor="某店",
@@ -659,6 +711,7 @@ class TestNotionLinkInNotify:
 
         effect = ExpenseLogged(
             record_id="uuid-x",
+            title=None,
             amount=Decimal("100"),
             currency="JPY",
             vendor="V",

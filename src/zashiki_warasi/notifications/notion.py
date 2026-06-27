@@ -85,15 +85,16 @@ class NotionExpenseRecorder:
     def _build_properties(self, record: ExpenseRecord) -> dict[str, Any]:
         """Translate an ExpenseRecord into Notion property payload.
 
-        Title is always populated (with `(不明)` if vendor is None) —
-        Notion requires the title property to exist. All other fields
-        are skipped when None to keep the row clean.
+        Title is always populated — Notion requires the title property
+        to exist. We prefer the LLM-extracted `title` (a short
+        descriptive name like "拿鐵 + 摩卡星冰樂"), fall back to the
+        vendor, then `(不明)`. All other fields are skipped when None
+        to keep the row clean.
         """
+        title_text = record.title or record.vendor or "(不明)"
         properties: dict[str, Any] = {
             self.PROP_VENDOR: {
-                "title": [
-                    {"text": {"content": record.vendor or "(不明)"}}
-                ],
+                "title": [{"text": {"content": title_text}}],
             },
         }
 

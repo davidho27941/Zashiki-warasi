@@ -194,7 +194,15 @@ EXPENSE_EXTRACT_SYSTEM_PROMPT = """\
 
 7. category 用簡短中文標籤 (e.g. 餐飲、交通、購物、訂閱、水電)。
 
-8. 反幻想規則(極重要):
+8. title 是這筆消費的「名稱」,30 字以內中文簡短描述:
+   - 優先用實際購買的商品為主 (e.g. 「拿鐵 + 摩卡星冰樂」、
+     「Kindle Paperwhite」、「悠遊卡儲值 500 元」)
+   - 若無法判斷具體商品,用「商家 + 性質」
+     (e.g. 「Amazon 訂單」、「JR 車票」、「便利商店消費」)
+   - 不要重複 amount / currency 已涵蓋的金額資訊
+   - 連商家都不知道則回 null
+
+9. 反幻想規則(極重要):
    - 若你看到的內容只是模糊提示而非具體支出資料
      (e.g.「您有新訂單,詳見附件」但附件本身未附在以下提供的文字中)
      → 所有欄位回 null。
@@ -325,6 +333,7 @@ class ExpenseSubgraph:
             else:
                 record = ExpenseRecord(
                     message_id=state["email"].id,
+                    title=draft.title,
                     amount=draft.amount,
                     currency=draft.currency,
                     transacted_at=draft.transacted_at,
@@ -380,6 +389,7 @@ class ExpenseSubgraph:
         return {
             "side_effect": ExpenseLogged(
                 record_id=str(record.id),
+                title=record.title,
                 amount=record.amount,
                 currency=record.currency,  # type: ignore[arg-type]
                 vendor=record.vendor,

@@ -304,7 +304,10 @@ def _format_expense_logged(effect: ExpenseLogged) -> str:
     """Render every payment field. Missing values show as 不明 so the
     user sees a complete frame rather than guessing whether a field was
     "not present in email" vs. "we forgot to display it"."""
-    lines = ["💰 <b>已記帳</b>"]
+    header = "💰 <b>已記帳</b>"
+    if effect.title:
+        header += f": {html.escape(effect.title)}"
+    lines = [header]
 
     if effect.amount is not None:
         amt = f"{effect.amount} {effect.currency or ''}".strip()
