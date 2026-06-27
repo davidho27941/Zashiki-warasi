@@ -69,9 +69,11 @@ def fake_email() -> EmailMessage:
 @pytest.fixture
 def fixed_analysis() -> EmailAnalysis:
     return EmailAnalysis(
-        category="work",
-        importance="high",
+        importance=4,
+        urgency="urgent",
+        category="會議邀請",
         summary="Quarterly report needs review by Friday.",
+        keywords=["report", "Q2", "Friday"],
     )
 
 
@@ -98,11 +100,20 @@ def mock_notifier() -> MagicMock:
 
 
 @pytest.fixture
-def agent(session_factory, mock_chat_model, mock_notifier) -> EmailAgent:
+def mock_client() -> MagicMock:
+    """GmailClient mock — expense subgraph uses it for get_attachment."""
+    return MagicMock(name="gmail_client")
+
+
+@pytest.fixture
+def agent(
+    session_factory, mock_chat_model, mock_notifier, mock_client
+) -> EmailAgent:
     return EmailAgent(
         checkpointer=InMemorySaver(),
         session_factory=session_factory,
         notifier=mock_notifier,
+        client=mock_client,
     )
 
 
@@ -127,9 +138,11 @@ class TestPersistence:
 
         assert row is not None
         assert row.message_id == fake_email.id
-        assert row.category == "work"
-        assert row.importance == "high"
+        assert row.category == "會議邀請"
+        assert row.importance == 4
+        assert row.urgency == "urgent"
         assert row.summary == "Quarterly report needs review by Friday."
+        assert row.keywords == ["report", "Q2", "Friday"]
 
     def test_analyzed_at_populated(
         self, agent, fake_email, session_factory
@@ -173,16 +186,25 @@ class TestLLMInvocation:
     def test_with_structured_output_uses_email_analysis_schema(
         self, agent, mock_chat_model
     ):
-        mock_chat_model.model.with_structured_output.assert_called_once_with(
-            EmailAnalysis
-        )
+        # Analyze uses EmailAnalysis; the expense subgraph (built in
+        # __init__) also calls with_structured_output(ExpenseDraft) on
+        # the same model. Assert EmailAnalysis is among the calls.
+        from zashiki_warasi.core.schemas import ExpenseDraft
+
+        targets = [
+            c.args[0]
+            for c in mock_chat_model.model.with_structured_output.call_args_list
+        ]
+        assert EmailAnalysis in targets
+        assert ExpenseDraft in targets
 
     def test_system_prompt_starts_correctly(
         self, agent, fake_email, mock_chat_model
     ):
         agent.handle_email(fake_email)
         messages = mock_chat_model.structured.invoke.call_args.args[0]
-        assert "email triage" in messages[0].content.lower()
+        # New prompt is Chinese; check for a stable marker phrase
+        assert "電子郵件分析助理" in messages[0].content
 
     def test_user_prompt_contains_email_fields(
         self, agent, fake_email, mock_chat_model
@@ -242,6 +264,7 @@ class TestNoneAnalysis:
             checkpointer=InMemorySaver(),
             session_factory=session_factory,
             notifier=MagicMock(),
+            client=MagicMock(),
         )
 
         # Must not raise
@@ -264,8 +287,11 @@ class TestNotifyNode:
     ):
         agent.handle_email(fake_email)
         text = mock_notifier.send_message.call_args.args[0]
-        assert "work" in text
-        assert "HIGH" in text
+        # New format: [category] in header, ★ for importance
+        assert "[會議邀請]" in text
+        assert "★" * 4 + "☆" in text  # importance=4 → 4 stars + 1 empty
+        # urgency Chinese label
+        assert "緊急" in text
 
     def test_message_contains_from_subject_summary(
         self, agent, fake_email, mock_notifier
@@ -283,9 +309,11 @@ class TestNotifyNode:
 
         # Inject analysis whose summary has HTML special chars.
         mock_chat_model.structured.invoke.return_value = EmailAnalysis(
-            category="work",
-            importance="low",
+            importance=2,
+            urgency="none",
+            category="其他",
             summary="Review <code> blocks & semicolons",
+            keywords=[],
         )
         email = EmailMessage(
             id="msg-html",
@@ -341,3 +369,183 @@ class TestNotifyNode:
 
         method_order = [c[0] for c in parent.mock_calls]
         assert method_order.index("analyze") < method_order.index("notify")
+
+
+# ---------- routing: analyze -> expense_sg vs notify ----------
+
+
+class TestRouting:
+    def test_non_expense_category_skips_expense_subgraph(
+        self, agent, fake_email, mock_notifier, mock_client
+    ):
+        # fixed_analysis uses category="會議邀請" (non-expense).
+        agent.handle_email(fake_email)
+        # Expense subgraph would call client.get_attachment for any PDF
+        # attachments; with no PDFs and a non-expense category, the
+        # subgraph never runs and get_attachment is never called.
+        mock_client.get_attachment.assert_not_called()
+        # notify still happens
+        mock_notifier.send_message.assert_called_once()
+
+    def test_expense_category_invokes_expense_subgraph(
+        self, monkeypatch, session_factory, fake_email,
+        mock_notifier, mock_client,
+    ):
+        from decimal import Decimal
+        from zashiki_warasi.core.schemas import (
+            EmailAnalysis,
+            ExpenseDraft,
+            ExpenseLogged,
+        )
+
+        # Analyze returns category="消費支出" → routes to expense_sg.
+        expense_analysis = EmailAnalysis(
+            importance=3,
+            urgency="normal",
+            category="消費支出",
+            summary="Amazon 訂單確認",
+            keywords=["Amazon"],
+        )
+        draft = ExpenseDraft(
+            amount=Decimal("3200"),
+            currency="JPY",
+            vendor="Amazon.co.jp",
+        )
+
+        # mock_chat_model fixture builds ONE structured runnable;
+        # analyze and the subgraph each call with_structured_output()
+        # → different runnable per call. We need a model where each
+        # call returns a distinct mock.
+        analyze_runnable = MagicMock(name="analyze_structured")
+        analyze_runnable.invoke.return_value = expense_analysis
+        extract_runnable = MagicMock(name="extract_structured")
+        extract_runnable.invoke.return_value = draft
+
+        model = MagicMock(name="chat_model")
+        # First call wraps EmailAnalysis (in EmailAgent.__init__),
+        # second wraps ExpenseDraft (in compile_expense_subgraph).
+        model.with_structured_output.side_effect = [
+            analyze_runnable,
+            extract_runnable,
+        ]
+        monkeypatch.setattr(
+            "zashiki_warasi.agents.email_agent.get_chat_model",
+            lambda: model,
+        )
+
+        agent = EmailAgent(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            notifier=mock_notifier,
+            client=mock_client,
+        )
+
+        agent.handle_email(fake_email)
+
+        # Both LLM runnables invoked exactly once.
+        analyze_runnable.invoke.assert_called_once()
+        extract_runnable.invoke.assert_called_once()
+
+        # Notify message contains the ExpenseLogged block markers.
+        text = mock_notifier.send_message.call_args.args[0]
+        assert "已記帳" in text
+        assert "3200 JPY" in text
+        assert "Amazon.co.jp" in text
+
+
+# ---------- needs_review side_effect rendering ----------
+
+
+class TestNeedsReviewNotify:
+    def test_image_pdf_unreadable_message_contains_warning_and_filename(self):
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_needs_review,
+        )
+        from zashiki_warasi.core.schemas import ExpenseNeedsReview
+
+        effect = ExpenseNeedsReview(
+            reason="image_pdf_unreadable",
+            unreadable_attachments=["scan_receipt.pdf"],
+        )
+        text = _format_expense_needs_review(effect)
+        assert "⚠️" in text
+        assert "影像格式" in text
+        assert "scan_receipt.pdf" in text
+        assert "人工" in text
+
+    def test_extraction_yielded_nulls_message_explains_reason(self):
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_needs_review,
+        )
+        from zashiki_warasi.core.schemas import ExpenseNeedsReview
+
+        effect = ExpenseNeedsReview(reason="extraction_yielded_nulls")
+        text = _format_expense_needs_review(effect)
+        assert "信件內容不足" in text
+
+
+# ---------- expense_logged rendering ----------
+
+
+class TestExpenseLoggedNotify:
+    def test_all_fields_present(self):
+        from decimal import Decimal
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_logged,
+        )
+        from zashiki_warasi.core.schemas import ExpenseLogged
+
+        effect = ExpenseLogged(
+            record_id="uuid-x",
+            amount=Decimal("3200"),
+            currency="JPY",
+            vendor="Amazon.co.jp",
+            transacted_at=datetime(2026, 6, 27, 14, 32, tzinfo=timezone.utc),
+            payment_method="SMBC Olive",
+            transaction_id="250-1234567",
+        )
+        text = _format_expense_logged(effect)
+        assert "已記帳" in text
+        assert "3200 JPY" in text
+        assert "Amazon.co.jp" in text
+        assert "2026-06-27 14:32" in text
+        assert "SMBC Olive" in text
+        assert "250-1234567" in text
+
+    def test_missing_amount_displays_buming(self):
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_logged,
+        )
+        from zashiki_warasi.core.schemas import ExpenseLogged
+
+        effect = ExpenseLogged(
+            record_id="uuid-x",
+            amount=None,
+            currency=None,
+            vendor="某店",
+            transacted_at=None,
+            payment_method=None,
+            transaction_id=None,
+        )
+        text = _format_expense_logged(effect)
+        assert "不明" in text
+
+    def test_other_payment_method_shown_with_warning(self):
+        from decimal import Decimal
+        from zashiki_warasi.agents.email_agent import (
+            _format_expense_logged,
+        )
+        from zashiki_warasi.core.schemas import ExpenseLogged
+
+        effect = ExpenseLogged(
+            record_id="uuid-x",
+            amount=Decimal("100"),
+            currency="JPY",
+            vendor="V",
+            transacted_at=None,
+            payment_method="其他",
+            transaction_id=None,
+        )
+        text = _format_expense_logged(effect)
+        assert "⚠️ 其他" in text
+        assert "請檢查信件確認" in text

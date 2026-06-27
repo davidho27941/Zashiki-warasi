@@ -8,52 +8,129 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Telegram notification node** in the email agent graph:
-  `analyze -> notify -> END`. Every analysed email produces a Telegram
-  message containing icon + importance + category + sender + subject +
-  summary (HTML formatted, all user-controlled fields escaped). The
-  notify node fails closed — if the Telegram API is unreachable, the
-  analyze result stays in the LangGraph checkpoint and the next tick
-  resumes at notify without re-billing the LLM.
+
+#### Telegram notifications and tool registry
+
+- **Telegram notification node** in the email agent graph
+  (`analyze -> notify -> END`). Every analysed email produces a
+  Telegram message; the notify node fails closed so a Telegram
+  outage keeps the analyze checkpoint and the next tick resumes
+  at notify without re-billing the LLM.
 - `notifications/telegram.py`: `TelegramNotifier` wrapping the Bot
   API `sendMessage` endpoint, with explicit `TelegramError` for
   transport failures, non-2xx responses, and `ok: false` API
   rejections.
 - `TelegramSettings` (env prefix `TELEGRAM_`): bot_token, chat_id,
   api_base, timeout_seconds.
-- `agents/tools/registry.py`: `ToolRegistry` for `langchain_core.tools.BaseTool`
-  instances. Supports `register` (also usable as a decorator),
-  `get`, `all`, `names`, plus `in` / `len` / iteration. Rejects
-  duplicate names and non-BaseTool inputs with actionable error
-  messages. Module-level `default_registry` provided for code that
-  wants a shared instance. Subgraph-as-tool patterns are explicitly
-  out of scope — those stay with the agent that composes them.
-- `httpx` pinned as an explicit direct dependency
-  (previously transitive via `langchain-openai`).
+- `agents/tools/registry.py`: `ToolRegistry` for
+  `langchain_core.tools.BaseTool` instances. Supports `register`
+  (also usable as a decorator), `get`, `all`, `names`, plus `in` /
+  `len` / iteration. Rejects duplicate names and non-BaseTool
+  inputs with actionable error messages. Module-level
+  `default_registry` provided. Subgraph-as-tool patterns are
+  explicitly out of scope.
+- `httpx` pinned as an explicit direct dependency.
+
+#### Analyze redesign and expense vertical
+
+- **Analyze node** rewritten to produce the full new
+  `EmailAnalysis` schema: `importance` 1-5, `urgency`
+  (very_urgent / urgent / normal / none), Chinese `category`
+  (Literal of 13 values), 5W1H `summary` (50-200 字, explicitly
+  excluding specific payment details), `keywords` (≤5). System
+  prompt rewritten in Chinese per the product spec, including
+  the importance scoring rules ("科技新知 ≥3", "促銷/廣告/信貸 ≤3")
+  and the financial-product → 廣告/促銷 classification rule.
+- **Expense vertical** as a LangGraph subgraph routed from analyze
+  when `category == "消費支出"`:
+  - `extract` builds combined context (email body + PDF
+    attachment text), calls LLM with
+    `with_structured_output(ExpenseDraft)`, **early-bails** to
+    `ExpenseNeedsReview(image_pdf_unreadable)` when the only
+    attachment is an unreadable PDF (does not hallucinate fields
+    from sender / subject alone).
+  - `persist` writes `ExpenseRecord` with the full draft JSON
+    for audit, handles UNIQUE collision on `message_id` for
+    crash-resume idempotency. All-null drafts route to
+    `ExpenseNeedsReview(extraction_yielded_nulls)` instead of
+    persisting.
+- `ExpenseDraft` / `ExpenseLogged` / `ExpenseNeedsReview` pydantic
+  models; `SideEffect` discriminated union for typed dispatch in
+  notify.
+- `PaymentMethod` Literal: 7 values (Rakuten Pay, SMBC Olive,
+  三菱UFJ-JCB, PayPay, 信用卡, 現金, 其他). The prompt distinguishes
+  null (信件未提及) from 其他 (提及但不在白名單).
+- `agents/verticals/pdf.py`: `pdf_extract_text` (pdfplumber-backed)
+  returns empty string on image-only / corrupt / encrypted PDFs;
+  `collect_text` returns `(combined_text, unreadable_pdf_filenames)`
+  so callers can route deterministically.
+- `ExpenseRecord` ORM on the new `expenses` table.
+- Alembic migrations `0003_analysis_v2.py` (drops +
+  recreates `importance` as INTEGER, adds `urgency` + `keywords`)
+  and `0004_expenses.py`.
+- Notify formatter rewritten to the spec output template:
+  importance stars + category header, 標題 / 寄件者 / 內容摘要 /
+  急迫性, per-side_effect-kind block (`expense_logged` with
+  金額/商家/時間/支付/編號; `expense_needs_review` with reason +
+  filename list), 關鍵字 hashtags. `payment_method == "其他"` gets
+  a `⚠️` prefix prompting manual check.
+- `pdfplumber` (plus pdfminer.six / pillow / pypdfium2 transitive).
 
 ### Changed
-- `EmailAgent.__init__` now requires a `notifier: TelegramNotifier`.
+
+- **Breaking — `EmailAnalysis` schema**: `importance` becomes
+  `int (1-5)` (was `Literal["high","medium","low"]`); `urgency`
+  and `keywords` added; `category` is now a Chinese Literal of 13
+  values (was English Literal of 6). Migration 0003 drops the old
+  column and recreates — existing dev rows are not preserved.
+- **Breaking — `EmailAgent.__init__`**: now requires `notifier:
+  TelegramNotifier` and `client: GmailClient` (the latter for the
+  expense subgraph's PDF fetch).
 - `EmailAgent.handle_email` is now properly idempotent across
   re-invocations: it inspects `graph.get_state(config)` first and
   reuses the cached analysis when the thread is already complete,
-  so a second call (e.g. from the poller after an unrelated crash)
-  no longer re-bills the LLM or re-sends Telegram. Interrupted
-  threads are resumed via `invoke(None, config)`.
+  so a second call no longer re-bills the LLM or re-sends Telegram.
+  Interrupted threads are resumed via `invoke(None, config)`. This
+  closes a gap that v0.1's CHANGELOG actually oversold.
+- ORM uses generic `sqlalchemy.JSON` / `sqlalchemy.Uuid` rather
+  than Postgres-specific `JSONB` / `postgresql.UUID`, so the
+  SQLite-backed test fixtures keep compiling. Production
+  PostgreSQL still maps these to `JSONB` / `UUID` at the dialect
+  layer.
 
 ### Tests
-- 36 new tests (169 total):
+
+196 tests total (63 new over v0.1's 133):
+
+- **Notifications + registry (v0.2 batch, 36):**
   - `tests/notifications/test_telegram.py` (14): construction
-    guards, URL / payload shape, parse_mode handling, timeout
-    pass-through, and error mapping for transport / HTTP /
-    `ok: false` cases.
-  - `tests/agents/test_email_agent.py::TestNotifyNode` (7): notify
-    invoked exactly once, message contents, HTML escaping of
-    untrusted fields, fail-closed behaviour blocking persistence,
-    second-call idempotency, ordering relative to analyze.
+    guards, URL / payload / parse_mode / timeout, error mapping.
+  - `tests/agents/test_email_agent.py::TestNotifyNode` (7):
+    notifier called once, message contents, HTML escaping,
+    fail-closed blocks persistence, second-call idempotency,
+    ordering after analyze.
   - `tests/agents/tools/test_registry.py` (15): register /
-    decorator usage / duplicate guard / non-BaseTool guard /
-    lookup / `all()` snapshot semantics / dunder methods /
-    `default_registry` presence.
+    decorator / duplicate / non-BaseTool guards, lookup, `all()`
+    snapshot, dunders, `default_registry` presence.
+- **Analyze + expense vertical (v0.3 batch, 27):**
+  - `tests/agents/verticals/test_pdf.py` (13): page concat,
+    None-page handling, image-only / corrupt PDF safe returns,
+    body+PDF combination, unreadable-PDF reporting, mixed
+    readable/unreadable.
+  - `tests/agents/verticals/test_expense.py` (7): happy path
+    (extract + persist + ExpenseLogged), image-PDF early-bail
+    skips LLM, all-null draft → needs_review, amount-only and
+    vendor-only persist, UNIQUE collision reuses existing row,
+    user prompt includes body + PDF text.
+  - `tests/agents/test_email_agent.py::TestRouting` (2): non-expense
+    category skips subgraph, `category == "消費支出"` invokes
+    subgraph and Telegram message includes expense block.
+  - `tests/agents/test_email_agent.py::TestNeedsReviewNotify` (2):
+    image-PDF reason wording + filename listed, all-null reason
+    wording.
+  - `tests/agents/test_email_agent.py::TestExpenseLoggedNotify` (3):
+    full-fields rendering, missing-amount shows 不明, `其他`
+    payment method gets a ⚠️ prefix.
 
 ## [0.1.0] - 2026-06-25
 

@@ -81,6 +81,7 @@ def run() -> None:
             checkpointer=checkpointer,
             session_factory=session_factory,
             notifier=notifier,
+            client=client,
         )
         poller = Poller(
             client=client,
