@@ -178,6 +178,53 @@ tests/                  # Pytest scaffolding
   and re-baselines from the current `historyId` (backlog is skipped, as
   on first run).
 
+## How expense deduplication works
+
+A single real-world purchase commonly produces more than one email —
+for example a credit-card authorisation notice plus the merchant's own
+receipt arriving seconds apart with no shared identifier. Before
+inserting a new row, the expense subgraph runs `find_duplicate(draft,
+session)` against the existing `expenses` table:
+
+**Stage 1 — real `transaction_id` collision.** If `draft.transaction_id`
+matches an existing row, that row is treated as the same transaction.
+Auto-generated IDs (prefix `AUTO-`) are excluded here because they are
+derived per-email and cannot legitimately coincide across distinct
+emails.
+
+**Stage 2 — amount + currency + ±15-minute window.** If Stage 1 produced
+no match, the subgraph looks for an existing row with the same
+`amount`, the same `currency`, and `transacted_at` within ±15 minutes.
+Vendor name is intentionally **not** part of the match because
+cross-system emails use different strings for the same merchant
+(`STARBUCKS MOBILE ORDER` from SMBC Olive vs.
+`スターバックス コーヒー Olive LOUNGE 渋谷店` from the merchant itself).
+If more than one existing row falls inside the window the subgraph
+gives up and inserts the new email as a distinct record — it would
+rather keep one spurious duplicate than collapse two real transactions
+into one.
+
+When `find_duplicate` returns a row, persist_node skips the `INSERT`,
+emits an `ExpenseLogged` SideEffect pointing at the existing
+`record_id`, and writes a log line:
+
+```
+expense: msg-<id> matches existing record <uuid>
+    (duplicate transaction) → skip persist
+```
+
+The Telegram notification still goes out, but it carries the original
+record's fields. The follow-up email is not annotated as a duplicate
+in the message itself — surfacing that is left for a future iteration.
+
+**Known limitations.** Long-range duplicates (Amazon "order confirmed"
+plus "shipped" hours or days later) are intentionally **not**
+deduplicated. Widening the time window beyond 15 minutes starts
+collapsing routine recurring purchases — e.g. three identical coffee
+runs in the same day — into a single record. Stage 2 also requires all
+three signals (`amount`, `currency`, `transacted_at`); a draft missing
+any of them skips Stage 2 and is persisted as new.
+
 ## License
 
 See [LICENSE](./LICENSE).
