@@ -8,52 +8,225 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Telegram notification node** in the email agent graph:
-  `analyze -> notify -> END`. Every analysed email produces a Telegram
-  message containing icon + importance + category + sender + subject +
-  summary (HTML formatted, all user-controlled fields escaped). The
-  notify node fails closed — if the Telegram API is unreachable, the
-  analyze result stays in the LangGraph checkpoint and the next tick
-  resumes at notify without re-billing the LLM.
+
+#### Telegram notifications and tool registry
+
+- **Telegram notification node** in the email agent graph
+  (`analyze -> notify -> END`). Every analysed email produces a
+  Telegram message; the notify node fails closed so a Telegram
+  outage keeps the analyze checkpoint and the next tick resumes
+  at notify without re-billing the LLM.
 - `notifications/telegram.py`: `TelegramNotifier` wrapping the Bot
   API `sendMessage` endpoint, with explicit `TelegramError` for
   transport failures, non-2xx responses, and `ok: false` API
   rejections.
 - `TelegramSettings` (env prefix `TELEGRAM_`): bot_token, chat_id,
   api_base, timeout_seconds.
-- `agents/tools/registry.py`: `ToolRegistry` for `langchain_core.tools.BaseTool`
-  instances. Supports `register` (also usable as a decorator),
-  `get`, `all`, `names`, plus `in` / `len` / iteration. Rejects
-  duplicate names and non-BaseTool inputs with actionable error
-  messages. Module-level `default_registry` provided for code that
-  wants a shared instance. Subgraph-as-tool patterns are explicitly
-  out of scope — those stay with the agent that composes them.
-- `httpx` pinned as an explicit direct dependency
-  (previously transitive via `langchain-openai`).
+- `agents/tools/registry.py`: `ToolRegistry` for
+  `langchain_core.tools.BaseTool` instances. Supports `register`
+  (also usable as a decorator), `get`, `all`, `names`, plus `in` /
+  `len` / iteration. Rejects duplicate names and non-BaseTool
+  inputs with actionable error messages. Module-level
+  `default_registry` provided. Subgraph-as-tool patterns are
+  explicitly out of scope.
+- `httpx` pinned as an explicit direct dependency.
+
+#### Analyze redesign and expense vertical
+
+- **Analyze node** rewritten to produce the full new
+  `EmailAnalysis` schema: `importance` 1-5, `urgency`
+  (very_urgent / urgent / normal / none), Chinese `category`
+  (Literal of 13 values), 5W1H `summary` (50-200 字, explicitly
+  excluding specific payment details), `keywords` (≤5). System
+  prompt rewritten in Chinese per the product spec, including
+  the importance scoring rules ("科技新知 ≥3", "促銷/廣告/信貸 ≤3")
+  and the financial-product → 廣告/促銷 classification rule.
+- **Expense vertical** as a LangGraph subgraph routed from analyze
+  when `category == "消費支出"`:
+  - `extract` builds combined context (email body + PDF
+    attachment text), calls LLM with
+    `with_structured_output(ExpenseDraft)`, **early-bails** to
+    `ExpenseNeedsReview(image_pdf_unreadable)` when the only
+    attachment is an unreadable PDF (does not hallucinate fields
+    from sender / subject alone).
+  - `persist` writes `ExpenseRecord` with the full draft JSON
+    for audit, handles UNIQUE collision on `message_id` for
+    crash-resume idempotency. All-null drafts route to
+    `ExpenseNeedsReview(extraction_yielded_nulls)` instead of
+    persisting.
+- `ExpenseDraft` / `ExpenseLogged` / `ExpenseNeedsReview` pydantic
+  models; `SideEffect` discriminated union for typed dispatch in
+  notify.
+- `PaymentMethod` Literal: 7 values (Rakuten Pay, SMBC Olive,
+  三菱UFJ-JCB, PayPay, 信用卡, 現金, 其他). The prompt distinguishes
+  null (信件未提及) from 其他 (提及但不在白名單).
+- `agents/verticals/pdf.py`: `pdf_extract_text` (pdfplumber-backed)
+  returns empty string on image-only / corrupt / encrypted PDFs;
+  `collect_text` returns `(combined_text, unreadable_pdf_filenames)`
+  so callers can route deterministically.
+- `ExpenseRecord` ORM on the new `expenses` table.
+- Alembic migrations `0003_analysis_v2.py` (drops +
+  recreates `importance` as INTEGER, adds `urgency` + `keywords`)
+  and `0004_expenses.py`.
+- Notify formatter rewritten to the spec output template:
+  importance stars + category header, 標題 / 寄件者 / 內容摘要 /
+  急迫性, per-side_effect-kind block (`expense_logged` with
+  金額/商家/時間/支付/編號; `expense_needs_review` with reason +
+  filename list), 關鍵字 hashtags. `payment_method == "其他"` gets
+  a `⚠️` prefix prompting manual check.
+- `pdfplumber` (plus pdfminer.six / pillow / pypdfium2 transitive).
 
 ### Changed
-- `EmailAgent.__init__` now requires a `notifier: TelegramNotifier`.
+
+- **Breaking — `EmailAnalysis` schema**: `importance` becomes
+  `int (1-5)` (was `Literal["high","medium","low"]`); `urgency`
+  and `keywords` added; `category` is now a Chinese Literal of 13
+  values (was English Literal of 6). Migration 0003 drops the old
+  column and recreates — existing dev rows are not preserved.
+- **Breaking — `EmailAgent.__init__`**: now requires `notifier:
+  TelegramNotifier` and `client: GmailClient` (the latter for the
+  expense subgraph's PDF fetch).
 - `EmailAgent.handle_email` is now properly idempotent across
   re-invocations: it inspects `graph.get_state(config)` first and
   reuses the cached analysis when the thread is already complete,
-  so a second call (e.g. from the poller after an unrelated crash)
-  no longer re-bills the LLM or re-sends Telegram. Interrupted
-  threads are resumed via `invoke(None, config)`.
+  so a second call no longer re-bills the LLM or re-sends Telegram.
+  Interrupted threads are resumed via `invoke(None, config)`. This
+  closes a gap that v0.1's CHANGELOG actually oversold.
+- ORM uses generic `sqlalchemy.JSON` / `sqlalchemy.Uuid` rather
+  than Postgres-specific `JSONB` / `postgresql.UUID`, so the
+  SQLite-backed test fixtures keep compiling. Production
+  PostgreSQL still maps these to `JSONB` / `UUID` at the dialect
+  layer.
+
+### Post-design adjustments (from live-run feedback)
+
+- `ExpenseSubgraph` is now a class (was `compile_expense_subgraph`
+  factory), matching the `EmailAgent` shape for project-internal
+  consistency. Exposes the compiled CompiledGraph as `.graph`.
+- **Migration 0003 wraps a `TRUNCATE TABLE email_analyses`**
+  before reshaping. Without it, the `ADD COLUMN importance
+  INTEGER NOT NULL` raised `psycopg.errors.NotNullViolation` on
+  any non-empty dev DB. The TRUNCATE makes the documented "dev
+  rows not preserved" behaviour actually happen.
+- **`importance` coercion at use-sites** (`_format_message` and
+  `_persist`). A pydantic `field_validator` alone is not enough
+  when LangGraph's checkpoint loader reconstructs state via
+  `BaseModel.model_construct`, which bypasses validators. The
+  shared `coerce_importance(value)` helper in `core.schemas`
+  accepts ints, digit strings ("4"), digit-with-label ("4
+  (重要)"), Chinese labels (非常不重要..非常重要), and English
+  labels (very low..very high). Unmappable values fall back to a
+  neutral 3 at the formatter rather than crashing the daemon.
+- **Full expense field rendering**: `ExpenseLogged` gains
+  `location` and `category`; the Telegram footer now always
+  renders all seven payment fields (金額 / 商家 / 地點 / 類別 /
+  時間 / 支付 / 編號) with `不明` for any field the LLM could
+  not extract. Distinguishes "extraction failed for this field"
+  from "format dropped this field".
+- **Auto-generated `transaction_id`** with an `AUTO-` prefix when
+  the email itself carries none — derived deterministically from
+  `sha256(message_id)[:12]` so resumes / retries never split a
+  single email across two ids. Telegram appends `(自動編號)` to
+  flag the synthetic value.
+- **Notion expense database mirror (optional, env-gated).** When
+  both `NOTION_TOKEN` and `NOTION_EXPENSE_DATABASE_ID` are set, every
+  newly persisted expense row is also written to the configured Notion
+  database via `notification/notion.py::NotionExpenseRecorder`. The
+  resulting `https://notion.so/<page_id>` link is appended to the
+  Telegram message; on dedup hit the existing row's link is reused
+  (no second page is created). Failures are best-effort: the Notion
+  exception is captured as `notion_sync_error` on the `expenses` row
+  and surfaced in Telegram as `⚠️ Notion 同步失敗: …` while Postgres
+  remains source of truth. Either env var missing → integration
+  completely disabled, no calls attempted. Two new columns on
+  `expenses` (`notion_page_id`, `notion_sync_error`) via migration
+  `0005_expenses_notion.py`. Required Notion DB schema documented in
+  the README. Adds `notion-client` dependency.
+- **Cross-email expense deduplication**: when two different emails
+  describe the same real-world transaction (e.g. SMBC Olive's
+  「承認番号」 confirmation arriving at the same minute as the
+  Starbucks merchant receipt), the second one no longer creates a
+  duplicate row. `find_duplicate(draft, session)` in
+  `agents/verticals/expense.py` does a two-stage match:
+  1. Real `transaction_id` collision (AUTO- ids excluded so they
+     can never coincide across distinct emails).
+  2. `amount + currency + transacted_at ± 15 min`. The window is
+     deliberately narrow so back-to-back same-amount purchases are
+     not collapsed; ambiguous windows (≥ 2 candidates) bail to
+     "insert as new" rather than risk merging the wrong record.
+  Long-range duplicates (Amazon "order confirmed" + "shipped"
+  hours/days later) are intentionally NOT deduplicated — widening
+  the window starts producing false positives on routine recurring
+  purchases.
 
 ### Tests
-- 36 new tests (169 total):
+
+256 tests total (123 new over v0.1's 133):
+
+- **Notifications + registry (v0.2 batch, 36):**
   - `tests/notifications/test_telegram.py` (14): construction
-    guards, URL / payload shape, parse_mode handling, timeout
-    pass-through, and error mapping for transport / HTTP /
-    `ok: false` cases.
-  - `tests/agents/test_email_agent.py::TestNotifyNode` (7): notify
-    invoked exactly once, message contents, HTML escaping of
-    untrusted fields, fail-closed behaviour blocking persistence,
-    second-call idempotency, ordering relative to analyze.
+    guards, URL / payload / parse_mode / timeout, error mapping.
+  - `tests/agents/test_email_agent.py::TestNotifyNode` (7):
+    notifier called once, message contents, HTML escaping,
+    fail-closed blocks persistence, second-call idempotency,
+    ordering after analyze.
   - `tests/agents/tools/test_registry.py` (15): register /
-    decorator usage / duplicate guard / non-BaseTool guard /
-    lookup / `all()` snapshot semantics / dunder methods /
-    `default_registry` presence.
+    decorator / duplicate / non-BaseTool guards, lookup, `all()`
+    snapshot, dunders, `default_registry` presence.
+- **Analyze + expense vertical (v0.3 batch, 27):**
+  - `tests/agents/verticals/test_pdf.py` (13): page concat,
+    None-page handling, image-only / corrupt PDF safe returns,
+    body+PDF combination, unreadable-PDF reporting, mixed
+    readable/unreadable.
+  - `tests/agents/verticals/test_expense.py` (7): happy path
+    (extract + persist + ExpenseLogged), image-PDF early-bail
+    skips LLM, all-null draft → needs_review, amount-only and
+    vendor-only persist, UNIQUE collision reuses existing row,
+    user prompt includes body + PDF text.
+  - `tests/agents/test_email_agent.py::TestRouting` (2): non-expense
+    category skips subgraph, `category == "消費支出"` invokes
+    subgraph and Telegram message includes expense block.
+  - `tests/agents/test_email_agent.py::TestNeedsReviewNotify` (2):
+    image-PDF reason wording + filename listed, all-null reason
+    wording.
+  - `tests/agents/test_email_agent.py::TestExpenseLoggedNotify` (4):
+    full-fields rendering, missing-amount shows 不明, `其他`
+    payment method gets a ⚠️ prefix, AUTO- transaction id gets a
+    (自動編號) suffix.
+- **Post-design batch (22 new):**
+  - `tests/core/test_schemas.py::TestImportanceCoercion` (17):
+    int passthrough, digit-string coercion, digit-with-label,
+    Chinese / English label mapping, out-of-range rejection,
+    unmappable rejection.
+  - `tests/agents/verticals/test_expense.py::TestAutoTransactionId`
+    (4): LLM-provided id passes through, missing id triggers
+    AUTO- generation with stable length, helper is deterministic
+    and distinguishes inputs, auto-id reaches the persisted row.
+  - `TestExpenseLoggedNotify::test_auto_transaction_id_marked_in_message`
+    (1): (自動編號) suffix only on AUTO- ids.
+  - `tests/agents/verticals/test_expense.py::TestCrossEmailDedup`
+    (7): Stage 1 real-id match, AUTO- id non-collision across
+    distinct emails, the Starbucks cross-system case (same amount,
+    seconds apart, different vendor strings), time-outside-window
+    leaves both rows, different-amount leaves both rows, multiple-
+    candidates-in-window stays safe by inserting new, missing
+    required fields skips Stage 2.
+  - `tests/notifications/test_notion.py` (22):
+    construction guards (token / database_id required), parent +
+    response shape, full property mapping (title fallback, amount
+    Decimal→float, currency/payment_method as `select`, category
+    as `rich_text`, transacted_at ISO 8601, transaction_id /
+    location as `rich_text`), per-field None-omit, error wrapping
+    into `NotionSyncError`, missing-id-in-response defensive raise.
+  - `tests/agents/verticals/test_expense.py::TestNotionSync` (4):
+    no notion → no fields set, success records page id on row +
+    SideEffect, failure is captured as `notion_sync_error` and
+    never raises, dedup hit does not re-attempt Notion.
+  - `tests/agents/test_email_agent.py::TestNotionLinkInNotify` (5):
+    page id renders as `https://notion.so/...` link with 🔗, error
+    renders as `⚠️ Notion 同步失敗: ...`, long error truncated to
+    80 chars, neither field renders nothing, page id takes
+    precedence over error.
 
 ## [0.1.0] - 2026-06-25
 

@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from decimal import Decimal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+# ----- Gmail layer -----
 
 
 class AttachmentMeta(BaseModel):
@@ -49,24 +53,220 @@ class ProfileInfo(BaseModel):
     history_id: int
 
 
-class EmailAnalysis(BaseModel):
-    """LLM-produced summary and classification of a single email.
+# ----- Analysis -----
 
-    Used as the structured output schema for the analyze node; the same
-    fields are persisted to the `email_analyses` table.
+
+Urgency = Literal["very_urgent", "urgent", "normal", "none"]
+
+Category = Literal[
+    "消費支出",
+    "訂閱服務",
+    "技術文章",
+    "講座資訊",
+    "會議邀請",
+    "帳單通知",
+    "廣告",
+    "促銷",
+    "社交",
+    "新聞",
+    "安全通知",
+    "股票資訊",
+    "其他",
+]
+
+
+class EmailAnalysis(BaseModel):
+    """High-level analysis produced by the analyze node.
+
+    Importance / urgency / category / summary / keywords come from a
+    single LLM call. Payment-specific details (amount, vendor, etc.)
+    are handled by the expense subgraph and surface via SideEffect —
+    they are intentionally NOT duplicated in `summary` to avoid
+    inconsistency between the two extraction paths.
     """
 
-    category: Literal[
-        "work",
-        "personal",
-        "promotional",
-        "newsletter",
-        "transactional",
-        "other",
-    ] = Field(description="High-level intent / kind of message.")
-    importance: Literal["high", "medium", "low"] = Field(
-        description="How urgently the user should act on this email."
+    model_config = ConfigDict(frozen=True)
+
+    importance: int = Field(
+        ..., ge=1, le=5,
+        description="重要度 1(非常不重要) 到 5(非常重要)",
     )
+    urgency: Urgency = Field(description="急迫性等級")
+    category: Category = Field(description="內容分類")
     summary: str = Field(
-        description="One to two sentences capturing the key point.",
+        ...,
+        description="50-200 字以內的 5W1H 高層次摘要,不含具體支付資訊",
     )
+    keywords: list[str] = Field(
+        default_factory=list,
+        max_length=5,
+        description="至多 5 個關鍵字",
+    )
+
+    @field_validator("importance", mode="before")
+    @classmethod
+    def _coerce_importance_validator(cls, value: object) -> object:
+        return coerce_importance(value)
+
+
+_IMPORTANCE_LABEL_MAP: dict[str, int] = {
+    "非常不重要": 1, "不重要": 2, "普通": 3,
+    "重要": 4, "非常重要": 5,
+    "very low": 1, "low": 2, "medium": 3,
+    "high": 4, "very high": 5,
+}
+
+
+def coerce_importance(value: object) -> object:
+    """Best-effort coercion of an `importance` value to int 1-5.
+
+    Used both by EmailAnalysis's field_validator (catches values at
+    construction time) AND by downstream consumers like notify
+    formatting (catches values that bypassed validation, e.g. state
+    loaded from a LangGraph checkpoint via `model_construct` which
+    skips validators).
+
+    Returns the value unchanged if it cannot be coerced — callers
+    that need a guaranteed int should int() the result themselves.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return value
+        head = stripped.split()[0]
+        if head.isdigit():
+            return int(head)
+        if stripped in _IMPORTANCE_LABEL_MAP:
+            return _IMPORTANCE_LABEL_MAP[stripped]
+    return value
+
+
+# ----- Expense vertical -----
+
+
+Currency = Literal["JPY", "TWD", "USD"]
+
+
+PaymentMethod = Literal[
+    "Rakuten Pay",
+    "SMBC Olive",
+    "三菱UFJ-JCB",
+    "PayPay",
+    "信用卡",
+    "現金",
+    "其他",
+]
+
+
+class ExpenseDraft(BaseModel):
+    """LLM extraction of payment info from a single email + its PDF
+    attachments. All fields nullable — the LLM must use null when the
+    source text does not mention that detail rather than fabricate it.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    title: str | None = Field(
+        default=None,
+        description=(
+            "這筆消費的「名稱」,30 字以內中文簡短描述。"
+            "優先用實際購買的商品為主 (e.g. '拿鐵 + 摩卡星冰樂'、"
+            "'Kindle Paperwhite'); 若無法判斷具體商品,用「商家 + "
+            "性質」(e.g. 'Amazon 訂單'、'JR 車票'); 連商家都不知道則 null。"
+        ),
+    )
+    amount: Decimal | None = Field(
+        default=None,
+        description="決済金額。信件未提及請回傳 null。",
+    )
+    currency: Currency | None = Field(
+        default=None,
+        description=(
+            "幣別。可從金額符號或上下文推斷 "
+            "(¥/円→JPY、NT$/新台幣→TWD、$/USD→USD)。"
+        ),
+    )
+    transacted_at: datetime | None = Field(
+        default=None,
+        description=(
+            "消費時間,ISO 8601 (YYYY-MM-DD HH:MM:SS)。"
+            "只有日期無時間時時間用 00:00:00;連日期都無則 null。"
+        ),
+    )
+    vendor: str | None = Field(
+        default=None,
+        description="商家名稱 (e.g. ファミリーマート、Amazon)。",
+    )
+    location: str | None = Field(
+        default=None,
+        description="消費地點的物理地址 (e.g. 東京都渋谷区)。",
+    )
+    category: str | None = Field(
+        default=None,
+        description="消費類別簡短中文標籤 (e.g. 餐飲、交通、購物、訂閱、水電)。",
+    )
+    transaction_id: str | None = Field(
+        default=None,
+        description="交易識別碼:伝票番号、注文番号、order ID 等都歸這一欄。",
+    )
+    payment_method: PaymentMethod | None = Field(
+        default=None,
+        description=(
+            "支付方式。null = 信件未提及;'其他' = 提及但不在白名單。"
+        ),
+    )
+
+
+class ExpenseLogged(BaseModel):
+    """SideEffect payload when an ExpenseRecord was successfully written.
+
+    Carries every field the notify formatter renders to Telegram so the
+    user sees a complete record (with 不明 placeholders for fields the
+    LLM could not extract) rather than a sparse subset.
+
+    `notion_page_id` and `notion_sync_error` are mutually exclusive in
+    practice: one is set when Notion sync succeeded, the other when it
+    failed, both are None when Notion is not configured.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["expense"] = "expense"
+    record_id: str  # uuid stringified
+
+    title: str | None
+    amount: Decimal | None
+    currency: Currency | None
+    vendor: str | None
+    location: str | None
+    category: str | None
+    transacted_at: datetime | None
+    payment_method: PaymentMethod | None
+    transaction_id: str | None
+
+    notion_page_id: str | None = None
+    notion_sync_error: str | None = None
+
+
+class ExpenseNeedsReview(BaseModel):
+    """SideEffect payload when expense extraction couldn't proceed.
+
+    Not persisted to the expenses table — that table is only for
+    confirmed records. Notify surfaces this so the user can handle
+    the email manually.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["expense_needs_review"] = "expense_needs_review"
+    reason: Literal[
+        "image_pdf_unreadable",
+        "extraction_yielded_nulls",
+    ]
+    unreadable_attachments: list[str] = Field(default_factory=list)
+
+
+SideEffect = Annotated[
+    ExpenseLogged | ExpenseNeedsReview,
+    Field(discriminator="kind"),
+]

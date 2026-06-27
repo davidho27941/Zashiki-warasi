@@ -94,3 +94,26 @@ class TelegramSettings(BaseSettings):
         description="Override only for testing or self-hosted bridges.",
     )
     timeout_seconds: float = 10.0
+
+
+class NotionSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="NOTION_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    token: str = Field(
+        default="",
+        description="Internal integration token starting with 'secret_'.",
+    )
+    expense_database_id: str = Field(
+        default="",
+        description=(
+            "UUID of the Notion database to write expenses into. "
+            "The integration must be granted access to this database "
+            "via its share menu in Notion."
+        ),
+    )
+    timeout_seconds: float = 10.0
