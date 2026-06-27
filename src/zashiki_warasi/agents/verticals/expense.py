@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from datetime import timedelta
 from typing import TypedDict
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -12,7 +13,7 @@ from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from zashiki_warasi.agents.verticals.pdf import collect_text
 from zashiki_warasi.core.models import ExpenseRecord
@@ -30,6 +31,73 @@ logger = logging.getLogger(__name__)
 
 
 AUTO_TRANSACTION_ID_PREFIX = "AUTO-"
+
+
+DEDUP_WINDOW_MINUTES = 15
+
+
+def find_duplicate(
+    draft: ExpenseDraft,
+    session: Session,
+    window_minutes: int = DEDUP_WINDOW_MINUTES,
+) -> ExpenseRecord | None:
+    """Locate an existing ExpenseRecord that matches `draft`.
+
+    Two-stage match:
+
+    1. Real `transaction_id` collision (the email's order/receipt
+       number is identical to one we already stored). Strongest
+       signal; immediately conclusive.
+    2. Amount + currency + a narrow time window around
+       `transacted_at`. Catches the cross-system case where a single
+       transaction generates two emails with different identifiers —
+       e.g. SMBC Olive's `承認番号` plus Starbucks's order receipt
+       for the same purchase, arriving seconds apart with the same
+       amount.
+
+    Returns None when no decisive match is found. Multiple Stage-2
+    candidates within the window is treated as "ambiguous, accept as
+    new" rather than risk merging into the wrong record.
+    """
+    # Stage 1: real transaction_id match. AUTO- ids are per-email
+    # deterministic so they can never coincide across distinct emails;
+    # we still skip them here to make the intent explicit.
+    if (
+        draft.transaction_id
+        and not draft.transaction_id.startswith(AUTO_TRANSACTION_ID_PREFIX)
+    ):
+        match = session.scalar(
+            select(ExpenseRecord).where(
+                ExpenseRecord.transaction_id == draft.transaction_id,
+            )
+        )
+        if match is not None:
+            return match
+
+    # Stage 2: (amount, currency, transacted_at ± window). Skip if any
+    # of the three required signals is missing — we'd be guessing.
+    if (
+        draft.amount is not None
+        and draft.currency
+        and draft.transacted_at is not None
+    ):
+        delta = timedelta(minutes=window_minutes)
+        lo = draft.transacted_at - delta
+        hi = draft.transacted_at + delta
+        candidates = list(
+            session.scalars(
+                select(ExpenseRecord).where(
+                    ExpenseRecord.amount == draft.amount,
+                    ExpenseRecord.currency == draft.currency,
+                    ExpenseRecord.transacted_at.between(lo, hi),
+                )
+            ).all()
+        )
+        if len(candidates) == 1:
+            return candidates[0]
+        # 0 -> definitely new; >1 -> ambiguous, do not merge
+
+    return None
 
 
 def auto_transaction_id(message_id: str) -> str:
@@ -201,31 +269,43 @@ class ExpenseSubgraph:
         )
 
         with self._session_factory() as session:
-            record = ExpenseRecord(
-                message_id=state["email"].id,
-                amount=draft.amount,
-                currency=draft.currency,
-                transacted_at=draft.transacted_at,
-                vendor=draft.vendor,
-                location=draft.location,
-                category=draft.category,
-                transaction_id=transaction_id,
-                payment_method=draft.payment_method,
-                raw_extraction=draft.model_dump(mode="json"),
-            )
-            session.add(record)
-            try:
-                session.commit()
-            except IntegrityError:
-                # message_id UNIQUE collided — already persisted on a
-                # prior tick (LangGraph resume scenario). Use the
-                # existing row for the SideEffect.
-                session.rollback()
-                record = session.scalar(
-                    select(ExpenseRecord).where(
-                        ExpenseRecord.message_id == state["email"].id
-                    )
+            # Cross-email dedup: detect "different email, same actual
+            # transaction" (e.g. SMBC Olive confirmation + Starbucks
+            # merchant receipt) before writing a second row.
+            existing = find_duplicate(draft, session)
+            if existing is not None:
+                logger.info(
+                    f"expense: {state['email'].id} matches existing record "
+                    f"{existing.id} (duplicate transaction) → skip persist"
                 )
+                record = existing
+            else:
+                record = ExpenseRecord(
+                    message_id=state["email"].id,
+                    amount=draft.amount,
+                    currency=draft.currency,
+                    transacted_at=draft.transacted_at,
+                    vendor=draft.vendor,
+                    location=draft.location,
+                    category=draft.category,
+                    transaction_id=transaction_id,
+                    payment_method=draft.payment_method,
+                    raw_extraction=draft.model_dump(mode="json"),
+                )
+                session.add(record)
+                try:
+                    session.commit()
+                except IntegrityError:
+                    # message_id UNIQUE collided — already persisted on
+                    # a prior tick (LangGraph resume scenario, NOT
+                    # cross-email dedup which is handled above). Use
+                    # the existing row for the SideEffect.
+                    session.rollback()
+                    record = session.scalar(
+                        select(ExpenseRecord).where(
+                            ExpenseRecord.message_id == state["email"].id
+                        )
+                    )
 
         return {
             "side_effect": ExpenseLogged(

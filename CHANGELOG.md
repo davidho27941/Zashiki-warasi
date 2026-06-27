@@ -128,10 +128,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sha256(message_id)[:12]` so resumes / retries never split a
   single email across two ids. Telegram appends `(自動編號)` to
   flag the synthetic value.
+- **Cross-email expense deduplication**: when two different emails
+  describe the same real-world transaction (e.g. SMBC Olive's
+  「承認番号」 confirmation arriving at the same minute as the
+  Starbucks merchant receipt), the second one no longer creates a
+  duplicate row. `find_duplicate(draft, session)` in
+  `agents/verticals/expense.py` does a two-stage match:
+  1. Real `transaction_id` collision (AUTO- ids excluded so they
+     can never coincide across distinct emails).
+  2. `amount + currency + transacted_at ± 15 min`. The window is
+     deliberately narrow so back-to-back same-amount purchases are
+     not collapsed; ambiguous windows (≥ 2 candidates) bail to
+     "insert as new" rather than risk merging the wrong record.
+  Long-range duplicates (Amazon "order confirmed" + "shipped"
+  hours/days later) are intentionally NOT deduplicated — widening
+  the window starts producing false positives on routine recurring
+  purchases.
 
 ### Tests
 
-218 tests total (85 new over v0.1's 133):
+225 tests total (92 new over v0.1's 133):
 
 - **Notifications + registry (v0.2 batch, 36):**
   - `tests/notifications/test_telegram.py` (14): construction
@@ -174,6 +190,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     and distinguishes inputs, auto-id reaches the persisted row.
   - `TestExpenseLoggedNotify::test_auto_transaction_id_marked_in_message`
     (1): (自動編號) suffix only on AUTO- ids.
+  - `tests/agents/verticals/test_expense.py::TestCrossEmailDedup`
+    (7): Stage 1 real-id match, AUTO- id non-collision across
+    distinct emails, the Starbucks cross-system case (same amount,
+    seconds apart, different vendor strings), time-outside-window
+    leaves both rows, different-amount leaves both rows, multiple-
+    candidates-in-window stays safe by inserting new, missing
+    required fields skips Stage 2.
 
 ## [0.1.0] - 2026-06-25
 

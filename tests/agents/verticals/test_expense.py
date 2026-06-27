@@ -450,3 +450,252 @@ class TestExtractPrompt:
         user_content = messages[1].content
         assert "PDF EXTRACTED TEXT 12345" in user_content
         assert "Amazon" in user_content  # from body or subject
+
+
+# ---------- cross-email dedup ----------
+
+
+class TestCrossEmailDedup:
+    """`find_duplicate` two-stage logic + integration through persist_node.
+
+    Stage 1 catches "same email order number, different email body"
+    (e.g. confirmation + reminder both quoting the same Amazon order id).
+    Stage 2 catches "different system, same purchase" — the Starbucks
+    example where SMBC Olive's 承認番号 and the merchant receipt
+    arrive seconds apart with the same amount but no shared id.
+    """
+
+    def _seed_existing(
+        self, session_factory, *,
+        message_id="msg-old",
+        amount=Decimal("1198"),
+        currency="JPY",
+        transacted_at=datetime(2026, 6, 21, 15, 13, 3, tzinfo=timezone.utc),
+        vendor="STARBUCKS MOBILE ORDER",
+        transaction_id="303840",
+    ):
+        with session_factory() as session:
+            existing = ExpenseRecord(
+                message_id=message_id,
+                amount=amount,
+                currency=currency,
+                transacted_at=transacted_at,
+                vendor=vendor,
+                location=None,
+                category=None,
+                transaction_id=transaction_id,
+                payment_method="SMBC Olive",
+                raw_extraction={},
+            )
+            session.add(existing)
+            session.commit()
+            return str(existing.id)
+
+    def _run_subgraph(
+        self, session_factory, mock_client, fake_analysis,
+        new_email_id: str, draft: ExpenseDraft,
+    ):
+        model = _build_model_returning(draft)
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=model,
+        )
+        email = EmailMessage(
+            id=new_email_id,
+            thread_id="t",
+            history_id=1,
+            from_address="x@y.com",
+            subject="s",
+            body_plain="body",
+            received_at=datetime.now(timezone.utc),
+            attachments=[],
+        )
+        return subgraph.graph.invoke(
+            _initial_state(email, fake_analysis),
+            config={"configurable": {"thread_id": email.id}},
+        )
+
+    # --- Stage 1: real transaction_id match ---
+
+    def test_real_transaction_id_match_reuses_existing(
+        self, session_factory, mock_client, fake_analysis,
+    ):
+        existing_id = self._seed_existing(session_factory)
+        draft = _draft(
+            transaction_id="303840",  # same as seeded
+            amount=Decimal("9999"),  # deliberately different to prove
+            transacted_at=datetime(2030, 1, 1, tzinfo=timezone.utc),
+            vendor="Different vendor",
+        )
+        result = self._run_subgraph(
+            session_factory, mock_client, fake_analysis, "msg-new", draft,
+        )
+
+        assert result["side_effect"].record_id == existing_id
+        with session_factory() as session:
+            assert session.scalar(
+                select(func.count()).select_from(ExpenseRecord)
+            ) == 1
+
+    def test_auto_transaction_id_does_not_match_via_stage_one(
+        self, session_factory, mock_client, fake_analysis,
+    ):
+        # Seed with an AUTO- id; draft has the SAME AUTO- string but
+        # should not trigger Stage 1 (it'd be a per-email value).
+        from zashiki_warasi.agents.verticals.expense import (
+            auto_transaction_id,
+        )
+        auto = auto_transaction_id("seeded-msg")
+        self._seed_existing(
+            session_factory, transaction_id=auto,
+            amount=Decimal("500"),
+            transacted_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        )
+
+        draft = _draft(
+            transaction_id=auto,  # same AUTO- string
+            amount=Decimal("9999"),
+            transacted_at=datetime(2030, 1, 1, tzinfo=timezone.utc),  # far
+        )
+        result = self._run_subgraph(
+            session_factory, mock_client, fake_analysis, "msg-new", draft,
+        )
+
+        with session_factory() as session:
+            count = session.scalar(
+                select(func.count()).select_from(ExpenseRecord)
+            )
+        # AUTO- ids must not collide; second email gets its own row.
+        assert count == 2
+
+    # --- Stage 2: amount + currency + time window ---
+
+    def test_starbucks_case_dedupes_by_amount_and_time(
+        self, session_factory, mock_client, fake_analysis,
+    ):
+        """The motivating case: SMBC Olive at 15:13:03 with 承認番号
+        303840 and Starbucks merchant receipt at 15:13:00 with no id —
+        same amount, ~3 seconds apart, different vendor strings."""
+        existing_id = self._seed_existing(
+            session_factory,
+            transaction_id="303840",
+            transacted_at=datetime(2026, 6, 21, 15, 13, 3, tzinfo=timezone.utc),
+            vendor="STARBUCKS MOBILE ORDER",
+        )
+
+        # Merchant receipt: same amount/currency, 3 sec later, different
+        # vendor string, no transaction_id of its own.
+        draft = _draft(
+            transaction_id=None,
+            amount=Decimal("1198"),
+            currency="JPY",
+            transacted_at=datetime(2026, 6, 21, 15, 13, 0, tzinfo=timezone.utc),
+            vendor="スターバックス コーヒー Olive LOUNGE 渋谷店",
+        )
+        result = self._run_subgraph(
+            session_factory, mock_client, fake_analysis, "msg-new", draft,
+        )
+
+        assert result["side_effect"].record_id == existing_id
+        with session_factory() as session:
+            assert session.scalar(
+                select(func.count()).select_from(ExpenseRecord)
+            ) == 1
+
+    def test_time_outside_window_does_not_dedup(
+        self, session_factory, mock_client, fake_analysis,
+    ):
+        # 16 min apart (window is 15 min) → both kept as distinct.
+        self._seed_existing(
+            session_factory,
+            transacted_at=datetime(2026, 6, 21, 15, 0, 0, tzinfo=timezone.utc),
+        )
+        draft = _draft(
+            transaction_id=None,
+            amount=Decimal("1198"),
+            currency="JPY",
+            transacted_at=datetime(2026, 6, 21, 15, 16, 0, tzinfo=timezone.utc),
+        )
+        self._run_subgraph(
+            session_factory, mock_client, fake_analysis, "msg-new", draft,
+        )
+
+        with session_factory() as session:
+            assert session.scalar(
+                select(func.count()).select_from(ExpenseRecord)
+            ) == 2
+
+    def test_different_amount_does_not_dedup(
+        self, session_factory, mock_client, fake_analysis,
+    ):
+        # Same time, same currency, different amount → distinct.
+        self._seed_existing(
+            session_factory, amount=Decimal("1198"),
+        )
+        draft = _draft(
+            transaction_id=None,
+            amount=Decimal("1200"),
+            currency="JPY",
+            transacted_at=datetime(2026, 6, 21, 15, 13, 0, tzinfo=timezone.utc),
+        )
+        self._run_subgraph(
+            session_factory, mock_client, fake_analysis, "msg-new", draft,
+        )
+
+        with session_factory() as session:
+            assert session.scalar(
+                select(func.count()).select_from(ExpenseRecord)
+            ) == 2
+
+    def test_multiple_candidates_in_window_does_not_dedup(
+        self, session_factory, mock_client, fake_analysis,
+    ):
+        # Two pre-existing rows match the (amount, currency, window)
+        # criteria → cannot pick safely → insert as new.
+        self._seed_existing(
+            session_factory, message_id="m1", transaction_id="A",
+            transacted_at=datetime(2026, 6, 21, 15, 10, tzinfo=timezone.utc),
+        )
+        self._seed_existing(
+            session_factory, message_id="m2", transaction_id="B",
+            transacted_at=datetime(2026, 6, 21, 15, 13, tzinfo=timezone.utc),
+        )
+
+        draft = _draft(
+            transaction_id=None,
+            amount=Decimal("1198"),
+            currency="JPY",
+            transacted_at=datetime(2026, 6, 21, 15, 11, tzinfo=timezone.utc),
+        )
+        self._run_subgraph(
+            session_factory, mock_client, fake_analysis, "msg-new", draft,
+        )
+
+        with session_factory() as session:
+            assert session.scalar(
+                select(func.count()).select_from(ExpenseRecord)
+            ) == 3  # both seeded + the new ambiguous one
+
+    def test_missing_required_fields_skips_stage_two(
+        self, session_factory, mock_client, fake_analysis,
+    ):
+        # No amount → cannot run Stage 2; without Stage 1 hit either,
+        # insert as new even if other fields would coincidentally match.
+        self._seed_existing(session_factory)
+        draft = _draft(
+            transaction_id=None,
+            amount=None,         # <-- the disqualifier
+            vendor="vendor-only-so-persist-still-runs",
+            currency="JPY",
+            transacted_at=datetime(2026, 6, 21, 15, 13, tzinfo=timezone.utc),
+        )
+        self._run_subgraph(
+            session_factory, mock_client, fake_analysis, "msg-new", draft,
+        )
+
+        with session_factory() as session:
+            assert session.scalar(
+                select(func.count()).select_from(ExpenseRecord)
+            ) == 2
