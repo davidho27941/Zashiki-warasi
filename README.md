@@ -128,14 +128,20 @@ about at runtime.
 
    | Property | Type | Notes |
    | --- | --- | --- |
-   | 商家 | Title | Required by Notion (every DB needs one title) |
-   | 金額 | Number | |
-   | 幣別 | Select | Predefine options: `JPY`, `TWD`, `USD` |
-   | 時間 | Date | Date+time supported via ISO 8601 |
-   | 類別 | Rich text | Free-form; the LLM can output any Chinese label |
+   | 消費店家 | Title | Required by Notion (every DB needs one title) |
+   | 消費金額 | Number | |
+   | 幣別 | Select | Predefine options: `日幣`, `台幣`, `美金` (the agent translates ISO codes from extraction) |
+   | 消費日期 | Date | Date+time supported via ISO 8601 |
+   | 消費類別 | Select | Predefine your category options (e.g. `飲食`, `交通`, `購物`, `訂閱`, `水電`, `講座`, `其他`); the LLM must use a label that already exists, so add new options as you encounter new expense kinds |
    | 支付方式 | Select | Predefine options: `Rakuten Pay`, `SMBC Olive`, `三菱UFJ-JCB`, `PayPay`, `信用卡`, `現金`, `其他` |
-   | 編號 | Rich text | Both real transaction ids and `AUTO-…` placeholders |
-   | 地點 | Rich text | |
+   | UUID | Rich text | Both real transaction ids (e.g. SMBC's `承認番号`) and `AUTO-…` placeholders |
+
+   Optional: add a `備註` (Rich text) column for manual notes — the
+   agent will not write to it but you can use it freely.
+
+   The `location` extracted from each email is intentionally **not**
+   mirrored to Notion; it stays in the Postgres `expenses.location`
+   column.
 
 3. Open the database as a full page → **Share** → invite your
    integration so it can write.

@@ -32,14 +32,22 @@ class NotionExpenseRecorder:
     """
 
     # Property names — must match the Notion DB exactly.
-    PROP_VENDOR = "商家"  # title
-    PROP_AMOUNT = "金額"  # number
+    PROP_VENDOR = "消費店家"  # title
+    PROP_AMOUNT = "消費金額"  # number
     PROP_CURRENCY = "幣別"  # select
-    PROP_TRANSACTED_AT = "時間"  # date
-    PROP_CATEGORY = "類別"  # rich_text
+    PROP_TRANSACTED_AT = "消費日期"  # date
+    PROP_CATEGORY = "消費類別"  # select
     PROP_PAYMENT_METHOD = "支付方式"  # select
-    PROP_TRANSACTION_ID = "編號"  # rich_text
-    PROP_LOCATION = "地點"  # rich_text
+    PROP_TRANSACTION_ID = "UUID"  # rich_text
+
+    # Translates our ISO-code Currency literal into the Chinese labels
+    # the Notion DB uses for its `幣別` select options. If the user
+    # extends Currency in the future they MUST add an entry here too.
+    _CURRENCY_LABELS = {
+        "JPY": "日幣",
+        "TWD": "台幣",
+        "USD": "美金",
+    }
 
     def __init__(self, settings: NotionSettings | None = None) -> None:
         self._settings = settings or NotionSettings()
@@ -93,8 +101,16 @@ class NotionExpenseRecorder:
             properties[self.PROP_AMOUNT] = {"number": float(record.amount)}
 
         if record.currency:
+            # ISO code → Chinese label expected by the Notion select.
+            # If the LLM somehow extracts a currency we don't know
+            # about, fall back to the raw code so the API at least
+            # reports a clear "X is not an option" error rather than
+            # silently dropping the field.
+            label = self._CURRENCY_LABELS.get(
+                record.currency, record.currency
+            )
             properties[self.PROP_CURRENCY] = {
-                "select": {"name": record.currency},
+                "select": {"name": label},
             }
 
         if record.transacted_at is not None:
@@ -103,8 +119,11 @@ class NotionExpenseRecorder:
             }
 
         if record.category:
+            # Category is a Notion Select column. The LLM must extract
+            # a label that exists as an option in the DB; new labels
+            # need to be added manually in Notion.
             properties[self.PROP_CATEGORY] = {
-                "rich_text": [{"text": {"content": record.category}}],
+                "select": {"name": record.category},
             }
 
         if record.payment_method:
@@ -119,9 +138,7 @@ class NotionExpenseRecorder:
                 ],
             }
 
-        if record.location:
-            properties[self.PROP_LOCATION] = {
-                "rich_text": [{"text": {"content": record.location}}],
-            }
+        # No location property in this schema — `record.location`
+        # is kept in Postgres only.
 
         return properties

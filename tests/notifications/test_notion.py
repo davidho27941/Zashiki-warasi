@@ -109,7 +109,7 @@ class TestPropertyMapping:
         recorder.record_expense(_record(vendor="Coffee Place"))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["商家"] == {
+        assert props["消費店家"] == {
             "title": [{"text": {"content": "Coffee Place"}}]
         }
 
@@ -120,7 +120,7 @@ class TestPropertyMapping:
         recorder.record_expense(_record(vendor=None))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["商家"]["title"][0]["text"]["content"] == "(不明)"
+        assert props["消費店家"]["title"][0]["text"]["content"] == "(不明)"
 
     def test_amount_is_float(self):
         recorder = _recorder_with_mock_client()
@@ -128,15 +128,33 @@ class TestPropertyMapping:
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
         # Notion's number type expects a JSON number, not a Decimal.
-        assert props["金額"] == {"number": 3200.0}
-        assert isinstance(props["金額"]["number"], float)
+        assert props["消費金額"] == {"number": 3200.0}
+        assert isinstance(props["消費金額"]["number"], float)
 
-    def test_currency_is_select(self):
+    @pytest.mark.parametrize(
+        "iso_code,chinese_label",
+        [("JPY", "日幣"), ("TWD", "台幣"), ("USD", "美金")],
+    )
+    def test_currency_is_translated_to_chinese_select(
+        self, iso_code, chinese_label
+    ):
+        # Currency is stored internally as the ISO code but the Notion
+        # select uses Chinese labels — the recorder translates.
         recorder = _recorder_with_mock_client()
-        recorder.record_expense(_record(currency="JPY"))
+        recorder.record_expense(_record(currency=iso_code))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["幣別"] == {"select": {"name": "JPY"}}
+        assert props["幣別"] == {"select": {"name": chinese_label}}
+
+    def test_unknown_currency_falls_back_to_raw_code(self):
+        # Defensive: if Currency literal gains a new value but the
+        # translation map isn't updated, we send the raw code and let
+        # Notion's API surface a clear "X is not an option" error.
+        recorder = _recorder_with_mock_client()
+        recorder.record_expense(_record(currency="EUR"))  # not mapped
+
+        props = recorder._client.pages.create.call_args.kwargs["properties"]
+        assert props["幣別"] == {"select": {"name": "EUR"}}
 
     def test_payment_method_is_select(self):
         recorder = _recorder_with_mock_client()
@@ -145,16 +163,15 @@ class TestPropertyMapping:
         props = recorder._client.pages.create.call_args.kwargs["properties"]
         assert props["支付方式"] == {"select": {"name": "信用卡"}}
 
-    def test_category_is_rich_text_not_select(self):
-        # Category is intentionally rich_text so the LLM can produce any
-        # Chinese label without breaking the API on unrecognised options.
+    def test_category_is_select(self):
+        # Category is a Notion Select column; the LLM-extracted label
+        # must already exist as an option in the Notion DB or the API
+        # will reject the request.
         recorder = _recorder_with_mock_client()
-        recorder.record_expense(_record(category="講座"))
+        recorder.record_expense(_record(category="飲食"))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["類別"] == {
-            "rich_text": [{"text": {"content": "講座"}}]
-        }
+        assert props["消費類別"] == {"select": {"name": "飲食"}}
 
     def test_transacted_at_is_iso_date(self):
         recorder = _recorder_with_mock_client()
@@ -164,25 +181,28 @@ class TestPropertyMapping:
         recorder.record_expense(record)
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["時間"]["date"]["start"].startswith("2026-06-21T15:13:03")
+        assert props["消費日期"]["date"]["start"].startswith(
+            "2026-06-21T15:13:03"
+        )
 
     def test_transaction_id_is_rich_text(self):
         recorder = _recorder_with_mock_client()
         recorder.record_expense(_record(transaction_id="ORDER-12345"))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["編號"] == {
+        assert props["UUID"] == {
             "rich_text": [{"text": {"content": "ORDER-12345"}}]
         }
 
-    def test_location_is_rich_text(self):
+    def test_location_is_not_sent_to_notion(self):
+        # The user's schema deliberately omits a location property —
+        # the field is kept in Postgres only.
         recorder = _recorder_with_mock_client()
         recorder.record_expense(_record(location="東京都渋谷区"))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["地點"] == {
-            "rich_text": [{"text": {"content": "東京都渋谷区"}}]
-        }
+        assert "地點" not in props
+        assert "location" not in props
 
 
 # --- property building: skip None fields ---
@@ -192,13 +212,12 @@ class TestNullableFieldSkipped:
     @pytest.mark.parametrize(
         "field,prop_key",
         [
-            ("amount", "金額"),
+            ("amount", "消費金額"),
             ("currency", "幣別"),
-            ("transacted_at", "時間"),
-            ("category", "類別"),
+            ("transacted_at", "消費日期"),
+            ("category", "消費類別"),
             ("payment_method", "支付方式"),
-            ("transaction_id", "編號"),
-            ("location", "地點"),
+            ("transaction_id", "UUID"),
         ],
     )
     def test_none_field_omitted_from_properties(self, field, prop_key):
