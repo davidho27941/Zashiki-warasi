@@ -105,26 +105,44 @@ class TestRequestShape:
 
 
 class TestPropertyMapping:
-    def test_title_becomes_notion_title(self):
-        # The Notion `消費店家` column (which IS the title) gets the
-        # LLM-extracted descriptive title, e.g. "拿鐵 + 摩卡星冰樂".
+    def test_title_property_gets_llm_title(self):
+        # The Notion title property (default name `標題`) receives the
+        # LLM-generated short description of the expense.
         recorder = _recorder_with_mock_client()
         recorder.record_expense(_record(title="拿鐵 + 摩卡星冰樂"))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["消費店家"] == {
+        assert props["標題"] == {
             "title": [{"text": {"content": "拿鐵 + 摩卡星冰樂"}}]
+        }
+
+    def test_vendor_goes_to_separate_rich_text_property(self):
+        # 消費店家 is rich_text, NOT the title — it stores the merchant
+        # name independently from the descriptive title.
+        recorder = _recorder_with_mock_client()
+        recorder.record_expense(
+            _record(title="拿鐵", vendor="Starbucks 渋谷店")
+        )
+
+        props = recorder._client.pages.create.call_args.kwargs["properties"]
+        assert props["消費店家"] == {
+            "rich_text": [{"text": {"content": "Starbucks 渋谷店"}}]
         }
 
     def test_title_none_falls_back_to_vendor(self):
         # When the LLM couldn't extract a title, use the vendor name as
-        # a sensible row label so the Notion DB stays readable.
+        # a sensible row label so the Notion title is still meaningful.
         recorder = _recorder_with_mock_client()
         recorder.record_expense(_record(title=None, vendor="Starbucks"))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["消費店家"] == {
+        # Notion title gets the vendor fallback.
+        assert props["標題"] == {
             "title": [{"text": {"content": "Starbucks"}}]
+        }
+        # 消費店家 still gets the vendor as well (independent column).
+        assert props["消費店家"] == {
+            "rich_text": [{"text": {"content": "Starbucks"}}]
         }
 
     def test_title_and_vendor_both_none_falls_back_to_buming(self):
@@ -134,7 +152,9 @@ class TestPropertyMapping:
         recorder.record_expense(_record(title=None, vendor=None))
 
         props = recorder._client.pages.create.call_args.kwargs["properties"]
-        assert props["消費店家"]["title"][0]["text"]["content"] == "(不明)"
+        assert props["標題"]["title"][0]["text"]["content"] == "(不明)"
+        # 消費店家 is skipped entirely when vendor is None.
+        assert "消費店家" not in props
 
     def test_amount_is_float(self):
         recorder = _recorder_with_mock_client()
@@ -226,6 +246,7 @@ class TestNullableFieldSkipped:
     @pytest.mark.parametrize(
         "field,prop_key",
         [
+            ("vendor", "消費店家"),
             ("amount", "消費金額"),
             ("currency", "幣別"),
             ("transacted_at", "消費日期"),

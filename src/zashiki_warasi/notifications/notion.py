@@ -32,7 +32,8 @@ class NotionExpenseRecorder:
     """
 
     # Property names — must match the Notion DB exactly.
-    PROP_VENDOR = "消費店家"  # title
+    PROP_TITLE = "標題"  # title (Notion's required title property)
+    PROP_VENDOR = "消費店家"  # rich_text (the merchant name)
     PROP_AMOUNT = "消費金額"  # number
     PROP_CURRENCY = "幣別"  # select
     PROP_TRANSACTED_AT = "消費日期"  # date
@@ -85,18 +86,25 @@ class NotionExpenseRecorder:
     def _build_properties(self, record: ExpenseRecord) -> dict[str, Any]:
         """Translate an ExpenseRecord into Notion property payload.
 
-        Title is always populated — Notion requires the title property
-        to exist. We prefer the LLM-extracted `title` (a short
-        descriptive name like "拿鐵 + 摩卡星冰樂"), fall back to the
-        vendor, then `(不明)`. All other fields are skipped when None
-        to keep the row clean.
+        Title (the LLM-generated expense name) goes into the Notion
+        title property; the merchant name goes into a separate
+        rich_text column. Title is always populated — Notion requires
+        the title property to exist — with a vendor / `(不明)` fallback
+        chain so the row stays scannable even when the LLM produced no
+        title. All other fields are skipped when None to keep the row
+        clean.
         """
         title_text = record.title or record.vendor or "(不明)"
         properties: dict[str, Any] = {
-            self.PROP_VENDOR: {
+            self.PROP_TITLE: {
                 "title": [{"text": {"content": title_text}}],
             },
         }
+
+        if record.vendor:
+            properties[self.PROP_VENDOR] = {
+                "rich_text": [{"text": {"content": record.vendor}}],
+            }
 
         if record.amount is not None:
             properties[self.PROP_AMOUNT] = {"number": float(record.amount)}
