@@ -12,6 +12,7 @@ import logging
 
 import pdfplumber
 
+from zashiki_warasi.agents.verticals.html_text import html_to_text
 from zashiki_warasi.core.schemas import EmailMessage
 from zashiki_warasi.gmail.client import GmailClient
 
@@ -43,7 +44,10 @@ def collect_text(
       than feed the LLM a thin context that invites hallucination.
     """
     chunks: list[str] = []
-    body = email.body_plain or email.snippet or ""
+    # Body fallback chain: text/plain (cheapest, cleanest) → HTML
+    # converted on demand (covers modern HTML-only e-receipts) →
+    # Gmail snippet (last-resort ~200-char preview).
+    body = email.body_plain or html_to_text(email.body_html) or email.snippet or ""
     if body.strip():
         chunks.append(body)
 

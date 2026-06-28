@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### HTML body fallback
+
+- `agents/verticals/html_text.py` — `html_to_text(html)` helper
+  wrapping `html2text` with LLM-friendly defaults (links / images
+  stripped, no markdown emphasis markers, no line re-wrapping).
+  Defensive: empty / None / malformed input never raises; returns
+  `""` so callers can chain it in `or` fallbacks.
+- Body fallback chain in `agents/verticals/pdf.py::collect_text`
+  and `agents/email_agent.py::_analyze` is now:
+  `body_plain → html_to_text(body_html) → snippet`. HTML-only
+  emails (modern e-receipts, marketing newsletters) used to
+  degrade to the ~200-char Gmail snippet alone; they now feed
+  the full converted HTML to the LLM.
+- `html2text >= 2025.4.15` dependency added.
+
 #### Telegram notifications and tool registry
 
 - **Telegram notification node** in the email agent graph

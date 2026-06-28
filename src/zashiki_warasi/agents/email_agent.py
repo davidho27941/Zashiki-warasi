@@ -23,6 +23,7 @@ from sqlalchemy.orm import sessionmaker
 
 from zashiki_warasi.agents.llm import get_chat_model
 from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
+from zashiki_warasi.agents.verticals.html_text import html_to_text
 from zashiki_warasi.core.models import EmailAnalysis as EmailAnalysisORM
 from zashiki_warasi.core.schemas import (
     EmailAnalysis,
@@ -144,12 +145,22 @@ class EmailAgent:
 
     def _analyze(self, state: AgentState) -> dict:
         email = state["email"]
+        # Body fallback chain: text/plain → HTML converted on demand →
+        # Gmail snippet. Covers HTML-only mails (modern e-receipts,
+        # marketing newsletters) that previously degraded to the
+        # ~200-char snippet alone.
+        body = (
+            email.body_plain
+            or html_to_text(email.body_html)
+            or email.snippet
+            or ""
+        )
         user_text = (
             f"From: {email.from_address}\n"
             f"Subject: {email.subject}\n"
             f"Date: {email.received_at.isoformat()}\n"
             f"\n"
-            f"{email.body_plain or email.snippet}"
+            f"{body}"
         )
         analysis = self._analyze_model.invoke(
             [

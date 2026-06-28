@@ -243,6 +243,57 @@ class TestLLMInvocation:
         user_content = mock_chat_model.structured.invoke.call_args.args[0][1].content
         assert "snippet only" in user_content
 
+    def test_falls_back_to_html_when_body_plain_missing(
+        self, agent, mock_chat_model
+    ):
+        # HTML-only email (modern e-receipt). Analyze sees the
+        # converted HTML rather than the ~200-char snippet.
+        email = EmailMessage(
+            id="msg-html-only",
+            thread_id="t-h",
+            history_id=300,
+            from_address="auto@merchant.example",
+            subject="Receipt",
+            snippet="short preview",
+            body_plain=None,
+            body_html=(
+                "<html><body>"
+                "<h2>Order Confirmation</h2>"
+                "<p>Total: <b>¥1,198</b></p>"
+                "<p>Vendor: スターバックス 渋谷店</p>"
+                "</body></html>"
+            ),
+            received_at=datetime(2026, 6, 22, tzinfo=timezone.utc),
+        )
+        agent.handle_email(email)
+        user_content = mock_chat_model.structured.invoke.call_args.args[0][1].content
+        # HTML text was converted and reached the prompt.
+        assert "¥1,198" in user_content
+        assert "スターバックス 渋谷店" in user_content
+        assert "Order Confirmation" in user_content
+        # Snippet was NOT used as fallback (HTML came first).
+        assert "short preview" not in user_content
+
+    def test_plain_preferred_over_html_when_both_present(
+        self, agent, mock_chat_model
+    ):
+        # multipart/alternative — plain wins to keep prompt clean.
+        email = EmailMessage(
+            id="msg-both",
+            thread_id="t-b",
+            history_id=400,
+            from_address="x@y.com",
+            subject="Both",
+            snippet="snippet",
+            body_plain="PLAIN BODY",
+            body_html="<p>HTML BODY VERSION</p>",
+            received_at=datetime(2026, 6, 22, tzinfo=timezone.utc),
+        )
+        agent.handle_email(email)
+        user_content = mock_chat_model.structured.invoke.call_args.args[0][1].content
+        assert "PLAIN BODY" in user_content
+        assert "HTML BODY VERSION" not in user_content
+
 
 # ---------- None / graceful handling ----------
 

@@ -131,6 +131,49 @@ class TestCollectText:
         text, _ = collect_text(email, MagicMock())
         assert text == "snippet text"
 
+    def test_falls_back_to_html_when_body_plain_missing(self):
+        # HTML-only e-receipt (no text/plain part). collect_text must
+        # convert the HTML rather than degrading to the snippet.
+        email = EmailMessage(
+            id="m",
+            thread_id="t",
+            history_id=1,
+            from_address="x@y.com",
+            subject="s",
+            snippet="snippet preview",  # would be the fallback
+            body_plain=None,
+            body_html=(
+                "<html><body>"
+                "<p>Order total: <b>¥1,198</b></p>"
+                "<p>Vendor: スターバックス 渋谷店</p>"
+                "</body></html>"
+            ),
+            received_at=datetime(2026, 6, 27, tzinfo=timezone.utc),
+        )
+        text, _ = collect_text(email, MagicMock())
+        # HTML was converted and used; snippet was NOT used.
+        assert "¥1,198" in text
+        assert "スターバックス 渋谷店" in text
+        assert "snippet preview" not in text
+
+    def test_prefers_body_plain_over_html_when_both_exist(self):
+        # multipart/alternative: text/plain takes precedence so we
+        # don't pay the HTML-conversion noise cost.
+        email = EmailMessage(
+            id="m",
+            thread_id="t",
+            history_id=1,
+            from_address="x@y.com",
+            subject="s",
+            snippet="snippet",
+            body_plain="PLAIN VERSION",
+            body_html="<p>HTML VERSION</p>",
+            received_at=datetime(2026, 6, 27, tzinfo=timezone.utc),
+        )
+        text, _ = collect_text(email, MagicMock())
+        assert "PLAIN VERSION" in text
+        assert "HTML VERSION" not in text
+
     def test_skips_non_pdf_attachments(self):
         jpeg = AttachmentMeta(
             attachment_id="a",

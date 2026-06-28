@@ -21,6 +21,13 @@ Crash-safe by design: per-message dedup plus LangGraph checkpoints (keyed by
 Gmail message ID) mean a restart never loses or re-bills a message, even if
 the process dies mid-LLM-call.
 
+**Body source for the LLM**: `text/plain` is preferred when present
+(cleanest, no markup noise). HTML-only emails (modern e-receipts,
+newsletters) fall back to a stripped-down conversion via `html2text`
+so the LLM sees the full content instead of just Gmail's 200-char
+snippet. The snippet is the last-resort fallback when neither plain
+nor HTML is available.
+
 ## Architecture
 
 ```
