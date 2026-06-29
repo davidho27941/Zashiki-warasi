@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Analyze prompt revisions (live-run feedback)
+
+- **Summary now keeps payment / point / aggregate specifics.**
+  The prompt's earlier "do NOT include amount / vendor / time in
+  summary" rule (introduced to avoid duplication with the expense
+  subgraph's structured output) was making non-expense
+  notifications — Rakuten point summaries, credit-card roll-ups,
+  bill aggregates — lose all useful detail, since those emails
+  don't route to the expense subgraph and have no other structured
+  fallback. Reverted to "include amount / time / location /
+  transaction-id when present; use 不明 for missing".
+- **Three new categories in the analyze Literal:**
+  - `消費資訊彙整` — single-email roll-ups containing multiple
+    transactions, including Rakuten card's daily
+    「【速報版】カード利用のお知らせ」 with no per-line detail.
+  - `點數資訊彙整` — Rakuten / d-point / similar point earning
+    & spending notifications. Distinct from `消費支出`; does not
+    route to the expense subgraph.
+- **Classification rules added:** points are never `消費支出`,
+  aggregate notifications are never `消費支出`, financial-product
+  promos remain `廣告` / `促銷`.
+
+Trade-off accepted: for `消費支出` emails the summary may now
+duplicate or slightly diverge from the structured `ExpenseLogged`
+fields. The structured fields remain source of truth; the Telegram
+message renders both side-by-side so the user can judge.
+
 #### HTML body fallback
 
 - `agents/verticals/html_text.py` — `html_to_text(html)` helper

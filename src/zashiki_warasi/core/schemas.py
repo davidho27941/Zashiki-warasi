@@ -60,6 +60,8 @@ Urgency = Literal["very_urgent", "urgent", "normal", "none"]
 
 Category = Literal[
     "消費支出",
+    "消費資訊彙整",
+    "點數資訊彙整",
     "訂閱服務",
     "技術文章",
     "講座資訊",

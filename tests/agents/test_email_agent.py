@@ -206,6 +206,41 @@ class TestLLMInvocation:
         # New prompt is Chinese; check for a stable marker phrase
         assert "電子郵件分析助理" in messages[0].content
 
+    def test_system_prompt_lists_aggregate_categories(
+        self, agent, fake_email, mock_chat_model
+    ):
+        # 點數資訊彙整 and 消費資訊彙整 were added so the LLM doesn't
+        # have to fall back to 其他 for Rakuten point / credit-card
+        # roll-up notifications.
+        agent.handle_email(fake_email)
+        prompt = mock_chat_model.structured.invoke.call_args.args[0][0].content
+        assert "點數資訊彙整" in prompt
+        assert "消費資訊彙整" in prompt
+
+    def test_system_prompt_disambiguates_points_vs_expense(
+        self, agent, fake_email, mock_chat_model
+    ):
+        # Rakuten / d points must NOT route to the expense subgraph.
+        agent.handle_email(fake_email)
+        prompt = mock_chat_model.structured.invoke.call_args.args[0][0].content
+        assert "點數消費" in prompt or "點數" in prompt
+        # The rule must explicitly say it's not a 消費支出.
+        assert "不視為「消費支出」" in prompt or "不要" in prompt
+
+    def test_system_prompt_requires_payment_specifics_in_summary(
+        self, agent, fake_email, mock_chat_model
+    ):
+        # We deliberately reverted the earlier "do NOT include
+        # amounts/time/vendor in summary" rule — too much info was
+        # lost for non-expense emails that have no structured-data
+        # fallback (points, aggregates, bills).
+        agent.handle_email(fake_email)
+        prompt = mock_chat_model.structured.invoke.call_args.args[0][0].content
+        assert "金額" in prompt
+        assert "時間" in prompt
+        # Either 地點 (location) or 來源 (source) should appear.
+        assert "地點" in prompt or "來源" in prompt
+
     def test_user_prompt_contains_email_fields(
         self, agent, fake_email, mock_chat_model
     ):
