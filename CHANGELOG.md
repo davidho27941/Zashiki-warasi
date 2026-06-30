@@ -36,6 +36,34 @@ duplicate or slightly diverge from the structured `ExpenseLogged`
 fields. The structured fields remain source of truth; the Telegram
 message renders both side-by-side so the user can judge.
 
+#### `--reset` CLI flag
+
+- `zashiki-warasi --reset` `TRUNCATE`s every app table
+  (`gmail_sync_state`, `processed_messages`, `email_analyses`,
+  `expenses`) plus every LangGraph PostgresSaver table
+  (`checkpoints`, `checkpoint_writes`, `checkpoint_blobs`,
+  `checkpoint_migrations`) before booting the poller, so the next
+  run behaves exactly like a first install — re-baselines the
+  Gmail `historyId`, no dedup memory, no checkpoint resume.
+- Defaults to an interactive `[y/N]` confirmation prompt; `-y` /
+  `--yes` skips it for non-interactive use.
+- Notion is intentionally NOT touched — the mirror outlives a
+  reset, matching the existing "Postgres is source of truth, Notion
+  is best-effort" boundary.
+- `reset_database()` in `core/db.py` looks up the target table
+  list against `information_schema.tables` before TRUNCATE, so a
+  reset on a fresh install (where LangGraph hasn't materialised
+  its tables yet via `checkpointer.setup()`) does not crash.
+- Console-script entry point updated from `app:run` to `app:main`
+  to introduce the `click` command layer; `app.run()` itself is
+  unchanged.
+- CLI built on `click` (≥8.1) — `@click.command` decorating
+  `main`, `@click.option` for `--reset` / `-y`, and
+  `click.confirm(abort=True)` for the interactive prompt.
+  `reset_database()` itself is now confirmation-free and
+  unconditional: the CLI layer owns the prompt so the function
+  stays single-purpose.
+
 #### HTML body fallback
 
 - `agents/verticals/html_text.py` — `html_to_text(html)` helper

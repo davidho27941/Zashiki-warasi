@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "alembic>=1.18.4",
+    "click>=8.1",
     "google-api-python-client>=2.197.0",
     "google-auth-httplib2>=0.4.0",
     "google-auth-oauthlib>=1.4.0",
@@ -22,7 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
-zashiki-warasi = "zashiki_warasi.app:run"
+zashiki-warasi = "zashiki_warasi.app:main"
 
 [build-system]
 requires = ["hatchling"]

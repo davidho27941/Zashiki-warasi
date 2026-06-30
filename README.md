@@ -174,6 +174,25 @@ On startup the poller fetches the current `historyId` as a baseline —
 backlog is **not** processed; only messages arriving from that point
 onwards are picked up. Polling runs at 30-second intervals by default.
 
+#### Starting from a clean slate
+
+```bash
+uv run zashiki-warasi --reset       # asks [y/N] first
+uv run zashiki-warasi --reset -y    # skip the prompt
+```
+
+`--reset` `TRUNCATE`s every domain table (`gmail_sync_state`,
+`processed_messages`, `email_analyses`, `expenses`) **and** every
+LangGraph checkpoint table (`checkpoints`, `checkpoint_writes`,
+`checkpoint_blobs`, `checkpoint_migrations`) before booting the
+poller. After the reset the poller behaves exactly as on first run:
+re-baselines the Gmail `historyId`, skips backlog, and starts
+collecting from that moment forward.
+
+The Notion mirror is **not** touched — any rows previously written
+to Notion stay there. If you want a matching wipe, delete them
+manually in the Notion UI.
+
 ## Configuration
 
 All settings come from environment variables (a `.env` file in the
