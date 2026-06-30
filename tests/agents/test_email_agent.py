@@ -206,6 +206,41 @@ class TestLLMInvocation:
         # New prompt is Chinese; check for a stable marker phrase
         assert "電子郵件分析助理" in messages[0].content
 
+    def test_system_prompt_lists_aggregate_categories(
+        self, agent, fake_email, mock_chat_model
+    ):
+        # 點數資訊彙整 and 消費資訊彙整 were added so the LLM doesn't
+        # have to fall back to 其他 for Rakuten point / credit-card
+        # roll-up notifications.
+        agent.handle_email(fake_email)
+        prompt = mock_chat_model.structured.invoke.call_args.args[0][0].content
+        assert "點數資訊彙整" in prompt
+        assert "消費資訊彙整" in prompt
+
+    def test_system_prompt_disambiguates_points_vs_expense(
+        self, agent, fake_email, mock_chat_model
+    ):
+        # Rakuten / d points must NOT route to the expense subgraph.
+        agent.handle_email(fake_email)
+        prompt = mock_chat_model.structured.invoke.call_args.args[0][0].content
+        assert "點數消費" in prompt or "點數" in prompt
+        # The rule must explicitly say it's not a 消費支出.
+        assert "不視為「消費支出」" in prompt or "不要" in prompt
+
+    def test_system_prompt_requires_payment_specifics_in_summary(
+        self, agent, fake_email, mock_chat_model
+    ):
+        # We deliberately reverted the earlier "do NOT include
+        # amounts/time/vendor in summary" rule — too much info was
+        # lost for non-expense emails that have no structured-data
+        # fallback (points, aggregates, bills).
+        agent.handle_email(fake_email)
+        prompt = mock_chat_model.structured.invoke.call_args.args[0][0].content
+        assert "金額" in prompt
+        assert "時間" in prompt
+        # Either 地點 (location) or 來源 (source) should appear.
+        assert "地點" in prompt or "來源" in prompt
+
     def test_user_prompt_contains_email_fields(
         self, agent, fake_email, mock_chat_model
     ):
@@ -242,6 +277,57 @@ class TestLLMInvocation:
         agent.handle_email(email)
         user_content = mock_chat_model.structured.invoke.call_args.args[0][1].content
         assert "snippet only" in user_content
+
+    def test_falls_back_to_html_when_body_plain_missing(
+        self, agent, mock_chat_model
+    ):
+        # HTML-only email (modern e-receipt). Analyze sees the
+        # converted HTML rather than the ~200-char snippet.
+        email = EmailMessage(
+            id="msg-html-only",
+            thread_id="t-h",
+            history_id=300,
+            from_address="auto@merchant.example",
+            subject="Receipt",
+            snippet="short preview",
+            body_plain=None,
+            body_html=(
+                "<html><body>"
+                "<h2>Order Confirmation</h2>"
+                "<p>Total: <b>¥1,198</b></p>"
+                "<p>Vendor: スターバックス 渋谷店</p>"
+                "</body></html>"
+            ),
+            received_at=datetime(2026, 6, 22, tzinfo=timezone.utc),
+        )
+        agent.handle_email(email)
+        user_content = mock_chat_model.structured.invoke.call_args.args[0][1].content
+        # HTML text was converted and reached the prompt.
+        assert "¥1,198" in user_content
+        assert "スターバックス 渋谷店" in user_content
+        assert "Order Confirmation" in user_content
+        # Snippet was NOT used as fallback (HTML came first).
+        assert "short preview" not in user_content
+
+    def test_plain_preferred_over_html_when_both_present(
+        self, agent, mock_chat_model
+    ):
+        # multipart/alternative — plain wins to keep prompt clean.
+        email = EmailMessage(
+            id="msg-both",
+            thread_id="t-b",
+            history_id=400,
+            from_address="x@y.com",
+            subject="Both",
+            snippet="snippet",
+            body_plain="PLAIN BODY",
+            body_html="<p>HTML BODY VERSION</p>",
+            received_at=datetime(2026, 6, 22, tzinfo=timezone.utc),
+        )
+        agent.handle_email(email)
+        user_content = mock_chat_model.structured.invoke.call_args.args[0][1].content
+        assert "PLAIN BODY" in user_content
+        assert "HTML BODY VERSION" not in user_content
 
 
 # ---------- None / graceful handling ----------

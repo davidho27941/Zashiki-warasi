@@ -360,18 +360,22 @@ class ExpenseSubgraph:
                     )
                     is_new_record = False
 
-            # Best-effort Notion sync. Only attempted for newly-written
-            # records — duplicates re-use the existing row's
-            # notion_page_id / notion_sync_error from the original
-            # write, no re-attempt here.
+            # Best-effort Notion sync. Attempted whenever the chosen
+            # record has no successful sync yet — covers both new
+            # inserts AND dedup hits whose original write failed
+            # Notion (so we self-heal historical failures the moment
+            # a second email about the same transaction arrives).
+            # Successfully-synced records are not re-attempted.
             if (
                 self._notion is not None
-                and is_new_record
                 and record.notion_page_id is None
-                and record.notion_sync_error is None
             ):
                 try:
                     record.notion_page_id = self._notion.record_expense(record)
+                    # Clear any stale error from a prior failed attempt
+                    # so the SideEffect / Telegram message reflects the
+                    # current successful state.
+                    record.notion_sync_error = None
                     logger.info(
                         f"expense: synced {record.id} to Notion page "
                         f"{record.notion_page_id}"

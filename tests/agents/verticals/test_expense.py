@@ -873,3 +873,76 @@ class TestNotionSync:
         assert (
             result["side_effect"].notion_page_id == "previously-synced-page"
         )
+
+    def test_dedup_hit_with_failed_prior_sync_retries_notion(
+        self, session_factory, mock_client, fake_analysis,
+    ):
+        """Self-heal scenario: an existing record's first Notion sync
+        failed (notion_page_id IS NULL + notion_sync_error set). A
+        second email about the same transaction triggers dedup; we
+        should re-attempt the Notion sync now and clear the stale
+        error on success."""
+        existing_message = "msg-failed-sync"
+        with session_factory() as session:
+            existing = ExpenseRecord(
+                message_id=existing_message,
+                amount=Decimal("3200"),
+                currency="JPY",
+                transacted_at=datetime(
+                    2026, 6, 27, 14, 32, tzinfo=timezone.utc
+                ),
+                vendor="Amazon.co.jp",
+                location=None,
+                category="購物",
+                transaction_id="250-1234567",
+                payment_method="SMBC Olive",
+                raw_extraction={},
+                notion_page_id=None,  # never successfully synced
+                notion_sync_error="schema mismatch (old)",
+            )
+            session.add(existing)
+            session.commit()
+            existing_id = str(existing.id)
+
+        notion = self._make_notion(page_id="freshly-synced-page")
+        draft = _draft(transaction_id="250-1234567")
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=_build_model_returning(draft),
+            notion=notion,
+        )
+
+        email = EmailMessage(
+            id="msg-new",
+            thread_id="t",
+            history_id=2,
+            from_address="x@y.com",
+            subject="s",
+            body_plain="body",
+            received_at=datetime.now(timezone.utc),
+            attachments=[],
+        )
+        result = subgraph.graph.invoke(
+            _initial_state(email, fake_analysis),
+            config={"configurable": {"thread_id": email.id}},
+        )
+
+        # Notion WAS retried this time.
+        notion.record_expense.assert_called_once()
+
+        # Existing row was updated in place, not duplicated.
+        assert result["side_effect"].record_id == existing_id
+        assert result["side_effect"].notion_page_id == "freshly-synced-page"
+        assert result["side_effect"].notion_sync_error is None
+
+        # DB reflects the same.
+        with session_factory() as session:
+            row = session.scalar(
+                select(ExpenseRecord).where(
+                    ExpenseRecord.message_id == existing_message
+                )
+            )
+            assert row.notion_page_id == "freshly-synced-page"
+            assert row.notion_sync_error is None

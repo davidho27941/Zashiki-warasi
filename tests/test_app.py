@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import signal
 import threading
+from unittest.mock import MagicMock
 
 import pytest
+from click.testing import CliRunner
 
+from zashiki_warasi import app
 from zashiki_warasi.app import _install_shutdown_handlers, _libpq_url
 
 
@@ -115,3 +118,74 @@ class TestInstallShutdownHandlers:
         handler(signal.SIGTERM, None)  # must not raise
 
         assert event.is_set()
+
+
+class TestMainCliRouting:
+    """`main` (click command) — confirms --reset / --yes flow through
+    to `reset_database` and that `run` is invoked / skipped correctly.
+
+    All tests use `CliRunner.invoke`, which captures stdout, simulates
+    `[y/N]` prompts via `input=`, and exposes the underlying exception
+    as `result.exception` rather than propagating it."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_dependencies(self, monkeypatch):
+        # Replace the side-effectful pieces with mocks so the test
+        # exercises only the CLI layer, not Postgres or the poller.
+        self.mock_reset = MagicMock()
+        self.mock_run = MagicMock()
+        monkeypatch.setattr(app, "reset_database", self.mock_reset)
+        monkeypatch.setattr(app, "run", self.mock_run)
+        self.runner = CliRunner()
+
+    def test_no_args_skips_reset(self):
+        result = self.runner.invoke(app.main, [])
+        assert result.exit_code == 0
+        self.mock_reset.assert_not_called()
+        self.mock_run.assert_called_once_with()
+
+    def test_reset_with_y_response_calls_reset_and_run(self):
+        result = self.runner.invoke(app.main, ["--reset"], input="y\n")
+        assert result.exit_code == 0
+        self.mock_reset.assert_called_once_with()
+        self.mock_run.assert_called_once_with()
+
+    def test_reset_with_n_response_aborts(self):
+        # click.confirm(abort=True) exits with code 1 and does NOT
+        # call reset_database or run.
+        result = self.runner.invoke(app.main, ["--reset"], input="n\n")
+        assert result.exit_code == 1
+        self.mock_reset.assert_not_called()
+        self.mock_run.assert_not_called()
+
+    def test_reset_with_short_yes_skips_prompt(self):
+        # `-y` provided → no input needed; if click DID prompt the
+        # runner's empty input stream would EOF and fail.
+        result = self.runner.invoke(app.main, ["--reset", "-y"])
+        assert result.exit_code == 0
+        self.mock_reset.assert_called_once_with()
+        self.mock_run.assert_called_once_with()
+        # Sanity: the confirmation question should not appear in
+        # stdout when -y bypasses the prompt.
+        assert "Continue?" not in result.output
+
+    def test_reset_with_long_yes_also_skips_prompt(self):
+        result = self.runner.invoke(app.main, ["--reset", "--yes"])
+        assert result.exit_code == 0
+        self.mock_reset.assert_called_once_with()
+
+    def test_run_is_called_after_reset(self):
+        order = []
+        self.mock_reset.side_effect = lambda: order.append("reset")
+        self.mock_run.side_effect = lambda: order.append("run")
+
+        result = self.runner.invoke(app.main, ["--reset", "-y"])
+
+        assert result.exit_code == 0
+        assert order == ["reset", "run"]
+
+    def test_help_shows_reset_flag(self):
+        result = self.runner.invoke(app.main, ["--help"])
+        assert result.exit_code == 0
+        assert "--reset" in result.output
+        assert "-y" in result.output

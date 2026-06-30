@@ -23,6 +23,7 @@ from sqlalchemy.orm import sessionmaker
 
 from zashiki_warasi.agents.llm import get_chat_model
 from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
+from zashiki_warasi.agents.verticals.html_text import html_to_text
 from zashiki_warasi.core.models import EmailAnalysis as EmailAnalysisORM
 from zashiki_warasi.core.schemas import (
     EmailAnalysis,
@@ -58,25 +59,41 @@ ANALYZE_SYSTEM_PROMPT = """\
 
 ### 2. 摘要 (summary, 50-200 字)
 
-以 5W1H (誰、什麼、何時、何地、為何、如何) 為核心做高層次摘要,
-只回答「這封信為什麼存在、誰寄的、要做什麼」這類整體資訊。
+以 5W1H (誰、什麼、何時、何地、為何、如何) 為核心做摘要。
 
-**不要在摘要中提及具體金額、商家名稱、交易時間、訂單編號**
-等細節 — 這些由結構化的支付資訊欄位處理。摘要與結構化欄位
-重疊只會增加不一致風險。
+當郵件內容是關於消費 / 點數 / 帳單彙整時,務必在摘要中提及:
+- 消費 / 獲得金額(若是點數則為點數數量)
+- 消費 / 獲得時間或期間
+- 消費地點 / 獲得來源(店家)
+- 交易識別碼、ID 或編號(伝票番号 / 注文番号)
+若信件中未提及某項,可以以「不明」替代。
 
-例:
-- 好:「Amazon 日本訂單確認通知,商品已成立訂單等候出貨」
-- 不好:「於 Amazon 訂購商品,共 3,200 日圓,訂單編號 250-1234567」
+例(好):「楽天ポイントカード 通知使用者 2026/06/18-06/24
+期間獲得的點數明細:於『彩家 楽天クリムゾン』獲得 19 點、
+於『東急ストア宮崎台店』獲得 3 點,合計 22 點。」
+
+例(不好,太空泛):「樂天點數卡寄送的每週點數獲得通知,
+旨在告知使用者所累積的點數總額與明細。」
 
 ### 3. 分類 (category)
 
 從以下列表選擇 **一項**:
-消費支出、訂閱服務、技術文章、講座資訊、會議邀請、帳單通知、
-廣告、促銷、社交、新聞、安全通知、股票資訊、其他
+消費支出、消費資訊彙整、點數資訊彙整、訂閱服務、技術文章、
+講座資訊、會議邀請、帳單通知、廣告、促銷、社交、新聞、
+安全通知、股票資訊、其他
 
-特例:金融產品(基金、ETF、信貸、信用卡帳單分期等)的「推銷」郵件
-一律歸類為「廣告」或「促銷」,不要分到「消費支出」或「帳單通知」。
+分類規則:
+
+- 金融產品(基金、ETF、信貸、信用卡帳單分期等)的「推銷」郵件
+  一律歸類為「廣告」或「促銷」,不要分到「消費支出」或
+  「帳單通知」。
+- 點數消費 / 獲得通知(楽天ポイント、d ポイント、悠遊付點數等)
+  **不視為「消費支出」**,歸類為「點數資訊彙整」。
+- 信用卡多筆消費彙整(一封信包含多則消費資訊、或多筆刷卡紀錄
+  的彙總)**不要分類為「消費支出」**,歸類為「消費資訊彙整」。
+- 樂天信用卡(楽天カード)定期寄送的「不含具體消費細節」的單日
+  消費金額統計 — 標題如「【速報版】カード利用のお知らせ(本人
+  ご利用分)」— 也歸類為「消費資訊彙整」,不要分類為「消費支出」。
 
 ### 4. 急迫性 (urgency)
 
@@ -144,12 +161,22 @@ class EmailAgent:
 
     def _analyze(self, state: AgentState) -> dict:
         email = state["email"]
+        # Body fallback chain: text/plain → HTML converted on demand →
+        # Gmail snippet. Covers HTML-only mails (modern e-receipts,
+        # marketing newsletters) that previously degraded to the
+        # ~200-char snippet alone.
+        body = (
+            email.body_plain
+            or html_to_text(email.body_html)
+            or email.snippet
+            or ""
+        )
         user_text = (
             f"From: {email.from_address}\n"
             f"Subject: {email.subject}\n"
             f"Date: {email.received_at.isoformat()}\n"
             f"\n"
-            f"{email.body_plain or email.snippet}"
+            f"{body}"
         )
         analysis = self._analyze_model.invoke(
             [

@@ -13,11 +13,12 @@ import logging
 import signal
 import threading
 
+import click
 from langgraph.checkpoint.postgres import PostgresSaver
 
 from zashiki_warasi.agents.email_agent import EmailAgent
 from zashiki_warasi.core.config import DatabaseSettings, NotionSettings
-from zashiki_warasi.core.db import get_session_factory
+from zashiki_warasi.core.db import get_session_factory, reset_database
 from zashiki_warasi.gmail.auth import get_credentials
 from zashiki_warasi.gmail.client import GmailClient
 from zashiki_warasi.gmail.poller import Poller
@@ -25,6 +26,14 @@ from zashiki_warasi.notifications.notion import NotionExpenseRecorder
 from zashiki_warasi.notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
+
+
+def _init_logging() -> None:
+    """Configure root logging once. Idempotent — repeat calls no-op."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
 
 def _libpq_url(sqlalchemy_url: str) -> str:
@@ -79,11 +88,50 @@ def _install_shutdown_handlers(stop_event: threading.Event) -> None:
     signal.signal(signal.SIGTERM, handler)
 
 
+@click.command(
+    context_settings={"help_option_names": ["-h", "--help"]},
+    help=(
+        "Self-hosted Gmail polling AI email agent. Boots the poller "
+        "and runs until interrupted."
+    ),
+)
+@click.option(
+    "--reset",
+    "reset",
+    is_flag=True,
+    help=(
+        "TRUNCATE all data (app tables + LangGraph checkpoints) "
+        "before starting the poller. Asks for confirmation unless "
+        "-y is also given."
+    ),
+)
+@click.option(
+    "-y",
+    "--yes",
+    "yes",
+    is_flag=True,
+    help="Skip the confirmation prompt for --reset.",
+)
+def main(reset: bool, yes: bool) -> None:
+    """CLI entry point. `--reset` wipes every app + LangGraph table
+    BEFORE starting so the next boot has no remembered state. Then
+    drops into the poller loop."""
+    _init_logging()
+
+    if reset:
+        if not yes:
+            click.confirm(
+                "This will TRUNCATE all email analyses, expenses, "
+                "polling state, and LangGraph checkpoints. Continue?",
+                abort=True,
+            )
+        reset_database()
+
+    run()
+
+
 def run() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    _init_logging()
 
     stop_event = threading.Event()
     _install_shutdown_handlers(stop_event)
