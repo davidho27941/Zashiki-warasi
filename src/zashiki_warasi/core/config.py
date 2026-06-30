@@ -117,3 +117,12 @@ class NotionSettings(BaseSettings):
         ),
     )
     timeout_seconds: float = 10.0
+
+    sync_interval_seconds: int = Field(
+        default=300,
+        ge=0,
+        description=(
+            "Background Notion→DB sync interval. 0 disables the puller "
+            "thread (the one-shot `sync-notion` subcommand still works)."
+        ),
+    )

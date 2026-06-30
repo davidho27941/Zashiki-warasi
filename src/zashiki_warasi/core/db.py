@@ -34,6 +34,7 @@ def get_session_factory() -> sessionmaker[Session]:
 # the reset.
 _RESET_TARGET_TABLES = (
     "gmail_sync_state",
+    "notion_sync_state",
     "processed_messages",
     "email_analyses",
     "expenses",

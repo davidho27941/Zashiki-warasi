@@ -189,3 +189,54 @@ class TestMainCliRouting:
         assert result.exit_code == 0
         assert "--reset" in result.output
         assert "-y" in result.output
+
+    def test_help_lists_sync_notion_subcommand(self):
+        result = self.runner.invoke(app.main, ["--help"])
+        assert result.exit_code == 0
+        assert "sync-notion" in result.output
+
+    def test_reset_with_subcommand_errors(self):
+        # --reset only makes sense for the default (poller) invocation;
+        # combining it with a subcommand must be a UsageError so users
+        # don't expect both behaviours.
+        result = self.runner.invoke(app.main, ["--reset", "sync-notion"])
+        assert result.exit_code != 0
+        assert "only valid without a subcommand" in result.output
+        self.mock_reset.assert_not_called()
+        self.mock_run.assert_not_called()
+
+
+class TestSyncNotionCommand:
+    """`sync-notion` subcommand — config gate + puller wiring."""
+
+    @pytest.fixture(autouse=True)
+    def _stub(self, monkeypatch):
+        self.mock_puller_class = MagicMock()
+        self.mock_puller = MagicMock()
+        self.mock_puller.sync_once.return_value = "STATS_REPR"
+        self.mock_puller_class.return_value = self.mock_puller
+        monkeypatch.setattr(
+            app, "NotionExpensePuller", self.mock_puller_class
+        )
+        # Cut session-factory dep so the test never reaches the DB.
+        monkeypatch.setattr(
+            app, "get_session_factory", lambda: MagicMock()
+        )
+        self.runner = CliRunner()
+
+    def test_aborts_when_notion_not_configured(self, monkeypatch):
+        monkeypatch.setenv("NOTION_TOKEN", "")
+        monkeypatch.setenv("NOTION_EXPENSE_DATABASE_ID", "")
+        result = self.runner.invoke(app.main, ["sync-notion"])
+        assert result.exit_code != 0
+        assert "NOTION_TOKEN" in result.output
+        self.mock_puller_class.assert_not_called()
+
+    def test_invokes_puller_when_configured(self, monkeypatch):
+        monkeypatch.setenv("NOTION_TOKEN", "secret_xxx")
+        monkeypatch.setenv("NOTION_EXPENSE_DATABASE_ID", "db-uuid")
+        result = self.runner.invoke(app.main, ["sync-notion"])
+        assert result.exit_code == 0
+        self.mock_puller_class.assert_called_once()
+        self.mock_puller.sync_once.assert_called_once_with()
+        assert "STATS_REPR" in result.output

@@ -23,6 +23,7 @@ from zashiki_warasi.gmail.auth import get_credentials
 from zashiki_warasi.gmail.client import GmailClient
 from zashiki_warasi.gmail.poller import Poller
 from zashiki_warasi.notifications.notion import NotionExpenseRecorder
+from zashiki_warasi.notifications.notion_puller import NotionExpensePuller
 from zashiki_warasi.notifications.telegram import TelegramNotifier
 
 logger = logging.getLogger(__name__)
@@ -88,11 +89,56 @@ def _install_shutdown_handlers(stop_event: threading.Event) -> None:
     signal.signal(signal.SIGTERM, handler)
 
 
-@click.command(
+def _start_notion_sync_thread(
+    settings: NotionSettings,
+    session_factory,
+    stop_event: threading.Event,
+) -> threading.Thread | None:
+    """Spawn a daemon thread that runs the Notion puller every
+    `sync_interval_seconds`. Returns None if the integration is
+    disabled or the interval is 0."""
+    if not (settings.token and settings.expense_database_id):
+        return None
+    if settings.sync_interval_seconds == 0:
+        logger.info(
+            "Notion background sync disabled "
+            "(NOTION_SYNC_INTERVAL_SECONDS=0)"
+        )
+        return None
+
+    puller = NotionExpensePuller(settings, session_factory)
+    interval = settings.sync_interval_seconds
+
+    def loop() -> None:
+        logger.info(
+            f"Notion background sync started (interval={interval}s)"
+        )
+        while not stop_event.is_set():
+            try:
+                stats = puller.sync_once()
+                if stats.updated or stats.fetched:
+                    logger.info(f"Notion sync: {stats}")
+            except Exception:
+                # Best-effort: a transient Notion 5xx must not kill the
+                # poller. We log and retry on the next tick.
+                logger.exception(
+                    "Notion sync failed; will retry next tick"
+                )
+            stop_event.wait(interval)
+        logger.info("Notion background sync stopped")
+
+    thread = threading.Thread(target=loop, name="notion-sync", daemon=True)
+    thread.start()
+    return thread
+
+
+@click.group(
     context_settings={"help_option_names": ["-h", "--help"]},
+    invoke_without_command=True,
     help=(
-        "Self-hosted Gmail polling AI email agent. Boots the poller "
-        "and runs until interrupted."
+        "Self-hosted Gmail polling AI email agent. Run with no "
+        "subcommand to boot the poller; use a subcommand for one-shot "
+        "operations."
     ),
 )
 @click.option(
@@ -102,7 +148,7 @@ def _install_shutdown_handlers(stop_event: threading.Event) -> None:
     help=(
         "TRUNCATE all data (app tables + LangGraph checkpoints) "
         "before starting the poller. Asks for confirmation unless "
-        "-y is also given."
+        "-y is also given. Only valid without a subcommand."
     ),
 )
 @click.option(
@@ -112,11 +158,19 @@ def _install_shutdown_handlers(stop_event: threading.Event) -> None:
     is_flag=True,
     help="Skip the confirmation prompt for --reset.",
 )
-def main(reset: bool, yes: bool) -> None:
-    """CLI entry point. `--reset` wipes every app + LangGraph table
-    BEFORE starting so the next boot has no remembered state. Then
-    drops into the poller loop."""
+@click.pass_context
+def main(ctx: click.Context, reset: bool, yes: bool) -> None:
+    """CLI entry point. With no subcommand: starts the poller (with
+    optional `--reset`). With a subcommand: runs that one-shot
+    operation and exits."""
     _init_logging()
+
+    if ctx.invoked_subcommand is not None:
+        if reset:
+            raise click.UsageError(
+                "--reset is only valid without a subcommand."
+            )
+        return
 
     if reset:
         if not yes:
@@ -130,6 +184,24 @@ def main(reset: bool, yes: bool) -> None:
     run()
 
 
+@main.command("sync-notion")
+def sync_notion_cmd() -> None:
+    """Run a single Notion→DB sync pass and exit.
+
+    Useful for debugging or manual catch-up after the background
+    thread has been disabled (NOTION_SYNC_INTERVAL_SECONDS=0).
+    Exits non-zero on any sync error.
+    """
+    settings = NotionSettings()
+    if not settings.token or not settings.expense_database_id:
+        raise click.ClickException(
+            "NOTION_TOKEN / NOTION_EXPENSE_DATABASE_ID not set."
+        )
+    puller = NotionExpensePuller(settings, get_session_factory())
+    stats = puller.sync_once()
+    click.echo(f"Notion sync complete: {stats}")
+
+
 def run() -> None:
     _init_logging()
 
@@ -141,6 +213,8 @@ def run() -> None:
     session_factory = get_session_factory()
     notifier = TelegramNotifier()
     notion = _build_notion()
+
+    _start_notion_sync_thread(NotionSettings(), session_factory, stop_event)
 
     db_url = _libpq_url(DatabaseSettings().database_url)
     with PostgresSaver.from_conn_string(db_url) as checkpointer:
