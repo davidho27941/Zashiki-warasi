@@ -215,6 +215,48 @@ One-shot manual sync (e.g. for debugging or after `NOTION_SYNC_INTERVAL_SECONDS=
 uv run zashiki-warasi sync-notion
 ```
 
+## Docker
+
+A self-contained stack (app + Postgres) is provided for users without
+an existing Postgres. Migrations are run automatically by the
+entrypoint before the poller boots.
+
+```bash
+cp .env.example .env                                # fill in LLM / Telegram / Notion
+mkdir credentials && cp /path/to/credentials.json credentials/   # OAuth client
+docker compose up --build
+```
+
+First boot: the container needs to complete OAuth interactively.
+Until `credentials/token.json` exists on the host, run the flow once
+with stdin attached:
+
+```bash
+docker compose run --rm app
+# follow the OAuth URL, paste the code; token.json gets cached in the
+# named volume so subsequent runs are non-interactive.
+```
+
+CLI flags pass through `docker compose run`:
+
+```bash
+docker compose run --rm app --reset -y
+docker compose run --rm app sync-notion
+```
+
+**Using your own Postgres** — don't `docker compose up`. Build the
+image and `docker run` it directly with `DATABASE_URL` pointing at
+your existing instance:
+
+```bash
+docker build -t zashiki-warasi .
+docker run --rm -it \
+  --env-file .env \
+  -v "$PWD/credentials:/app/credentials:ro" \
+  -v zashiki_token:/root/.config/zashiki-warasi \
+  zashiki-warasi
+```
+
 ## Configuration
 
 All settings come from environment variables (a `.env` file in the

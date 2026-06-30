@@ -35,6 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `invoke_without_command=True`, preserving the existing `--reset` UX
   while adding subcommand surface area.
 
+#### Docker deployment
+
+- `Dockerfile` (multi-stage, uv-based) builds a slim Python 3.13
+  runtime image with the project venv. BuildKit cache mounts keep
+  cold builds under ~10s.
+- `docker/entrypoint.sh` runs `alembic upgrade head` before exec'ing
+  the CLI, so schema is always at HEAD on container boot. Uses `exec`
+  so SIGTERM from `docker stop` reaches the Python process and the
+  shutdown handlers can drain the in-flight message.
+- `docker-compose.yml` provides a self-contained stack (app + Postgres
+  16-alpine + healthcheck gate) for users without an existing
+  Postgres. OAuth client is host-mounted (`./credentials/`); the
+  refresh token cache lives in a named volume so it survives rebuilds.
+- `.dockerignore` excludes `.git`, caches, `.venv`, secrets
+  (`credential.json`, `credentials/`, `token.json`, `.env`), and
+  local-only paths (`tests/`, `scripts/`, `docs/lessons/`).
+
 #### Analyze prompt revisions (live-run feedback)
 
 - **Summary now keeps payment / point / aggregate specifics.**
