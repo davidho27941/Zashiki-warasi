@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### Notion API migration — `databases.query` → `data_sources.query`
+
+- `notion-client 3.x` removed `client.databases.query` when Notion's
+  2025 API split databases into 1+ data sources. The freshly-shipped
+  `NotionExpensePuller` broke on first run with
+  `AttributeError: 'DatabasesEndpoint' object has no attribute 'query'`.
+- Puller now resolves the data_source_id lazily via
+  `databases.retrieve` and caches it for the process lifetime, then
+  calls `data_sources.query(data_source_id=…)`. The write side
+  (`NotionExpenseRecorder.record_expense`) is unaffected — `pages.create`
+  with `parent={"database_id": …}` still works.
+- 3 new tests: cache behaviour (retrieve called once across N syncs),
+  correct arg name passed to `data_sources.query`, and clear
+  `RuntimeError` when the retrieve response has no data_sources.
+
 ### Added
 
 #### Notion → DB reverse sync

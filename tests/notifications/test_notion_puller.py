@@ -199,7 +199,12 @@ def _puller(
                 "next_cursor": f"cur-{i + 1}" if i < len(batches) - 1 else None,
             }
         )
-    client.databases.query.side_effect = responses
+    # Notion 2025 API: `data_sources.query` replaces `databases.query`,
+    # and the data_source_id is resolved via `databases.retrieve`.
+    client.databases.retrieve.return_value = {
+        "data_sources": [{"id": "ds-uuid-xyz", "name": "default"}],
+    }
+    client.data_sources.query.side_effect = responses
 
     puller = NotionExpensePuller(
         _settings(), _FakeSessionFactory(session), client=client
@@ -282,7 +287,7 @@ class TestQueryFilter:
         puller, client = _puller(session=session, query_pages=[])
         puller.sync_once()
 
-        kwargs = client.databases.query.call_args.kwargs
+        kwargs = client.data_sources.query.call_args.kwargs
         and_filters = kwargs["filter"]["and"]
         # Only the auto-generated marker filter; no time filter.
         assert len(and_filters) == 1
@@ -301,7 +306,7 @@ class TestQueryFilter:
         puller, client = _puller(session=session, query_pages=[])
         puller.sync_once()
 
-        and_filters = client.databases.query.call_args.kwargs["filter"][
+        and_filters = client.data_sources.query.call_args.kwargs["filter"][
             "and"
         ]
         assert len(and_filters) == 2
@@ -317,7 +322,7 @@ class TestQueryFilter:
         session = _FakeSession()
         puller, client = _puller(session=session, query_pages=[])
         puller.sync_once()
-        sorts = client.databases.query.call_args.kwargs["sorts"]
+        sorts = client.data_sources.query.call_args.kwargs["sorts"]
         assert sorts == [
             {"timestamp": "last_edited_time", "direction": "ascending"}
         ]
@@ -433,8 +438,8 @@ class TestSyncOnce:
 
         assert stats.fetched == 2
         # First call: no start_cursor. Second call: start_cursor=cur-1.
-        first_kwargs = client.databases.query.call_args_list[0].kwargs
-        second_kwargs = client.databases.query.call_args_list[1].kwargs
+        first_kwargs = client.data_sources.query.call_args_list[0].kwargs
+        second_kwargs = client.data_sources.query.call_args_list[1].kwargs
         assert "start_cursor" not in first_kwargs
         assert second_kwargs["start_cursor"] == "cur-1"
 
@@ -460,3 +465,53 @@ class TestConstruction:
                 _FakeSessionFactory(_FakeSession()),
                 client=MagicMock(),
             )
+
+
+class TestDataSourceResolution:
+    """`data_sources.query` requires the data_source_id (Notion 2025
+    API change). The puller resolves it lazily via `databases.retrieve`
+    and caches it for the process lifetime."""
+
+    def test_data_source_resolved_once_and_cached(self):
+        session = _FakeSession()
+        puller, client = _puller(session=session, query_pages=[])
+        # Override the one-shot side_effect with a repeatable
+        # return_value so 3 sync_once calls all succeed.
+        client.data_sources.query.side_effect = None
+        client.data_sources.query.return_value = {
+            "results": [],
+            "has_more": False,
+            "next_cursor": None,
+        }
+
+        # Three sync passes back-to-back. databases.retrieve should
+        # only be hit on the first one; subsequent passes reuse the
+        # cached data_source_id.
+        for _ in range(3):
+            puller.sync_once()
+
+        assert client.databases.retrieve.call_count == 1
+        assert client.data_sources.query.call_count == 3
+
+    def test_query_uses_resolved_data_source_id(self):
+        session = _FakeSession()
+        puller, client = _puller(session=session, query_pages=[])
+        puller.sync_once()
+
+        kwargs = client.data_sources.query.call_args.kwargs
+        # The resolved id comes from the mocked retrieve response —
+        # NOT the configured database_id; this guards against a
+        # regression where the old `database_id` arg name is passed.
+        assert kwargs["data_source_id"] == "ds-uuid-xyz"
+        assert "database_id" not in kwargs
+
+    def test_database_with_no_data_sources_raises(self):
+        session = _FakeSession()
+        puller, client = _puller(session=session, query_pages=[])
+        # Override the retrieve mock to return an empty data_sources
+        # list — Notion shouldn't ever do this, but if it does we
+        # want a clear error instead of an IndexError.
+        client.databases.retrieve.return_value = {"data_sources": []}
+
+        with pytest.raises(RuntimeError, match="no data_sources"):
+            puller.sync_once()

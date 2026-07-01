@@ -85,6 +85,12 @@ class NotionExpensePuller:
             auth=settings.token,
             timeout_ms=int(settings.timeout_seconds * 1000),
         )
+        # Resolved on first call to `_fetch_recent_pages` and cached
+        # for the puller's lifetime — data_source_id doesn't change.
+        # Notion's 2025 API split databases into 1+ data sources;
+        # query was moved from `databases.query` (removed in
+        # notion-client 3.x) to `data_sources.query`.
+        self._data_source_id: str | None = None
 
     def sync_once(self) -> SyncStats:
         """Run one full reconcile pass; return counts."""
@@ -113,6 +119,29 @@ class NotionExpensePuller:
 
         return SyncStats(fetched=len(pages), updated=updated, skipped=skipped)
 
+    def _resolve_data_source_id(self) -> str:
+        """Look up the data_source_id for the configured database.
+
+        Notion's 2025 model: each database has one or more data
+        sources; `data_sources.query` operates on the data source,
+        not the database. For our use case (a single expense DB) the
+        first data source is the only one and we cache it for the
+        process lifetime.
+        """
+        if self._data_source_id is not None:
+            return self._data_source_id
+        database = self._client.databases.retrieve(
+            database_id=self._settings.expense_database_id
+        )
+        data_sources = database.get("data_sources") or []
+        if not data_sources:
+            raise RuntimeError(
+                f"Notion database {self._settings.expense_database_id} "
+                "has no data_sources — cannot query."
+            )
+        self._data_source_id = data_sources[0]["id"]
+        return self._data_source_id
+
     def _fetch_recent_pages(
         self, cursor: datetime | None
     ) -> list[dict[str, Any]]:
@@ -120,6 +149,7 @@ class NotionExpensePuller:
         auto-generated. Paginates through `has_more`."""
         marker = NotionExpenseRecorder.AUTO_GENERATED_NOTE
         notes_prop = NotionExpenseRecorder.PROP_NOTES
+        data_source_id = self._resolve_data_source_id()
 
         and_filters: list[dict[str, Any]] = [
             {
@@ -139,7 +169,7 @@ class NotionExpensePuller:
         start_cursor: str | None = None
         while True:
             query: dict[str, Any] = {
-                "database_id": self._settings.expense_database_id,
+                "data_source_id": data_source_id,
                 "filter": {"and": and_filters},
                 "sorts": [
                     {
@@ -151,7 +181,7 @@ class NotionExpensePuller:
             }
             if start_cursor is not None:
                 query["start_cursor"] = start_cursor
-            response = self._client.databases.query(**query)
+            response = self._client.data_sources.query(**query)
             results.extend(response.get("results", []))
             if not response.get("has_more"):
                 break
