@@ -198,9 +198,38 @@ class NotionExpensePuller:
             logger.warning(f"Notion page missing id: {page!r}")
             return False
 
-        updates = _extract_updates(page.get("properties", {}))
+        properties = page.get("properties", {})
+        updates = _extract_updates(properties)
+        page_uuid = _read_rich_text(
+            properties.get(NotionExpenseRecorder.PROP_TRANSACTION_ID)
+        )
 
         with self._session_factory() as session:
+            # UUID duplicate guard. While the user runs the parallel
+            # n8n system, the same transaction may end up as two Notion
+            # pages sharing one UUID: one from Zashiki (correctly
+            # linked to a local row via notion_page_id) and one from
+            # n8n (unlinked). If our filter ever admits an n8n page
+            # (e.g. someone stamps the marker manually), we must NOT
+            # let it drive an update against a row it doesn't own.
+            if page_uuid:
+                uuid_match = session.scalar(
+                    select(ExpenseRecord).where(
+                        ExpenseRecord.transaction_id == page_uuid
+                    )
+                )
+                if (
+                    uuid_match is not None
+                    and uuid_match.notion_page_id != page_id
+                ):
+                    logger.info(
+                        f"Notion page {page_id} has UUID {page_uuid!r} "
+                        f"already on local expense {uuid_match.id} "
+                        f"(notion_page_id={uuid_match.notion_page_id!r}); "
+                        "skipping — likely an n8n-created duplicate."
+                    )
+                    return False
+
             expense = session.scalar(
                 select(ExpenseRecord).where(
                     ExpenseRecord.notion_page_id == page_id

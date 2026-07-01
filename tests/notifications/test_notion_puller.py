@@ -45,9 +45,17 @@ def _page(
     transacted: str | None = "2026-06-21",
     category: str | None = "Food",
     payment: str | None = "Credit",
+    uuid_prop: str | None = None,
 ) -> dict:
     """Build a Notion page object shaped like the API response."""
     props: dict = {
+        NotionExpenseRecorder.PROP_TRANSACTION_ID: {
+            "rich_text": (
+                [{"plain_text": uuid_prop}]
+                if uuid_prop is not None
+                else []
+            )
+        },
         NotionExpenseRecorder.PROP_TITLE: {
             "title": (
                 [{"plain_text": title}] if title is not None else []
@@ -115,7 +123,9 @@ class _FakeSession:
     """Stand-in for SQLAlchemy Session used by the puller.
 
     The puller uses three operations only:
-      - `scalar(select(ExpenseRecord).where(...))`
+      - `scalar(select(ExpenseRecord).where(...))` — resolves both
+        `notion_page_id ==` and `transaction_id ==` lookups by
+        peeking at the literal-bound SQL.
       - `get(NotionSyncState, key)`
       - `add(state)` / `commit()`
     """
@@ -123,19 +133,28 @@ class _FakeSession:
     def __init__(
         self,
         expenses_by_page: dict[str, ExpenseRecord] | None = None,
+        expenses_by_uuid: dict[str, ExpenseRecord] | None = None,
         cursor: NotionSyncState | None = None,
     ) -> None:
         self.expenses_by_page = expenses_by_page or {}
+        self.expenses_by_uuid = expenses_by_uuid or {}
         self.cursor = cursor
         self.committed = False
         self.added: list = []
         self._last_select_page_id: str | None = None
 
     def scalar(self, stmt):
-        # Crude but sufficient: pull the literal page_id off the
-        # compiled where clause via the stmt's parameters.
+        # Compile with literal binds so the where value is visible in
+        # the SQL text. Both `transaction_id` and `notion_page_id`
+        # appear in the SELECT column list, so we must sniff the
+        # WHERE clause specifically — check the ` = '` predicate form.
         compiled = stmt.compile(compile_kwargs={"literal_binds": True})
         sql = str(compiled)
+        if "transaction_id = '" in sql or "transaction_id='" in sql:
+            for uuid, expense in self.expenses_by_uuid.items():
+                if f"'{uuid}'" in sql:
+                    return expense
+            return None
         for page_id in self.expenses_by_page:
             if f"'{page_id}'" in sql:
                 return self.expenses_by_page[page_id]
@@ -465,6 +484,95 @@ class TestConstruction:
                 _FakeSessionFactory(_FakeSession()),
                 client=MagicMock(),
             )
+
+
+class TestUuidDuplicateGuard:
+    """`_apply_page` must not update a local row via `notion_page_id`
+    if the Notion page's UUID (transaction_id) already exists on a
+    DIFFERENT local row — e.g. n8n created the local row first and
+    Zashiki independently produced a Notion page for the same
+    transaction. Without this guard we'd risk cross-writing fields
+    between two records for the same transaction."""
+
+    def test_page_uuid_matches_different_notion_page_id_is_skipped(self):
+        # Local row R was created by n8n (or an earlier Zashiki run)
+        # and is linked to page-old. A fresh Notion page (page-new)
+        # arrives with the SAME UUID → guard must skip.
+        n8n_row = _expense(
+            notion_page_id="page-old", transaction_id="txn-123"
+        )
+        session = _FakeSession(
+            expenses_by_page={"page-old": n8n_row},
+            expenses_by_uuid={"txn-123": n8n_row},
+        )
+        page = _page(page_id="page-new", uuid_prop="txn-123")
+        puller, _ = _puller(session=session, query_pages=[page])
+
+        stats = puller.sync_once()
+
+        assert stats.skipped == 1
+        assert stats.updated == 0
+        # The n8n row must be untouched — no field bleed.
+        assert n8n_row.vendor == "Old vendor"
+        assert n8n_row.notion_synced_at is None
+
+    def test_page_uuid_matches_same_notion_page_id_proceeds(self):
+        # The normal case: Zashiki created BOTH the local row and the
+        # Notion page, so the UUID lookup returns the same row that
+        # notion_page_id would. Guard should let the update through.
+        our_row = _expense(
+            notion_page_id="page-1", transaction_id="txn-123"
+        )
+        session = _FakeSession(
+            expenses_by_page={"page-1": our_row},
+            expenses_by_uuid={"txn-123": our_row},
+        )
+        page = _page(
+            page_id="page-1",
+            uuid_prop="txn-123",
+            vendor="Updated vendor",
+        )
+        puller, _ = _puller(session=session, query_pages=[page])
+
+        stats = puller.sync_once()
+
+        assert stats.updated == 1
+        assert our_row.vendor == "Updated vendor"
+
+    def test_page_with_uuid_but_no_local_match_falls_through(self):
+        # UUID present on the Notion page but nothing in local DB has
+        # it — guard is inert, the normal notion_page_id lookup runs
+        # (and skips because there's no matching row).
+        session = _FakeSession(
+            expenses_by_page={}, expenses_by_uuid={}
+        )
+        page = _page(page_id="page-1", uuid_prop="txn-fresh")
+        puller, _ = _puller(session=session, query_pages=[page])
+
+        stats = puller.sync_once()
+
+        # Falls through to the orphan skip, not the guard skip.
+        assert stats.skipped == 1
+        assert stats.updated == 0
+
+    def test_page_without_uuid_skips_guard_entirely(self):
+        # If the page's UUID column is empty, the guard cannot fire —
+        # existing behaviour preserved for the (common) case of
+        # transaction_id being None on both sides.
+        our_row = _expense(
+            notion_page_id="page-1", transaction_id=None, vendor="Old"
+        )
+        session = _FakeSession(
+            expenses_by_page={"page-1": our_row},
+            expenses_by_uuid={},
+        )
+        page = _page(page_id="page-1", vendor="New", uuid_prop=None)
+        puller, _ = _puller(session=session, query_pages=[page])
+
+        stats = puller.sync_once()
+
+        assert stats.updated == 1
+        assert our_row.vendor == "New"
 
 
 class TestDataSourceResolution:

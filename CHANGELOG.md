@@ -24,6 +24,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct arg name passed to `data_sources.query`, and clear
   `RuntimeError` when the retrieve response has no data_sources.
 
+#### Puller UUID duplicate guard
+
+- `NotionExpensePuller._apply_page` now reads the Notion page's
+  `UUID` property (== `expenses.transaction_id`) and, before doing
+  any update, looks up any local `ExpenseRecord` with that
+  transaction_id. If the lookup returns a row whose
+  `notion_page_id` differs from the page currently being processed,
+  the page is skipped with a log entry.
+- Motivation: during the migration window from the previous n8n
+  workflow, both systems process the same emails. A given
+  transaction can end up as two Notion pages sharing one UUID
+  (one Zashiki-linked, one n8n-created). The guard ensures an n8n
+  page that somehow slips past the marker filter cannot drive an
+  update against a row it doesn't own.
+- Pages without a UUID (transaction_id was `None` on the original
+  extraction) bypass the guard — existing behaviour preserved.
+- 4 new tests in `TestUuidDuplicateGuard`.
+
 #### Poller loop stability
 
 - **Gmail HTTP socket timeout.** `GmailClient` now builds its own
