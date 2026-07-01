@@ -29,6 +29,14 @@ class GmailSettings(BaseSettings):
         default_factory=lambda: list(DEFAULT_SCOPES)
     )
 
+    # Socket-level timeout (seconds) for every Gmail HTTP request.
+    # Without this, httplib2's default of `None` lets the OS TCP
+    # layer wait up to ~13 minutes (RTO doubling) before a dead
+    # connection surfaces as ConnectionResetError — which stalls the
+    # poller loop for the entire wait. 60s is well below the poll
+    # cadence (30s tick, but individual requests should be sub-second).
+    http_timeout_seconds: float = Field(default=60.0, gt=0)
+
     @field_validator("credentials_path", "token_path")
     @classmethod
     def _expand(cls, value: Path) -> Path:

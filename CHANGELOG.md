@@ -24,6 +24,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct arg name passed to `data_sources.query`, and clear
   `RuntimeError` when the retrieve response has no data_sources.
 
+#### Poller loop stability
+
+- **Gmail HTTP socket timeout.** `GmailClient` now builds its own
+  `httplib2.Http(timeout=…)` and wraps it in `AuthorizedHttp` before
+  passing to `googleapiclient.discovery.build`. Without this,
+  httplib2's default of `None` lets the OS TCP layer wait ~13min
+  (RTO doubling) before a dead connection surfaces as
+  `ConnectionResetError` — visibly stalling the poller. Default
+  timeout `60`s via new `GMAIL_HTTP_TIMEOUT_SECONDS` env var.
+  4 new tests in `test_client_api.py::TestHttpTimeout`.
+- **DB pool pre-ping.** `create_engine` now sets `pool_pre_ping=True`
+  and `pool_recycle=1800`. Overnight-idle connections killed by a
+  home-router NAT eviction or by Postgres server-side idle-drop
+  were surfacing as `SSL SYSCALL Operation timed out` /
+  `server closed the connection unexpectedly` on the next query;
+  both are eliminated by the cheap SELECT 1 pre-flight on checkout.
+  Both the Gmail poller and Notion puller share the singleton
+  engine, so both benefit. 2 new tests in `test_db.py::TestGetEngine`.
+
 ### Added
 
 #### Notion → DB reverse sync

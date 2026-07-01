@@ -268,6 +268,7 @@ project root is supported via `pydantic-settings`).
 | `GMAIL_CREDENTIALS_PATH` | `credentials.json` | OAuth client secrets JSON |
 | `GMAIL_TOKEN_PATH` | `~/.config/zashiki-warasi/token.json` | Cached user token |
 | `GMAIL_SCOPES` | `https://www.googleapis.com/auth/gmail.readonly` | Comma-separated OAuth scopes |
+| `GMAIL_HTTP_TIMEOUT_SECONDS` | `60` | Per-request socket timeout; prevents dead-connection blocking of the poller loop |
 | `LLM_PROVIDER` | `llamacpp` | One of `llamacpp`, `openai`, `anthropic` |
 | `LLM_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible endpoint (used by `llamacpp` and `openai`) |
 | `LLM_API_KEY` | `not-needed` | API key for the provider |

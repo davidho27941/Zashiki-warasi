@@ -9,7 +9,7 @@ translation that the poller relies on.
 from __future__ import annotations
 
 import base64
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from googleapiclient.errors import HttpError
@@ -333,3 +333,72 @@ class TestListHistory:
         # startHistoryId (only the fluent chain warm-up MagicMock calls).
         list_calls = service.users().history().list.call_args_list
         assert not any("startHistoryId" in c.kwargs for c in list_calls)
+
+
+class TestHttpTimeout:
+    """__init__ must pin an httplib2 socket timeout — otherwise a
+    dead TCP connection blocks the whole poller loop for ~13min while
+    the OS retransmits before surfacing ConnectionResetError.
+
+    These tests patch httplib2.Http and google_auth_httplib2's
+    AuthorizedHttp so we can inspect what timeout the client passes
+    without needing real credentials or a live socket."""
+
+    def test_default_timeout_from_gmail_settings(self, monkeypatch):
+        monkeypatch.setenv("GMAIL_HTTP_TIMEOUT_SECONDS", "42")
+        with (
+            patch("zashiki_warasi.gmail.client.httplib2.Http") as mock_http,
+            patch("zashiki_warasi.gmail.client.AuthorizedHttp"),
+            patch("zashiki_warasi.gmail.client.build"),
+        ):
+            GmailClient(credentials=MagicMock())
+
+        mock_http.assert_called_once_with(timeout=42.0)
+
+    def test_explicit_timeout_overrides_settings(self, monkeypatch):
+        monkeypatch.setenv("GMAIL_HTTP_TIMEOUT_SECONDS", "99")
+        with (
+            patch("zashiki_warasi.gmail.client.httplib2.Http") as mock_http,
+            patch("zashiki_warasi.gmail.client.AuthorizedHttp"),
+            patch("zashiki_warasi.gmail.client.build"),
+        ):
+            GmailClient(credentials=MagicMock(), http_timeout_seconds=5.0)
+
+        mock_http.assert_called_once_with(timeout=5.0)
+
+    def test_authorized_http_receives_the_timed_http(self):
+        with (
+            patch("zashiki_warasi.gmail.client.httplib2.Http") as mock_http,
+            patch(
+                "zashiki_warasi.gmail.client.AuthorizedHttp"
+            ) as mock_auth,
+            patch("zashiki_warasi.gmail.client.build"),
+        ):
+            creds = MagicMock()
+            GmailClient(credentials=creds, http_timeout_seconds=10.0)
+
+        # AuthorizedHttp(credentials, http=Http(timeout=10)) —
+        # verifies the credentials are still attached AND the
+        # timed http instance is what gets wrapped.
+        args, kwargs = mock_auth.call_args
+        assert args[0] is creds
+        assert kwargs["http"] is mock_http.return_value
+
+    def test_build_uses_the_authorized_http_not_bare_credentials(self):
+        # Regression guard: earlier version called
+        # `build("gmail", "v1", credentials=creds, ...)` which
+        # internally creates a NO-TIMEOUT Http. We must pass `http=`
+        # so our timed transport is actually used.
+        with (
+            patch("zashiki_warasi.gmail.client.httplib2.Http"),
+            patch(
+                "zashiki_warasi.gmail.client.AuthorizedHttp"
+            ) as mock_auth,
+            patch("zashiki_warasi.gmail.client.build") as mock_build,
+        ):
+            GmailClient(credentials=MagicMock())
+
+        _, kwargs = mock_build.call_args
+        assert kwargs["http"] is mock_auth.return_value
+        assert "credentials" not in kwargs
+        assert kwargs["cache_discovery"] is False
