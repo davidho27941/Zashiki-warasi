@@ -473,6 +473,57 @@ class TestRouting:
         # notify still happens
         mock_notifier.send_message.assert_called_once()
 
+    @pytest.mark.parametrize(
+        "category", ["消費支出", "帳單通知"]
+    )
+    def test_expense_like_categories_route_to_expense(self, category):
+        # Direct unit check on the router. Avoids the full subgraph
+        # scaffolding — used by the integration test below — since the
+        # dispatch logic is the whole point here.
+        agent = EmailAgent.__new__(EmailAgent)
+        state = {
+            "analysis": EmailAnalysis(
+                importance=3,
+                urgency="normal",
+                category=category,
+                summary="s",
+                keywords=[],
+            )
+        }
+        assert agent._route_by_category(state) == "expense"
+
+    @pytest.mark.parametrize(
+        "category",
+        [
+            "廣告",
+            "促銷",
+            "點數資訊彙整",
+            "消費資訊彙整",
+            "訂閱服務",
+            "會議邀請",
+            "其他",
+        ],
+    )
+    def test_non_expense_categories_route_to_notify(self, category):
+        # Regression guard: adding 帳單通知 must NOT also grab 消費資訊
+        # 彙整 (multi-txn digests, no per-line detail) or 點數資訊彙整
+        # (point notifications, deliberately excluded from expense).
+        agent = EmailAgent.__new__(EmailAgent)
+        state = {
+            "analysis": EmailAnalysis(
+                importance=3,
+                urgency="normal",
+                category=category,
+                summary="s",
+                keywords=[],
+            )
+        }
+        assert agent._route_by_category(state) == "notify"
+
+    def test_missing_analysis_routes_to_notify(self):
+        agent = EmailAgent.__new__(EmailAgent)
+        assert agent._route_by_category({"analysis": None}) == "notify"
+
     def test_expense_category_invokes_expense_subgraph(
         self, monkeypatch, session_factory, fake_email,
         mock_notifier, mock_client,

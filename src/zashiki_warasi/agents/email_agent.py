@@ -186,11 +186,18 @@ class EmailAgent:
         )
         return {"analysis": analysis}
 
+    # Categories that go through the expense subgraph — where PDF /
+    # HTML attachments are pulled and the LLM extracts structured
+    # payment fields (amount, vendor, transacted_at, …). Kept as a
+    # tuple so a future addition (e.g. 訂閱服務 for recurring charges)
+    # is a one-line change.
+    _EXPENSE_LIKE_CATEGORIES = ("消費支出", "帳單通知")
+
     def _route_by_category(self, state: AgentState) -> str:
         analysis = state.get("analysis")
         if analysis is None:
             return "notify"
-        if analysis.category == "消費支出":
+        if analysis.category in self._EXPENSE_LIKE_CATEGORIES:
             return "expense"
         return "notify"
 

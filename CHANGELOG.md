@@ -24,6 +24,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct arg name passed to `data_sources.query`, and clear
   `RuntimeError` when the retrieve response has no data_sources.
 
+#### `帳單通知` category now routes to the expense subgraph
+
+- `_route_by_category` was hardcoded to `category == "消費支出"`,
+  so bill-notification emails (cloud invoices, utility bills,
+  telecom charges, etc.) went straight to `notify` and never
+  reached `ExpenseSubgraph._extract_node` — the only path that
+  downloads and reads PDF attachments. Symptom in the wild: a
+  Google Cloud Platform electronic invoice was classified as
+  `帳單通知`, the invoice PDF was fetched by the Gmail poller but
+  never opened, and the Telegram summary carried `消費金額為不明`.
+- Router now dispatches to expense for both `消費支出` and
+  `帳單通知` via a new `_EXPENSE_LIKE_CATEGORIES` tuple.
+  Adjacent categories (`消費資訊彙整`, `點數資訊彙整`, `訂閱服務`,
+  `廣告`, `促銷`) remain routed to `notify` — the tuple is the
+  single source of truth so future additions are one-line.
+- Extraction system prompt broadened from "消費支出資訊擷取助理"
+  to "消費支出 / 帳單資訊擷取助理" and now lists cloud invoice /
+  utility / subscription as valid sources. All other extraction
+  rules (nulls-not-guesses, ISO 8601, payment_method taxonomy,
+  title guidance) unchanged — bill fields map cleanly onto the
+  existing schema.
+- 10 new tests in `TestRouting`: parametrised route table for
+  both expense-like categories, regression guards that 7 other
+  categories still hit `notify`, and the `analysis is None`
+  short-circuit.
+
 #### Puller UUID duplicate guard
 
 - `NotionExpensePuller._apply_page` now reads the Notion page's
