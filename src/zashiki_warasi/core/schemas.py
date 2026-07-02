@@ -268,7 +268,26 @@ class ExpenseNeedsReview(BaseModel):
     unreadable_attachments: list[str] = Field(default_factory=list)
 
 
+class AnalysisFailed(BaseModel):
+    """SideEffect payload when the analyze LLM call blew up before we
+    got a structured `EmailAnalysis` back.
+
+    Emitted from the analyze node itself (not any vertical). Notify
+    renders this even when `state["analysis"]` is None so the user
+    still gets pinged for a manual review instead of the failure
+    silently vanishing into the poller's tick retry log.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["analysis_failed"] = "analysis_failed"
+    reason: Literal["content_too_long"]
+    # Free-form context (e.g. token counts from LengthFinishReasonError)
+    # so the Telegram message shows something actionable.
+    detail: str | None = None
+
+
 SideEffect = Annotated[
-    ExpenseLogged | ExpenseNeedsReview,
+    ExpenseLogged | ExpenseNeedsReview | AnalysisFailed,
     Field(discriminator="kind"),
 ]

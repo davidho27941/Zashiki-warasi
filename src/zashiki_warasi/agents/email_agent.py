@@ -19,6 +19,7 @@ from typing import TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
+from openai import LengthFinishReasonError
 from sqlalchemy.orm import sessionmaker
 
 from zashiki_warasi.agents.llm import get_chat_model
@@ -26,6 +27,7 @@ from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
 from zashiki_warasi.agents.verticals.html_text import html_to_text
 from zashiki_warasi.core.models import EmailAnalysis as EmailAnalysisORM
 from zashiki_warasi.core.schemas import (
+    AnalysisFailed,
     EmailAnalysis,
     EmailMessage,
     ExpenseLogged,
@@ -178,12 +180,33 @@ class EmailAgent:
             f"\n"
             f"{body}"
         )
-        analysis = self._analyze_model.invoke(
-            [
-                SystemMessage(content=ANALYZE_SYSTEM_PROMPT),
-                HumanMessage(content=user_text),
-            ]
-        )
+        try:
+            analysis = self._analyze_model.invoke(
+                [
+                    SystemMessage(content=ANALYZE_SYSTEM_PROMPT),
+                    HumanMessage(content=user_text),
+                ]
+            )
+        except LengthFinishReasonError as exc:
+            # LLM ran out of completion tokens mid-structured-output.
+            # Poller would otherwise re-tick and fail identically until
+            # the message dropped off history; instead we emit an
+            # `AnalysisFailed` side-effect so notify still pings the
+            # user and the graph completes normally.
+            usage = exc.completion.usage
+            detail = (
+                f"prompt={usage.prompt_tokens} "
+                f"completion={usage.completion_tokens}"
+            )
+            logger.warning(
+                f"analyze: LLM hit token limit for {email.id} ({detail})"
+            )
+            return {
+                "analysis": None,
+                "side_effect": AnalysisFailed(
+                    reason="content_too_long", detail=detail
+                ),
+            }
         return {"analysis": analysis}
 
     # Categories that go through the expense subgraph — where PDF /
@@ -203,14 +226,21 @@ class EmailAgent:
 
     def _notify(self, state: AgentState) -> dict:
         analysis = state["analysis"]
+        side_effect = state.get("side_effect")
         if analysis is None:
+            # Analyze itself failed — no structured summary to render.
+            # If it left us an AnalysisFailed marker we still ping the
+            # user (they need to open the mail manually); otherwise we
+            # log and skip since something else went off-script.
+            if isinstance(side_effect, AnalysisFailed):
+                text = _format_analysis_failed(state["email"], side_effect)
+                self._notifier.send_message(text)
+                return {}
             logger.warning(
                 f"notify: skipping {state['email'].id} — no analysis"
             )
             return {}
-        text = _format_message(
-            state["email"], analysis, state.get("side_effect")
-        )
+        text = _format_message(state["email"], analysis, side_effect)
         self._notifier.send_message(text)
         return {}
 
@@ -394,6 +424,29 @@ def _format_expense_logged(effect: ExpenseLogged) -> str:
         err = html.escape(effect.notion_sync_error[:80])
         lines.append(f"  ⚠️ Notion 同步失敗: {err}")
 
+    return "\n".join(lines)
+
+
+def _format_analysis_failed(
+    email: EmailMessage, effect: AnalysisFailed
+) -> str:
+    """Render an `AnalysisFailed` — no analysis body exists yet, so
+    this is the ENTIRE Telegram message (unlike ExpenseLogged /
+    NeedsReview which piggyback onto the normal analysis block)."""
+    lines = [
+        "⚠️ <b>LLM 分析失敗</b>",
+        "",
+        f"<b>標題:</b> {html.escape(email.subject)}",
+        f"<b>寄件者:</b> {html.escape(email.from_address)}",
+        "",
+    ]
+    if effect.reason == "content_too_long":
+        lines.append(
+            "原因: 郵件內容超過 LLM token 上限,無法完成結構化分析。"
+        )
+    if effect.detail:
+        lines.append(f"用量: <code>{html.escape(effect.detail)}</code>")
+    lines.append("→ 請打開原信手動處理。")
     return "\n".join(lines)
 
 

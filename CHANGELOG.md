@@ -24,6 +24,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct arg name passed to `data_sources.query`, and clear
   `RuntimeError` when the retrieve response has no data_sources.
 
+#### Catch `LengthFinishReasonError` in the analyze node
+
+- When an email + system prompt exceeds the LLM's context window
+  (in the wild: a 31k-prompt email exhausted the 32k window
+  mid-generation, `finish_reason=length`), `openai` raises
+  `LengthFinishReasonError` from
+  `_parse_chat_completion`. Previously it escaped the graph and
+  surfaced as `Unhandled error during tick; will retry`, which
+  meant the poller re-tried the same doomed LLM call every tick
+  until Gmail's ~7-day history retention rolled the message off.
+- `_analyze` now catches the error, logs the prompt/completion
+  token counts, and returns
+  `{"analysis": None, "side_effect": AnalysisFailed(...)}`.
+  The graph completes normally, notify sends the user a Telegram
+  message describing the failure, and `handle_email` skips
+  persistence (no placeholder row in `email_analyses`).
+- New `AnalysisFailed` variant added to the `SideEffect` union
+  (`kind="analysis_failed"`, `reason: Literal["content_too_long"]`,
+  optional `detail` for token counts). Extensible if future
+  analyze failure modes need distinct handling.
+- New `_format_analysis_failed` renderer produces the whole
+  Telegram body (no analyze summary to hang it on) with the
+  offending mail's subject / sender escaped, the reason in
+  Chinese, and the raw token counts inside a `<code>` block.
+- 8 new tests in `TestAnalyzeFailure` / `TestFormatAnalysisFailed`:
+  handle_email returns normally, notify still sends, no analysis
+  row persisted, structured runnable called exactly once (no
+  retry inside the graph), content-too-long reason string, HTML
+  escape guard, detail-omitted-when-None.
+
 #### `帳單通知` category now routes to the expense subgraph
 
 - `_route_by_category` was hardcoded to `category == "消費支出"`,

@@ -20,7 +20,49 @@ from sqlalchemy.orm import sessionmaker
 from zashiki_warasi.agents.email_agent import EmailAgent
 from zashiki_warasi.core.models import Base
 from zashiki_warasi.core.models import EmailAnalysis as EmailAnalysisORM
-from zashiki_warasi.core.schemas import EmailAnalysis, EmailMessage
+from zashiki_warasi.core.schemas import (
+    AnalysisFailed,
+    EmailAnalysis,
+    EmailMessage,
+)
+
+
+def _make_length_finish_error(
+    prompt_tokens: int = 31059, completion_tokens: int = 1709
+):
+    """Build a real `LengthFinishReasonError` — its `__init__` needs a
+    valid ChatCompletion, so we synthesise a minimal one instead of
+    reaching for `MagicMock(spec=...)` which would fail pydantic
+    validation in `_parse_chat_completion`."""
+    from openai import LengthFinishReasonError
+    from openai.types.chat.chat_completion import (
+        ChatCompletion,
+        ChatCompletionMessage,
+        Choice,
+    )
+    from openai.types.completion_usage import CompletionUsage
+
+    completion = ChatCompletion(
+        id="c-1",
+        created=0,
+        model="test",
+        object="chat.completion",
+        choices=[
+            Choice(
+                index=0,
+                message=ChatCompletionMessage(
+                    role="assistant", content="partial"
+                ),
+                finish_reason="length",
+            )
+        ],
+        usage=CompletionUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+    )
+    return LengthFinishReasonError(completion=completion)
 
 
 @dataclass
@@ -588,6 +630,139 @@ class TestRouting:
         assert "已記帳" in text
         assert "3200 JPY" in text
         assert "Amazon.co.jp" in text
+
+
+# ---------- LLM analyze failure handling ----------
+
+
+class TestAnalyzeFailure:
+    """`_analyze` must not let an `openai.LengthFinishReasonError`
+    escape the graph — it'd surface as an unhandled poller-tick
+    error and re-fire on every retry until Gmail history retention
+    kicks in. Instead the node emits an `AnalysisFailed` side_effect
+    so notify still pings the user for manual review."""
+
+    @pytest.fixture
+    def agent_with_length_error(
+        self, monkeypatch, session_factory, mock_notifier, mock_client
+    ):
+        # Structured runnable raises LengthFinishReasonError on invoke.
+        structured = MagicMock(name="structured_output")
+        structured.invoke.side_effect = _make_length_finish_error()
+        model = MagicMock(name="chat_model")
+        model.with_structured_output.return_value = structured
+        monkeypatch.setattr(
+            "zashiki_warasi.agents.email_agent.get_chat_model",
+            lambda: model,
+        )
+        return EmailAgent(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            notifier=mock_notifier,
+            client=mock_client,
+        )
+
+    def test_length_error_does_not_escape_handle_email(
+        self, agent_with_length_error, fake_email
+    ):
+        # No pytest.raises — the graph must return normally.
+        agent_with_length_error.handle_email(fake_email)
+
+    def test_length_error_sends_notify_message(
+        self, agent_with_length_error, fake_email, mock_notifier
+    ):
+        agent_with_length_error.handle_email(fake_email)
+
+        mock_notifier.send_message.assert_called_once()
+        text = mock_notifier.send_message.call_args.args[0]
+        assert "LLM 分析失敗" in text
+        assert "token 上限" in text
+        # Detail (prompt/completion token counts) is surfaced so the
+        # user can eyeball whether it's a genuinely huge email or a
+        # runaway generation.
+        assert "31059" in text
+        assert "1709" in text
+        # Subject and sender still rendered so the user can locate the
+        # offending mail without cross-referencing an id.
+        assert fake_email.subject in text
+        assert fake_email.from_address in text
+
+    def test_length_error_does_not_persist_analysis(
+        self, agent_with_length_error, fake_email, session_factory
+    ):
+        # Persistence guard: without an EmailAnalysis object we must
+        # NOT write a placeholder row — analyzer failures shouldn't
+        # pollute the analytics table.
+        agent_with_length_error.handle_email(fake_email)
+        assert _count_analyses(session_factory) == 0
+
+    def test_length_error_only_calls_llm_once(
+        self, agent_with_length_error, fake_email
+    ):
+        # Regression guard: the graph must not retry the analyze node
+        # after catching the error (a retry would just re-raise).
+        agent_with_length_error.handle_email(fake_email)
+        structured = (
+            agent_with_length_error._analyze_model
+        )
+        structured.invoke.assert_called_once()
+
+
+class TestFormatAnalysisFailed:
+    """Direct tests on the formatter — subject / sender injection
+    guard and reason text coverage."""
+
+    def _email(self, **overrides) -> EmailMessage:
+        base = dict(
+            id="m1",
+            thread_id="t",
+            history_id=1,
+            from_address="billing@gcp.example",
+            subject="Your invoice is attached",
+            received_at=datetime(2026, 7, 2, tzinfo=timezone.utc),
+        )
+        base.update(overrides)
+        return EmailMessage(**base)
+
+    def test_content_too_long_reason_renders(self):
+        from zashiki_warasi.agents.email_agent import (
+            _format_analysis_failed,
+        )
+
+        effect = AnalysisFailed(
+            reason="content_too_long",
+            detail="prompt=31059 completion=1709",
+        )
+        text = _format_analysis_failed(self._email(), effect)
+        assert "⚠️" in text
+        assert "LLM 分析失敗" in text
+        assert "token 上限" in text
+        assert "prompt=31059" in text
+        assert "手動" in text
+
+    def test_html_special_chars_in_subject_are_escaped(self):
+        from zashiki_warasi.agents.email_agent import (
+            _format_analysis_failed,
+        )
+
+        effect = AnalysisFailed(reason="content_too_long")
+        email = self._email(
+            subject="<script>x</script>",
+            from_address="<b>a</b>@x.com",
+        )
+        text = _format_analysis_failed(email, effect)
+        assert "<script>x</script>" not in text
+        assert "&lt;script&gt;" in text
+        assert "<b>a</b>@x.com" not in text
+
+    def test_detail_omitted_when_none(self):
+        from zashiki_warasi.agents.email_agent import (
+            _format_analysis_failed,
+        )
+
+        effect = AnalysisFailed(reason="content_too_long", detail=None)
+        text = _format_analysis_failed(self._email(), effect)
+        assert "用量:" not in text
 
 
 # ---------- needs_review side_effect rendering ----------
