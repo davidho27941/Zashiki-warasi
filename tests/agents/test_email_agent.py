@@ -684,6 +684,28 @@ class TestExpenseExtractPromptRules:
         assert "SMBC Olive" in EXPENSE_EXTRACT_SYSTEM_PROMPT
         assert "承認番号" in EXPENSE_EXTRACT_SYSTEM_PROMPT
 
+    def test_positive_amount_extraction_markers_present(self):
+        # A first pass at rule 10 was too defensive ("boilerplate
+        # 通常只有金額 → 這種數字不是這筆消費的金額") — the local
+        # LLM over-applied it and returned amount=None for a valid
+        # 803 JPY SMBC Olive charge. The fix reframes rule 10 as
+        # positive pattern-matching: show the model the four ◇
+        # field mapping and require it to extract each one. These
+        # pins guard the positive markers.
+        from zashiki_warasi.agents.verticals.expense import (
+            EXPENSE_EXTRACT_SYSTEM_PROMPT,
+        )
+
+        assert "◇利用金額" in EXPENSE_EXTRACT_SYSTEM_PROMPT
+        assert "◇利用日" in EXPENSE_EXTRACT_SYSTEM_PROMPT
+        assert "◇利用先" in EXPENSE_EXTRACT_SYSTEM_PROMPT
+        # The '必須' word specifically guards against the over-cautious
+        # "回 null" default the previous phrasing invited.
+        assert "必須" in EXPENSE_EXTRACT_SYSTEM_PROMPT
+        # Concrete 803 example so a rewrite that keeps only the
+        # abstract mapping still trips.
+        assert "803" in EXPENSE_EXTRACT_SYSTEM_PROMPT
+
 
 # ---------- LLM analyze failure handling ----------
 

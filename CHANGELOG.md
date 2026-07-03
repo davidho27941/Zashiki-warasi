@@ -24,6 +24,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct arg name passed to `data_sources.query`, and clear
   `RuntimeError` when the retrieve response has no data_sources.
 
+#### Expense prompt rule 10 reframed as positive extraction
+
+- First pass at the "boilerplate vs. real transaction" rule (added
+  in 4bae084) fixed the classification but broke amount extraction.
+  A live SMBC Olive charge (803 JPY at RENGESYOKUDO MIYAZAKI) came
+  back with correct vendor / transaction_id / transacted_at /
+  payment_method but `amount=None`. Root cause: the previous
+  phrasing
+  ("boilerplate 通常只有金額而缺日期或店家 — 這種數字**不是**
+  這筆消費的金額") read as "if you see amounts, treat them as
+  suspect" to the local LLM, and the safest response was to
+  default `amount` to null.
+- Rule 10 now leads with **positive** guidance: it shows the
+  literal `◇利用日 / ◇利用先 / ◇利用金額 / ◇承認番号` block
+  from a real SMBC Olive mail with each `◇` line annotated with
+  its target ExpenseDraft field, and demands `amount` be filled
+  ("必須全部抽出,尤其 amount 一定要填,不要漏掉 or 回 null").
+  The boilerplate warning is still there for the `※` disclaimer
+  below, but it's no longer the leading framing.
+- 1 new pinned test in `TestExpenseExtractPromptRules` guards
+  the `◇利用金額` / `◇利用日` / `◇利用先` markers and the
+  concrete `803` example — so a future rewrite that keeps only
+  the abstract mapping still trips the check.
+
 #### Boilerplate-vs-transaction anti-hallucination rules
 
 - A single-transaction SMBC Olive デビット notification
