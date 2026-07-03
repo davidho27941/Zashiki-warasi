@@ -632,6 +632,59 @@ class TestRouting:
         assert "Amazon.co.jp" in text
 
 
+# ---------- prompt content regression guards ----------
+
+
+class TestAnalyzePromptRules:
+    """These tests pin specific rules into the analyze prompt so a
+    future rewrite cannot silently drop them. Each rule was added in
+    response to a concrete misclassification observed in production;
+    the comment above each assertion is the incident it guards."""
+
+    def test_boilerplate_disclaimer_rule_present(self):
+        # An SMBC Olive デビット notification (single transaction at
+        # SEVEN-ELEVEN for 280 JPY) had a boilerplate line about
+        # overseas ATM fees (110 JPY). The LLM listed the 110 as a
+        # second transaction in the summary. Rule must remind the
+        # model that boilerplate disclaimers ≠ transactions.
+        from zashiki_warasi.agents.email_agent import ANALYZE_SYSTEM_PROMPT
+
+        assert "反幻想" in ANALYZE_SYSTEM_PROMPT
+        assert "boilerplate" in ANALYZE_SYSTEM_PROMPT
+        assert "手續費說明" in ANALYZE_SYSTEM_PROMPT
+
+    def test_single_txn_with_boilerplate_stays_expense_category(self):
+        # Same SMBC Olive incident: the mail was misclassified as
+        # `消費資訊彙整` (multi-transaction digest) because the
+        # boilerplate line about ATM fees was interpreted as a second
+        # transaction. Rule must clarify that single-transaction +
+        # boilerplate stays `消費支出`.
+        from zashiki_warasi.agents.email_agent import ANALYZE_SYSTEM_PROMPT
+
+        assert "SMBC Olive" in ANALYZE_SYSTEM_PROMPT
+        assert "承認番号" in ANALYZE_SYSTEM_PROMPT
+        # Cross-reference the specific number so a rewrite that keeps
+        # "SMBC Olive" but loses the concrete example still trips.
+        assert "110" in ANALYZE_SYSTEM_PROMPT
+
+
+class TestExpenseExtractPromptRules:
+    def test_boilerplate_vs_transaction_rule_present(self):
+        # If the classification is fixed but a similar mail slips
+        # through, we still don't want the extractor to fill
+        # `amount=110` from the ATM-fee disclaimer. Rule must guide
+        # the LLM to distinguish transaction fields from disclaimer
+        # text.
+        from zashiki_warasi.agents.verticals.expense import (
+            EXPENSE_EXTRACT_SYSTEM_PROMPT,
+        )
+
+        assert "條款" in EXPENSE_EXTRACT_SYSTEM_PROMPT
+        assert "boilerplate" in EXPENSE_EXTRACT_SYSTEM_PROMPT
+        assert "SMBC Olive" in EXPENSE_EXTRACT_SYSTEM_PROMPT
+        assert "承認番号" in EXPENSE_EXTRACT_SYSTEM_PROMPT
+
+
 # ---------- LLM analyze failure handling ----------
 
 

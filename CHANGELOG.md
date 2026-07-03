@@ -24,6 +24,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct arg name passed to `data_sources.query`, and clear
   `RuntimeError` when the retrieve response has no data_sources.
 
+#### Boilerplate-vs-transaction anti-hallucination rules
+
+- A single-transaction SMBC Olive デビット notification
+  (280 JPY at SEVEN-ELEVEN, 承認番号 498134) was misclassified
+  as `消費資訊彙整` and its Telegram summary claimed a second
+  110 JPY "ATM" transaction. The 110 came from a boilerplate
+  disclaimer line at the bottom of the mail
+  (「海外ATMでの現地通貨の引き出しは...ATM利用手数料110円を
+  加えて引き落とし致します」) — a hypothetical fee note, not
+  a transaction. Because the mail then routed to `notify`
+  (not `expense_sg`), no expense record was created either.
+- `ANALYZE_SYSTEM_PROMPT` gains two guards:
+  1. A `⚠️ 反幻想` block in §2 (summary) telling the model
+     that only date+vendor+amount-complete lines count as
+     transactions; boilerplate (fee terms, hypothetical
+     scenarios, promo asides) must be omitted from the summary.
+  2. A new `分類規則` bullet in §3 clarifying that a mail with
+     ONE real transaction plus boilerplate stays `消費支出`,
+     not `消費資訊彙整`. Cites the SMBC Olive example verbatim
+     with the 110 JPY fee text so the model sees the concrete
+     failure pattern.
+- `EXPENSE_EXTRACT_SYSTEM_PROMPT` gains rule 10 (`條款 vs.
+  實際交易`) so even if a similar mail slips past classification,
+  the extractor won't pull `amount=110` from an ATM-fee disclaimer.
+  Same SMBC Olive citation for consistency.
+- 3 regression tests in `TestAnalyzePromptRules` /
+  `TestExpenseExtractPromptRules` — pinned string checks (`反幻想`,
+  `boilerplate`, `SMBC Olive`, `承認番号`, `110`) so a future
+  prompt rewrite that keeps only the intent but drops the concrete
+  example still trips the test and surfaces to review.
+
 #### Catch `LengthFinishReasonError` in the analyze node
 
 - When an email + system prompt exceeds the LLM's context window
