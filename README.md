@@ -359,7 +359,7 @@ alembic/versions/       # 0001–0007 domain migrations (LangGraph tables self-i
 docker/                 # entrypoint.sh (alembic upgrade head → exec CLI)
 Dockerfile              # multi-stage uv build
 docker-compose.yml      # bundled Postgres 16 + app (for new users)
-tests/                  # Pytest scaffolding (354 tests as of this branch)
+tests/                  # Pytest scaffolding (357 tests as of this branch)
 ```
 
 ## How crash recovery works
@@ -412,6 +412,52 @@ normally, `notify` sends a distinct Telegram message
 
 and no placeholder row lands in `email_analyses` — analyze failures
 don't pollute the analytics table.
+
+## How the analyze prompt separates real transactions from boilerplate
+
+Bank / card / cloud-service notification emails routinely include a
+disclaimer line at the bottom about a hypothetical fee — for example
+SMBC Olive デビット's `ご利用のお知らせ` mail carries a single real
+transaction block
+
+```
+◇利用日  : 2026/07/03 09:43:03
+◇利用先  : SEVEN-ELEVEN
+◇利用金額: 280円
+◇承認番号: 498134
+```
+
+followed by
+
+```
+※海外ATMでの現地通貨の引き出しは上記金額にATM利用手数料110円を
+加えて引き落とし致します。
+```
+
+The 110 is a hypothetical fee for an ATM withdrawal that didn't
+happen, not a second transaction. A naïve read of the mail sees
+two amounts, decides "this is a multi-transaction digest", and
+misclassifies it as `消費資訊彙整` — which does **not** route
+into the expense subgraph, so no `ExpenseRecord` gets persisted
+and the phantom 110 leaks into the Telegram summary.
+
+The analyze prompt makes this distinction explicit:
+
+- **Summary rule:** a line only counts as a transaction if it has
+  date + vendor + amount all three present. Fee disclaimers,
+  hypothetical scenarios, and boilerplate promo asides are
+  excluded from the summary regardless of what numbers they
+  contain.
+- **Classification rule:** `消費資訊彙整` requires **multiple**
+  real transactions in the mail. One real transaction plus any
+  amount of boilerplate stays `消費支出` and gets routed to the
+  expense subgraph.
+
+The expense extraction prompt carries the same guard as rule 10 —
+so even if the classification is ever wrong, the extractor won't
+pull `amount=110` from a fee disclaimer either. Both guards are
+pinned by regression tests that assert the concrete SMBC Olive
+example survives future prompt rewrites.
 
 ## How expense deduplication works
 
