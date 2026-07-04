@@ -24,6 +24,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   correct arg name passed to `data_sources.query`, and clear
   `RuntimeError` when the retrieve response has no data_sources.
 
+#### Classification: strict 4-signal definition of a real transaction
+
+- A 楽天カード「【速報版】カード利用のお知らせ(本人ご利用分)」
+  mail (just an aggregate daily total, no per-purchase detail)
+  slipped through as `消費支出`. The previous phrasing
+  ("若只有一筆真實交易 → 消費支出") was too loose — the local LLM
+  read "one amount" as "one transaction" and ignored the
+  Rakuten-specific rule that was already present.
+- The classification rule now defines `消費支出` explicitly:
+  the mail must contain **at least one** transaction with
+  **all four** signals — (a) 具體日期時間 (b) 具體店家名稱
+  (not `本人利用` / `カード利用` generic phrasing) (c) 金額
+  (d) 交易識別碼 (承認番号 / 伝票番号 / 注文番号). Missing
+  **any one** signal → `消費資訊彙整`.
+- Both positive (SMBC Olive `ご利用のお知らせ` has all four) and
+  negative (楽天カード `【速報版】` has amount + optional date
+  only) examples are inlined so the LLM sees the discriminating
+  signal (specific vendor + transaction id vs. aggregate total).
+- 1 new pinned test:
+  `test_rakuten_flash_notification_stays_digest_category`
+  guards `速報版`, `楽天カード`, `四項`, and `本人利用` so a
+  future rewrite that keeps only the abstract 4-signal definition
+  still trips if the concrete Rakuten example is dropped.
+
 #### Expense prompt rule 10 reframed as positive extraction
 
 - First pass at the "boilerplate vs. real transaction" rule (added

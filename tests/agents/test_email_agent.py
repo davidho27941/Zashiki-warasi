@@ -667,6 +667,24 @@ class TestAnalyzePromptRules:
         # "SMBC Olive" but loses the concrete example still trips.
         assert "110" in ANALYZE_SYSTEM_PROMPT
 
+    def test_rakuten_flash_notification_stays_digest_category(self):
+        # After the SMBC rule was strengthened, the local LLM started
+        # over-applying "one amount = one transaction = 消費支出" to
+        # a 楽天カード 【速報版】カード利用のお知らせ mail that has
+        # ONE aggregate amount but NO vendor and NO 承認番号 — the
+        # classic digest pattern. The rule must define "real
+        # transaction" strictly enough (all 4 signals: date + vendor
+        # + amount + transaction_id) that this mail lands in
+        # 消費資訊彙整, not 消費支出.
+        from zashiki_warasi.agents.email_agent import ANALYZE_SYSTEM_PROMPT
+
+        assert "速報版" in ANALYZE_SYSTEM_PROMPT
+        assert "楽天カード" in ANALYZE_SYSTEM_PROMPT
+        # The 4-signal definition — pin the specific phrasing so a
+        # rewrite can't relax the vendor/transaction_id requirement.
+        assert "四項" in ANALYZE_SYSTEM_PROMPT or "全部四項" in ANALYZE_SYSTEM_PROMPT
+        assert "本人利用" in ANALYZE_SYSTEM_PROMPT  # generic-vendor callout
+
 
 class TestExpenseExtractPromptRules:
     def test_boilerplate_vs_transaction_rule_present(self):
