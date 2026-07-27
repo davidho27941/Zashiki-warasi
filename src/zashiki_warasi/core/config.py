@@ -76,6 +76,13 @@ class LLMSettings(BaseSettings):
     api_key: str = "not-needed"
     model: str = "local-model"
     temperature: float = 0.2
+    # Analyze produces a small structured EmailAnalysis (~300-500 tokens
+    # of JSON). Local models sometimes degenerate into a repeat loop
+    # inside a JSON string/array, chewing through 30k+ tokens before
+    # the server-side context cap trips. Capping here bounds the loop
+    # to ~1s so the LengthFinishReasonError catch fires quickly and we
+    # emit AnalysisFailed instead of blocking the poller.
+    analyze_max_tokens: int = Field(default=1024, gt=0)
 
 
 class TelegramSettings(BaseSettings):

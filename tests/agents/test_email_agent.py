@@ -130,7 +130,7 @@ def mock_chat_model(monkeypatch, fixed_analysis) -> MockChat:
 
     monkeypatch.setattr(
         "zashiki_warasi.agents.email_agent.get_chat_model",
-        lambda: model,
+        lambda *a, **kw: model,
     )
     return MockChat(model=model, structured=structured)
 
@@ -385,7 +385,7 @@ class TestNoneAnalysis:
         model.with_structured_output.return_value = structured
         monkeypatch.setattr(
             "zashiki_warasi.agents.email_agent.get_chat_model",
-            lambda: model,
+            lambda *a, **kw: model,
         )
 
         agent = EmailAgent(
@@ -609,7 +609,7 @@ class TestRouting:
         ]
         monkeypatch.setattr(
             "zashiki_warasi.agents.email_agent.get_chat_model",
-            lambda: model,
+            lambda *a, **kw: model,
         )
 
         agent = EmailAgent(
@@ -725,6 +725,103 @@ class TestExpenseExtractPromptRules:
         assert "803" in EXPENSE_EXTRACT_SYSTEM_PROMPT
 
 
+# ---------- analyze-model max_tokens wiring ----------
+
+
+class TestAnalyzeMaxTokensWiring:
+    """`EmailAgent.__init__` must build TWO chat model instances:
+
+    - analyze: capped by `LLM_ANALYZE_MAX_TOKENS` so a degenerate JSON
+      loop tripping `finish_reason=length` fires in ~1s instead of
+      after the whole context window is chewed through.
+    - expense extraction: uncapped — extract JSON can legitimately be
+      long and shouldn't share the analyze cap.
+
+    Regression driver: JAL Pay mail, prompt=1745, completion=31023
+    (whole 32k-1745 context window consumed by a summary loop).
+    """
+
+    def _spy_get_chat_model(self, monkeypatch):
+        calls: list[dict] = []
+
+        def spy(settings=None, *, max_tokens=None):
+            calls.append({"settings": settings, "max_tokens": max_tokens})
+            model = MagicMock(name=f"chat_model_call{len(calls)}")
+            model.with_structured_output.return_value = MagicMock(
+                name="structured_output"
+            )
+            return model
+
+        monkeypatch.setattr(
+            "zashiki_warasi.agents.email_agent.get_chat_model", spy
+        )
+        return calls
+
+    def test_two_chat_model_instances_constructed(
+        self, monkeypatch, session_factory, mock_notifier, mock_client
+    ):
+        calls = self._spy_get_chat_model(monkeypatch)
+        EmailAgent(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            notifier=mock_notifier,
+            client=mock_client,
+        )
+        assert len(calls) == 2, (
+            "expected one capped call (analyze) and one uncapped call "
+            f"(expense extract), got: {calls}"
+        )
+
+    def test_one_call_carries_the_analyze_cap(
+        self, monkeypatch, session_factory, mock_notifier, mock_client
+    ):
+        calls = self._spy_get_chat_model(monkeypatch)
+        EmailAgent(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            notifier=mock_notifier,
+            client=mock_client,
+        )
+        capped = [c for c in calls if c["max_tokens"] is not None]
+        assert len(capped) == 1
+        # Must be a positive number — silently 0 would truncate every
+        # completion and mask real failures as LengthFinishReasonError.
+        assert capped[0]["max_tokens"] > 0
+
+    def test_one_call_is_uncapped_for_extract(
+        self, monkeypatch, session_factory, mock_notifier, mock_client
+    ):
+        calls = self._spy_get_chat_model(monkeypatch)
+        EmailAgent(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            notifier=mock_notifier,
+            client=mock_client,
+        )
+        uncapped = [c for c in calls if c["max_tokens"] is None]
+        assert len(uncapped) == 1, (
+            "expense extraction must NOT inherit the analyze cap — its "
+            "JSON can be legitimately larger (multi-item, PDF-derived) "
+            f"than {calls}"
+        )
+
+    def test_cap_reads_from_llm_settings_env(
+        self, monkeypatch, session_factory, mock_notifier, mock_client
+    ):
+        """`LLM_ANALYZE_MAX_TOKENS` env override propagates all the way
+        through — user can shrink the cap without a code change."""
+        monkeypatch.setenv("LLM_ANALYZE_MAX_TOKENS", "512")
+        calls = self._spy_get_chat_model(monkeypatch)
+        EmailAgent(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            notifier=mock_notifier,
+            client=mock_client,
+        )
+        capped = [c for c in calls if c["max_tokens"] is not None]
+        assert capped[0]["max_tokens"] == 512
+
+
 # ---------- LLM analyze failure handling ----------
 
 
@@ -746,7 +843,7 @@ class TestAnalyzeFailure:
         model.with_structured_output.return_value = structured
         monkeypatch.setattr(
             "zashiki_warasi.agents.email_agent.get_chat_model",
-            lambda: model,
+            lambda *a, **kw: model,
         )
         return EmailAgent(
             checkpointer=InMemorySaver(),

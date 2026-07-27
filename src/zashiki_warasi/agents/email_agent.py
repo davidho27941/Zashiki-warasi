@@ -25,6 +25,7 @@ from sqlalchemy.orm import sessionmaker
 from zashiki_warasi.agents.llm import get_chat_model
 from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
 from zashiki_warasi.agents.verticals.html_text import html_to_text
+from zashiki_warasi.core.config import LLMSettings
 from zashiki_warasi.core.models import EmailAnalysis as EmailAnalysisORM
 from zashiki_warasi.core.schemas import (
     AnalysisFailed,
@@ -161,13 +162,26 @@ class EmailAgent:
         self._session_factory = session_factory
         self._notifier = notifier
 
-        chat_model = get_chat_model()
-        self._analyze_model = chat_model.with_structured_output(EmailAnalysis)
+        # Two model instances against the same server:
+        # - analyze: capped by LLM_ANALYZE_MAX_TOKENS. Bounds
+        #   degenerate JSON loops so LengthFinishReasonError fires in
+        #   ~1s instead of after the whole context window (~30s).
+        # - expense extraction: uncapped. The extract JSON can be
+        #   larger (multiple items, attachments), and its failure mode
+        #   is not the same degenerate-loop risk.
+        llm_settings = LLMSettings()
+        analyze_chat_model = get_chat_model(
+            llm_settings, max_tokens=llm_settings.analyze_max_tokens
+        )
+        extract_chat_model = get_chat_model(llm_settings)
+        self._analyze_model = analyze_chat_model.with_structured_output(
+            EmailAnalysis
+        )
         self._expense_subgraph = ExpenseSubgraph(
             checkpointer=checkpointer,
             session_factory=session_factory,
             client=client,
-            model=chat_model,
+            model=extract_chat_model,
             notion=notion,
         )
         self._graph = self._build_graph(checkpointer)

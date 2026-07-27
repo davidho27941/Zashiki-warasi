@@ -48,6 +48,29 @@ class TestOpenAICompatibleProviders:
         assert model.openai_api_key.get_secret_value() == "my-secret"
 
 
+# --- max_tokens propagation ---
+
+
+class TestMaxTokensPassthrough:
+    """`max_tokens` kwarg on the factory must land on the underlying
+    ChatOpenAI so the analyze node can bound degenerate JSON loops
+    without applying the cap to the (uncapped) expense extraction."""
+
+    def test_default_omitted_leaves_max_tokens_unset(self):
+        """No cap by default — keeps existing behavior for callers that
+        don't opt in (expense extraction, tests that don't care)."""
+        model = get_chat_model(_settings())
+        assert model.max_tokens is None
+
+    def test_explicit_max_tokens_passed_through(self):
+        model = get_chat_model(_settings(), max_tokens=1024)
+        assert model.max_tokens == 1024
+
+    def test_explicit_none_matches_default(self):
+        model = get_chat_model(_settings(), max_tokens=None)
+        assert model.max_tokens is None
+
+
 # --- anthropic path ---
 
 
