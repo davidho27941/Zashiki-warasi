@@ -112,7 +112,7 @@ class TestLLMSettings:
         assert s.base_url == "http://localhost:8080/v1"
         assert s.model == "local-model"
         assert s.temperature == pytest.approx(0.2)
-        assert s.analyze_max_tokens == 1024
+        assert s.analyze_max_tokens == 10922
 
     def test_provider_literal_rejects_unknown(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
