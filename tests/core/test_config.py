@@ -104,6 +104,7 @@ class TestLLMSettings:
             "LLM_API_KEY",
             "LLM_MODEL",
             "LLM_TEMPERATURE",
+            "LLM_ANALYZE_MAX_TOKENS",
         ):
             monkeypatch.delenv(var, raising=False)
         s = LLMSettings()
@@ -111,6 +112,7 @@ class TestLLMSettings:
         assert s.base_url == "http://localhost:8080/v1"
         assert s.model == "local-model"
         assert s.temperature == pytest.approx(0.2)
+        assert s.analyze_max_tokens == 10922
 
     def test_provider_literal_rejects_unknown(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -133,3 +135,18 @@ class TestLLMSettings:
         monkeypatch.setenv("LLM_TEMPERATURE", "0.9")
         s = LLMSettings()
         assert s.temperature == pytest.approx(0.9)
+
+    def test_analyze_max_tokens_env_override(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LLM_ANALYZE_MAX_TOKENS", "512")
+        s = LLMSettings()
+        assert s.analyze_max_tokens == 512
+
+    def test_analyze_max_tokens_rejects_non_positive(self, monkeypatch, tmp_path):
+        """gt=0 constraint — 0 or negative caps make no sense (a
+        cap of 0 would truncate everything, silently masking real
+        failures as LengthFinishReasonError)."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LLM_ANALYZE_MAX_TOKENS", "0")
+        with pytest.raises(Exception):
+            LLMSettings()

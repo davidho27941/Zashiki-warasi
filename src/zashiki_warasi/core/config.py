@@ -76,6 +76,18 @@ class LLMSettings(BaseSettings):
     api_key: str = "not-needed"
     model: str = "local-model"
     temperature: float = 0.2
+    # Analyze produces a structured EmailAnalysis. Local models can
+    # degenerate into a repeat loop inside a JSON string/array,
+    # chewing through the whole context window (JAL Pay case:
+    # completion=31023 on a 32k llama-server) before
+    # finish_reason=length trips. Cap keeps that loop bounded so
+    # LengthFinishReasonError fires fast enough that AnalysisFailed
+    # takes over instead of blocking the poller.
+    # Default 10922 ≈ 32768 / 3 — loose enough that a legitimate
+    # long summary of a heavy newsletter (prompt ~5k, output several
+    # hundred tokens) has plenty of headroom, tight enough that a
+    # degenerate loop still aborts in ~10s instead of ~30s.
+    analyze_max_tokens: int = Field(default=10922, gt=0)
 
 
 class TelegramSettings(BaseSettings):
