@@ -11,20 +11,29 @@ from __future__ import annotations
 
 import logging
 import signal
+import sys
 import threading
 
 import click
 from langgraph.checkpoint.postgres import PostgresSaver
 
 from zashiki_warasi.agents.email_agent import EmailAgent
-from zashiki_warasi.core.config import DatabaseSettings, NotionSettings
+from zashiki_warasi.core.config import (
+    DatabaseSettings,
+    GmailSettings,
+    NotionSettings,
+)
 from zashiki_warasi.core.db import get_session_factory, reset_database
 from zashiki_warasi.gmail.auth import get_credentials
 from zashiki_warasi.gmail.client import GmailClient
+from zashiki_warasi.gmail.exceptions import CredentialRefreshError
 from zashiki_warasi.gmail.poller import Poller
 from zashiki_warasi.notifications.notion import NotionExpenseRecorder
 from zashiki_warasi.notifications.notion_puller import NotionExpensePuller
-from zashiki_warasi.notifications.telegram import TelegramNotifier
+from zashiki_warasi.notifications.telegram import (
+    TelegramError,
+    TelegramNotifier,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +193,33 @@ def main(ctx: click.Context, reset: bool, yes: bool) -> None:
     run()
 
 
+@main.command("reauth")
+def reauth_cmd() -> None:
+    """Delete the cached OAuth token and re-run the InstalledAppFlow.
+
+    Use when the Gmail refresh token has been revoked or expired
+    (invalid_grant). Opens a browser to complete authorisation, then
+    writes a fresh `token.json`. Exits non-zero if the flow fails
+    (e.g. `credentials.json` missing).
+    """
+    settings = GmailSettings()
+    token_path = settings.token_path
+    if token_path.exists():
+        token_path.unlink()
+        click.echo(f"Removed stale token: {token_path}")
+    else:
+        click.echo(f"No cached token at {token_path}; running flow anyway.")
+    creds = get_credentials(settings)
+    click.echo(f"Re-authorised; new token written to {token_path}.")
+    if not creds.refresh_token:
+        click.echo(
+            "WARNING: new credentials have no refresh_token — the next "
+            "expiry will require re-auth again. Ensure the OAuth client "
+            "is a Desktop app and access_type=offline.",
+            err=True,
+        )
+
+
 @main.command("sync-notion")
 def sync_notion_cmd() -> None:
     """Run a single Notion→DB sync pass and exit.
@@ -202,16 +238,26 @@ def sync_notion_cmd() -> None:
     click.echo(f"Notion sync complete: {stats}")
 
 
+EXIT_CREDENTIAL_FAILURE = 78  # sysexits.h EX_CONFIG — user must intervene
+
+
 def run() -> None:
     _init_logging()
 
     stop_event = threading.Event()
     _install_shutdown_handlers(stop_event)
 
-    credentials = get_credentials()
-    client = GmailClient(credentials)
     session_factory = get_session_factory()
     notifier = TelegramNotifier()
+
+    try:
+        credentials = get_credentials()
+    except CredentialRefreshError as exc:
+        _notify_credential_failure(notifier, str(exc))
+        logger.critical(f"Aborting startup: {exc}")
+        sys.exit(EXIT_CREDENTIAL_FAILURE)
+
+    client = GmailClient(credentials)
     notion = _build_notion()
 
     _start_notion_sync_thread(NotionSettings(), session_factory, stop_event)
@@ -231,5 +277,28 @@ def run() -> None:
             session_factory=session_factory,
             handler=agent.handle_email,
             stop_event=stop_event,
+            notifier=notifier,
         )
-        poller.run()
+        try:
+            poller.run()
+        except CredentialRefreshError:
+            # Poller already notified and set stop_event; propagate as
+            # non-zero exit so operators know to run `reauth`.
+            sys.exit(EXIT_CREDENTIAL_FAILURE)
+
+
+def _notify_credential_failure(
+    notifier: TelegramNotifier, message: str
+) -> None:
+    """Best-effort Telegram alert at startup credential failure."""
+    try:
+        notifier.send_message(
+            "🚨 Zashiki-warasi: Gmail 授權失效 (啟動時)\n\n"
+            f"{message}\n\n"
+            "請在主機上執行 <code>zashiki-warasi reauth</code> "
+            "重新授權後再啟動。"
+        )
+    except TelegramError:
+        logger.exception(
+            "Failed to send Telegram alert about startup auth failure"
+        )

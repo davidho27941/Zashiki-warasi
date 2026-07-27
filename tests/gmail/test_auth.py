@@ -8,8 +8,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from google.auth.exceptions import RefreshError
+
 from zashiki_warasi.core.config import GmailSettings
 from zashiki_warasi.gmail import auth
+from zashiki_warasi.gmail.exceptions import CredentialRefreshError
 
 
 def _settings(tmp_path: Path, *, with_credentials: bool = True) -> GmailSettings:
@@ -94,6 +97,94 @@ class TestRefreshPath:
         assert result is cached
         # Persisted to disk after refresh
         assert settings.token_path.exists()
+
+
+# --- refresh path: RefreshError -> CredentialRefreshError ---
+
+
+class TestRefreshErrorWrapping:
+    """The Google RefreshError must not leak — callers upstream match
+    on our own CredentialRefreshError so they can trigger reauth flow
+    and shut down cleanly."""
+
+    def _cached_expired(self, tmp_path, monkeypatch, refresh_side_effect):
+        settings = _settings(tmp_path)
+        settings.token_path.parent.mkdir(parents=True, exist_ok=True)
+        settings.token_path.write_text("{}")
+        cached = _fake_creds(valid=False, expired=True, refresh_token="rt")
+        cached.refresh.side_effect = refresh_side_effect
+        monkeypatch.setattr(
+            "zashiki_warasi.gmail.auth.Credentials.from_authorized_user_file",
+            MagicMock(return_value=cached),
+        )
+        # Guard: the installed flow must NOT be invoked as a fallback
+        # for refresh failures — refresh errors need explicit reauth,
+        # not a silent flow retry.
+        flow_mock = MagicMock()
+        monkeypatch.setattr(
+            "zashiki_warasi.gmail.auth.InstalledAppFlow.from_client_secrets_file",
+            flow_mock,
+        )
+        return settings, cached, flow_mock
+
+    def test_refresh_error_reraised_as_credential_refresh_error(
+        self, tmp_path, monkeypatch
+    ):
+        original = RefreshError("invalid_grant: Token has been expired or revoked.")
+        settings, _, _ = self._cached_expired(
+            tmp_path, monkeypatch, refresh_side_effect=original
+        )
+
+        with pytest.raises(CredentialRefreshError) as exc_info:
+            auth.get_credentials(settings)
+
+        assert exc_info.value.__cause__ is original
+
+    def test_error_message_names_token_path_and_reauth_command(
+        self, tmp_path, monkeypatch
+    ):
+        original = RefreshError("invalid_grant")
+        settings, _, _ = self._cached_expired(
+            tmp_path, monkeypatch, refresh_side_effect=original
+        )
+
+        with pytest.raises(CredentialRefreshError) as exc_info:
+            auth.get_credentials(settings)
+
+        msg = str(exc_info.value)
+        assert str(settings.token_path) in msg
+        assert "reauth" in msg
+        assert "consent screen" in msg  # points to Testing-mode trap
+
+    def test_installed_flow_not_used_as_fallback_for_refresh_failure(
+        self, tmp_path, monkeypatch
+    ):
+        settings, _, flow_mock = self._cached_expired(
+            tmp_path,
+            monkeypatch,
+            refresh_side_effect=RefreshError("invalid_grant"),
+        )
+
+        with pytest.raises(CredentialRefreshError):
+            auth.get_credentials(settings)
+
+        flow_mock.assert_not_called()
+
+    def test_token_not_persisted_when_refresh_fails(
+        self, tmp_path, monkeypatch
+    ):
+        settings, cached, _ = self._cached_expired(
+            tmp_path,
+            monkeypatch,
+            refresh_side_effect=RefreshError("invalid_grant"),
+        )
+        # to_json returns junk to prove _persist did NOT run.
+        cached.to_json.return_value = "SHOULD_NOT_WRITE"
+
+        with pytest.raises(CredentialRefreshError):
+            auth.get_credentials(settings)
+
+        assert settings.token_path.read_text() == "{}"  # untouched
 
 
 # --- no cache or expired-without-refresh-token: installed flow ---

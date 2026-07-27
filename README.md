@@ -147,8 +147,25 @@ managed by Alembic.
    `client_secret_*.json` file.
 2. Save it as `credentials.json` in the project root (or set
    `GMAIL_CREDENTIALS_PATH`).
-3. The first run will open a browser for one-time consent; the refresh
+3. **Publish the OAuth consent screen** (APIs & Services → OAuth consent
+   screen → `PUBLISH APP`). A consent screen left in **Testing** status
+   expires every refresh token after **7 days**, so the poller will
+   crash weekly with `invalid_grant: Token has been expired or revoked`.
+   Individual Gmail accounts can publish without Google verification —
+   external users just see an "unverified app" warning.
+4. The first run will open a browser for one-time consent; the refresh
    token is then cached at `~/.config/zashiki-warasi/token.json`.
+
+If the refresh token is later revoked (Google security action, manual
+revoke, or the 50-refresh-tokens-per-user cap being hit during dev),
+the poller sends a Telegram alert and exits with code 78. To recover:
+
+```bash
+uv run zashiki-warasi reauth
+```
+
+This deletes the stale `token.json` and re-runs the browser consent
+flow. Then restart the poller.
 
 ### 4. LLM
 
@@ -383,6 +400,16 @@ tests/                  # Pytest scaffolding (357 tests as of this branch)
   `pool_pre_ping=True` + `pool_recycle=1800` so a connection killed by
   a router NAT eviction is detected on checkout and replaced instead of
   crashing the next query.
+- **Gmail OAuth refresh token expired or revoked.** A `RefreshError`
+  from Google's auth library is unrecoverable in-process — retrying the
+  same refresh will always fail and would just hammer the token
+  endpoint until Google rate-limits us. The poller (or startup path)
+  catches it, sends a Telegram alert naming the failure, and exits with
+  code `78` (`EX_CONFIG`). Recover with `zashiki-warasi reauth`, then
+  restart. Container orchestrators using `restart: on-failure` will
+  keep restarting the process, but each restart will land on the same
+  bad token and exit immediately — the alert is the actionable signal,
+  not the log spam.
 
 ## How LLM analyze failures are handled
 

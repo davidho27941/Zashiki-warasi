@@ -6,11 +6,13 @@ import os
 from pathlib import Path
 from typing import Sequence
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 from zashiki_warasi.core.config import GmailSettings
+from zashiki_warasi.gmail.exceptions import CredentialRefreshError
 
 
 def get_credentials(settings: GmailSettings | None = None) -> Credentials:
@@ -21,12 +23,29 @@ def get_credentials(settings: GmailSettings | None = None) -> Credentials:
         return creds
 
     if creds and creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+        try:
+            creds.refresh(Request())
+        except RefreshError as exc:
+            raise CredentialRefreshError(
+                _refresh_error_message(settings.token_path, exc)
+            ) from exc
     else:
         creds = _run_installed_flow(settings.credentials_path, settings.scopes)
 
     _persist(creds, settings.token_path)
     return creds
+
+
+def _refresh_error_message(token_path: Path, exc: RefreshError) -> str:
+    """Human-actionable message for a dead refresh token."""
+    return (
+        f"Gmail refresh token at {token_path} is expired or revoked "
+        f"({exc}). Recover by running `zashiki-warasi reauth` "
+        "(which deletes the stale token and re-runs the OAuth flow), "
+        "or delete the file manually and re-launch. If this happens "
+        "repeatedly, check that the OAuth consent screen is set to "
+        "'In production' — Testing-mode tokens expire after 7 days."
+    )
 
 
 def _load_cached(token_path: Path, scopes: Sequence[str]) -> Credentials | None:
