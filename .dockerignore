@@ -1,0 +1,42 @@
+# --- VCS / dev tooling ---
+.git
+.gitignore
+.github
+.vscode
+.idea
+
+# --- Python bytecode / caches ---
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+htmlcov
+*.egg-info
+build
+dist
+.python-version
+
+# --- Local virtualenvs (the image builds its own with uv) ---
+.venv
+venv
+
+# --- Secrets / OAuth state (mounted at runtime, never baked in) ---
+.env
+.env.*
+!.env.example
+credential.json
+credentials.json
+credentials/
+token.json
+
+# --- Local scratch / docs / tests ---
+scripts/
+docs/lessons/
+tests/
+
+# --- Build artefacts from previous local runs ---
+*.log

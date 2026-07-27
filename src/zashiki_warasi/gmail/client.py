@@ -11,10 +11,13 @@ from datetime import datetime, timezone
 from email.utils import getaddresses
 from typing import Iterable, Iterator
 
+import httplib2
 from google.oauth2.credentials import Credentials
+from google_auth_httplib2 import AuthorizedHttp
 from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
 
+from zashiki_warasi.core.config import GmailSettings
 from zashiki_warasi.core.schemas import (
     AttachmentMeta,
     EmailMessage,
@@ -35,9 +38,25 @@ class GmailClient:
     database — persistence lives in the poller.
     """
 
-    def __init__(self, credentials: Credentials) -> None:
+    def __init__(
+        self,
+        credentials: Credentials,
+        http_timeout_seconds: float | None = None,
+    ) -> None:
+        # Build the HTTP transport ourselves so we can pin an explicit
+        # socket timeout. httplib2's default is `None`, meaning a dead
+        # TCP connection blocks the entire poller loop for the ~13min
+        # OS-level RTO before surfacing as ConnectionResetError.
+        timeout = (
+            http_timeout_seconds
+            if http_timeout_seconds is not None
+            else GmailSettings().http_timeout_seconds
+        )
+        http = AuthorizedHttp(
+            credentials, http=httplib2.Http(timeout=timeout)
+        )
         self._service: Resource = build(
-            "gmail", "v1", credentials=credentials, cache_discovery=False
+            "gmail", "v1", http=http, cache_discovery=False
         )
         self._user_id = "me"
 

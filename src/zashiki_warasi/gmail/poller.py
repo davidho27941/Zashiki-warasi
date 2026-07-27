@@ -9,16 +9,22 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable
+from typing import Callable, NoReturn
 
+from google.auth.exceptions import RefreshError
 from sqlalchemy.orm import sessionmaker
 
 from zashiki_warasi.core.models import GmailSyncState, ProcessedMessage
 from zashiki_warasi.core.schemas import EmailMessage
 from zashiki_warasi.gmail.client import GmailClient
 from zashiki_warasi.gmail.exceptions import (
+    CredentialRefreshError,
     HistoryExpiredError,
     MessageNotFoundError,
+)
+from zashiki_warasi.notifications.telegram import (
+    TelegramError,
+    TelegramNotifier,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,11 +54,13 @@ class Poller:
         handler: EmailHandler,
         interval_seconds: int = 30,
         stop_event: threading.Event | None = None,
+        notifier: TelegramNotifier | None = None,
     ) -> None:
         self._client = client
         self._session_factory = session_factory
         self._handler = handler
         self._interval = interval_seconds
+        self._notifier = notifier
         # Exposed publicly so the app entry point can `stop_event.set()`
         # from a signal handler without holding a reference to a private
         # attribute.
@@ -69,8 +77,16 @@ class Poller:
 
         The message currently being processed always runs to completion
         so its `processed_messages` row is written before exit.
+
+        A dead OAuth refresh token (google.auth RefreshError) is
+        unrecoverable in-process: we notify (best-effort), stop the
+        loop, and re-raise as `CredentialRefreshError` so the app entry
+        point exits non-zero.
         """
-        profile = self._client.get_profile()
+        try:
+            profile = self._client.get_profile()
+        except RefreshError as exc:
+            self._handle_credential_failure(exc)
         email = profile.email
         logger.info(f"Poller starting for {email}")
         self._baseline_if_needed(email, profile.history_id)
@@ -84,12 +100,39 @@ class Poller:
                     "re-baselining"
                 )
                 self._rebaseline(email)
+            except RefreshError as exc:
+                self._handle_credential_failure(exc)
             except Exception:
                 logger.exception("Unhandled error during tick; will retry")
             if self.stop_event.wait(timeout=self._interval):
                 break
 
         logger.info(f"Poller stopped for {email}")
+
+    def _handle_credential_failure(
+        self, exc: RefreshError
+    ) -> NoReturn:
+        """Notify + stop the loop, then re-raise CredentialRefreshError."""
+        message = (
+            f"Gmail OAuth refresh failed ({exc}). The refresh token is "
+            "expired or revoked; the poller will exit. Run "
+            "`zashiki-warasi reauth` to re-authorise."
+        )
+        logger.critical(message)
+        if self._notifier is not None:
+            try:
+                self._notifier.send_message(
+                    "🚨 Zashiki-warasi: Gmail 授權失效\n\n"
+                    f"{exc}\n\n"
+                    "已停止 poller。請在主機上執行 "
+                    "<code>zashiki-warasi reauth</code> 重新授權。",
+                )
+            except TelegramError:
+                logger.exception(
+                    "Failed to send Telegram alert about auth failure"
+                )
+        self.stop_event.set()
+        raise CredentialRefreshError(message) from exc
 
     # ----- Branch A: first-run baseline -----
 

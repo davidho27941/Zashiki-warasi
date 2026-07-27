@@ -16,7 +16,24 @@ logger = logging.getLogger(__name__)
 @lru_cache(maxsize=1)
 def get_engine() -> Engine:
     settings = DatabaseSettings()
-    return create_engine(settings.database_url, future=True)
+    return create_engine(
+        settings.database_url,
+        future=True,
+        # `pool_pre_ping` issues a lightweight SELECT 1 on every
+        # checkout so a connection killed by a network hop (e.g. a
+        # home-router NAT idle-timeout evicting an entry, or the
+        # Postgres server itself dropping an idle backend) is
+        # detected and replaced before the caller gets it. Without
+        # this, the poller's overnight-idle connections would surface
+        # as `SSL SYSCALL Operation timed out` /
+        # `server closed the connection unexpectedly` on the next
+        # query. Overhead: one round-trip per checkout.
+        pool_pre_ping=True,
+        # Belt-and-braces: recycle any connection older than 30 min
+        # regardless of health. Most home NAT timeouts sit at
+        # 30–60 min, so this stays well under the danger zone.
+        pool_recycle=1800,
+    )
 
 
 @lru_cache(maxsize=1)
@@ -34,6 +51,7 @@ def get_session_factory() -> sessionmaker[Session]:
 # the reset.
 _RESET_TARGET_TABLES = (
     "gmail_sync_state",
+    "notion_sync_state",
     "processed_messages",
     "email_analyses",
     "expenses",

@@ -19,6 +19,7 @@ from typing import TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
+from openai import LengthFinishReasonError
 from sqlalchemy.orm import sessionmaker
 
 from zashiki_warasi.agents.llm import get_chat_model
@@ -26,6 +27,7 @@ from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
 from zashiki_warasi.agents.verticals.html_text import html_to_text
 from zashiki_warasi.core.models import EmailAnalysis as EmailAnalysisORM
 from zashiki_warasi.core.schemas import (
+    AnalysisFailed,
     EmailAnalysis,
     EmailMessage,
     ExpenseLogged,
@@ -68,6 +70,17 @@ ANALYZE_SYSTEM_PROMPT = """\
 - 交易識別碼、ID 或編號(伝票番号 / 注文番号)
 若信件中未提及某項,可以以「不明」替代。
 
+⚠️ 反幻想(重要):摘要中列出的消費/交易必須是郵件中明確、
+實際發生的交易 — 具體日期時間 + 店家 + 金額三者齊全才算。
+以下 **不算** 實際交易,絕對不要當成一筆消費列進摘要:
+- 手續費說明(例如「海外ATMの利用手数料 110円を加える」、
+  「送金手数料無料」等條件描述)
+- 假設情境或條款(例如「為替影響で変更があった場合...」)
+- 廣告、注意事項、活動預告、客服說明
+
+若信件下方有 boilerplate 條款,只摘要真實交易,忽略條款文字。
+真實交易缺少的欄位用「不明」填,不要用條款裡的數字補位。
+
 例(好):「楽天ポイントカード 通知使用者 2026/06/18-06/24
 期間獲得的點數明細:於『彩家 楽天クリムゾン』獲得 19 點、
 於『東急ストア宮崎台店』獲得 3 點,合計 22 點。」
@@ -91,9 +104,27 @@ ANALYZE_SYSTEM_PROMPT = """\
   **不視為「消費支出」**,歸類為「點數資訊彙整」。
 - 信用卡多筆消費彙整(一封信包含多則消費資訊、或多筆刷卡紀錄
   的彙總)**不要分類為「消費支出」**,歸類為「消費資訊彙整」。
-- 樂天信用卡(楽天カード)定期寄送的「不含具體消費細節」的單日
-  消費金額統計 — 標題如「【速報版】カード利用のお知らせ(本人
-  ご利用分)」— 也歸類為「消費資訊彙整」,不要分類為「消費支出」。
+- 「消費支出」的嚴格定義 — 郵件必須明確包含**至少一筆**同時
+  具備以下 **全部四項** 的真實交易:
+    (a) 具體的日期時間
+    (b) 具體的店家/商戶名稱(**不是**「本人利用」、「カード利用」
+        這種通用敘述)
+    (c) 金額
+    (d) 交易識別碼(承認番号 / 伝票番号 / 注文番号 等)
+  四項**缺任何一項**即不算單筆真實消費 → 分類為「消費資訊彙整」。
+  * 正例(消費支出):SMBC Olive デビット的「ご利用のお知らせ」
+    含 ◇利用日 + ◇利用先 + ◇利用金額 + ◇承認番号 全部四項。
+    即便信件下方寫著「海外ATMでの現地通貨の引き出しは...ATM
+    利用手数料110円を加えて引き落とし致します」這種條款,仍為
+    「消費支出」— 不要把 110 円當成第二筆消費(boilerplate 條款
+    不算獨立交易)。
+  * 反例(消費資訊彙整):楽天カードの「【速報版】カード利用の
+    お知らせ(本人ご利用分)」只有當日消費總額(可能有日期),
+    **沒有具體店家名稱、沒有承認番号/注文番号** — 即便金額看起
+    來只有一筆,也是彙整摘要,**絕對不要**分類為「消費支出」;
+    正確分類是「消費資訊彙整」。
+  * 反例(消費資訊彙整):信用卡多筆消費彙整 — 一封信包含多則
+    刷卡紀錄的彙總 — 也是「消費資訊彙整」,不是「消費支出」。
 
 ### 4. 急迫性 (urgency)
 
@@ -178,32 +209,67 @@ class EmailAgent:
             f"\n"
             f"{body}"
         )
-        analysis = self._analyze_model.invoke(
-            [
-                SystemMessage(content=ANALYZE_SYSTEM_PROMPT),
-                HumanMessage(content=user_text),
-            ]
-        )
+        try:
+            analysis = self._analyze_model.invoke(
+                [
+                    SystemMessage(content=ANALYZE_SYSTEM_PROMPT),
+                    HumanMessage(content=user_text),
+                ]
+            )
+        except LengthFinishReasonError as exc:
+            # LLM ran out of completion tokens mid-structured-output.
+            # Poller would otherwise re-tick and fail identically until
+            # the message dropped off history; instead we emit an
+            # `AnalysisFailed` side-effect so notify still pings the
+            # user and the graph completes normally.
+            usage = exc.completion.usage
+            detail = (
+                f"prompt={usage.prompt_tokens} "
+                f"completion={usage.completion_tokens}"
+            )
+            logger.warning(
+                f"analyze: LLM hit token limit for {email.id} ({detail})"
+            )
+            return {
+                "analysis": None,
+                "side_effect": AnalysisFailed(
+                    reason="content_too_long", detail=detail
+                ),
+            }
         return {"analysis": analysis}
+
+    # Categories that go through the expense subgraph — where PDF /
+    # HTML attachments are pulled and the LLM extracts structured
+    # payment fields (amount, vendor, transacted_at, …). Kept as a
+    # tuple so a future addition (e.g. 訂閱服務 for recurring charges)
+    # is a one-line change.
+    _EXPENSE_LIKE_CATEGORIES = ("消費支出", "帳單通知")
 
     def _route_by_category(self, state: AgentState) -> str:
         analysis = state.get("analysis")
         if analysis is None:
             return "notify"
-        if analysis.category == "消費支出":
+        if analysis.category in self._EXPENSE_LIKE_CATEGORIES:
             return "expense"
         return "notify"
 
     def _notify(self, state: AgentState) -> dict:
         analysis = state["analysis"]
+        side_effect = state.get("side_effect")
         if analysis is None:
+            # Analyze itself failed — no structured summary to render.
+            # If it left us an AnalysisFailed marker we still ping the
+            # user (they need to open the mail manually); otherwise we
+            # log and skip since something else went off-script.
+            if isinstance(side_effect, AnalysisFailed):
+                text = _format_analysis_failed(state["email"], side_effect)
+                self._notifier.send_message(text)
+                return {}
             logger.warning(
                 f"notify: skipping {state['email'].id} — no analysis"
             )
             return {}
-        text = _format_message(
-            state["email"], analysis, state.get("side_effect")
-        )
+        text = _format_message(state["email"], analysis, side_effect)
         self._notifier.send_message(text)
         return {}
 
@@ -387,6 +453,29 @@ def _format_expense_logged(effect: ExpenseLogged) -> str:
         err = html.escape(effect.notion_sync_error[:80])
         lines.append(f"  ⚠️ Notion 同步失敗: {err}")
 
+    return "\n".join(lines)
+
+
+def _format_analysis_failed(
+    email: EmailMessage, effect: AnalysisFailed
+) -> str:
+    """Render an `AnalysisFailed` — no analysis body exists yet, so
+    this is the ENTIRE Telegram message (unlike ExpenseLogged /
+    NeedsReview which piggyback onto the normal analysis block)."""
+    lines = [
+        "⚠️ <b>LLM 分析失敗</b>",
+        "",
+        f"<b>標題:</b> {html.escape(email.subject)}",
+        f"<b>寄件者:</b> {html.escape(email.from_address)}",
+        "",
+    ]
+    if effect.reason == "content_too_long":
+        lines.append(
+            "原因: 郵件內容超過 LLM token 上限,無法完成結構化分析。"
+        )
+    if effect.detail:
+        lines.append(f"用量: <code>{html.escape(effect.detail)}</code>")
+    lines.append("→ 請打開原信手動處理。")
     return "\n".join(lines)
 
 

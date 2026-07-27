@@ -7,7 +7,239 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### Notion API migration — `databases.query` → `data_sources.query`
+
+- `notion-client 3.x` removed `client.databases.query` when Notion's
+  2025 API split databases into 1+ data sources. The freshly-shipped
+  `NotionExpensePuller` broke on first run with
+  `AttributeError: 'DatabasesEndpoint' object has no attribute 'query'`.
+- Puller now resolves the data_source_id lazily via
+  `databases.retrieve` and caches it for the process lifetime, then
+  calls `data_sources.query(data_source_id=…)`. The write side
+  (`NotionExpenseRecorder.record_expense`) is unaffected — `pages.create`
+  with `parent={"database_id": …}` still works.
+- 3 new tests: cache behaviour (retrieve called once across N syncs),
+  correct arg name passed to `data_sources.query`, and clear
+  `RuntimeError` when the retrieve response has no data_sources.
+
+#### Classification: strict 4-signal definition of a real transaction
+
+- A 楽天カード「【速報版】カード利用のお知らせ(本人ご利用分)」
+  mail (just an aggregate daily total, no per-purchase detail)
+  slipped through as `消費支出`. The previous phrasing
+  ("若只有一筆真實交易 → 消費支出") was too loose — the local LLM
+  read "one amount" as "one transaction" and ignored the
+  Rakuten-specific rule that was already present.
+- The classification rule now defines `消費支出` explicitly:
+  the mail must contain **at least one** transaction with
+  **all four** signals — (a) 具體日期時間 (b) 具體店家名稱
+  (not `本人利用` / `カード利用` generic phrasing) (c) 金額
+  (d) 交易識別碼 (承認番号 / 伝票番号 / 注文番号). Missing
+  **any one** signal → `消費資訊彙整`.
+- Both positive (SMBC Olive `ご利用のお知らせ` has all four) and
+  negative (楽天カード `【速報版】` has amount + optional date
+  only) examples are inlined so the LLM sees the discriminating
+  signal (specific vendor + transaction id vs. aggregate total).
+- 1 new pinned test:
+  `test_rakuten_flash_notification_stays_digest_category`
+  guards `速報版`, `楽天カード`, `四項`, and `本人利用` so a
+  future rewrite that keeps only the abstract 4-signal definition
+  still trips if the concrete Rakuten example is dropped.
+
+#### Expense prompt rule 10 reframed as positive extraction
+
+- First pass at the "boilerplate vs. real transaction" rule (added
+  in 4bae084) fixed the classification but broke amount extraction.
+  A live SMBC Olive charge (803 JPY at RENGESYOKUDO MIYAZAKI) came
+  back with correct vendor / transaction_id / transacted_at /
+  payment_method but `amount=None`. Root cause: the previous
+  phrasing
+  ("boilerplate 通常只有金額而缺日期或店家 — 這種數字**不是**
+  這筆消費的金額") read as "if you see amounts, treat them as
+  suspect" to the local LLM, and the safest response was to
+  default `amount` to null.
+- Rule 10 now leads with **positive** guidance: it shows the
+  literal `◇利用日 / ◇利用先 / ◇利用金額 / ◇承認番号` block
+  from a real SMBC Olive mail with each `◇` line annotated with
+  its target ExpenseDraft field, and demands `amount` be filled
+  ("必須全部抽出,尤其 amount 一定要填,不要漏掉 or 回 null").
+  The boilerplate warning is still there for the `※` disclaimer
+  below, but it's no longer the leading framing.
+- 1 new pinned test in `TestExpenseExtractPromptRules` guards
+  the `◇利用金額` / `◇利用日` / `◇利用先` markers and the
+  concrete `803` example — so a future rewrite that keeps only
+  the abstract mapping still trips the check.
+
+#### Boilerplate-vs-transaction anti-hallucination rules
+
+- A single-transaction SMBC Olive デビット notification
+  (280 JPY at SEVEN-ELEVEN, 承認番号 498134) was misclassified
+  as `消費資訊彙整` and its Telegram summary claimed a second
+  110 JPY "ATM" transaction. The 110 came from a boilerplate
+  disclaimer line at the bottom of the mail
+  (「海外ATMでの現地通貨の引き出しは...ATM利用手数料110円を
+  加えて引き落とし致します」) — a hypothetical fee note, not
+  a transaction. Because the mail then routed to `notify`
+  (not `expense_sg`), no expense record was created either.
+- `ANALYZE_SYSTEM_PROMPT` gains two guards:
+  1. A `⚠️ 反幻想` block in §2 (summary) telling the model
+     that only date+vendor+amount-complete lines count as
+     transactions; boilerplate (fee terms, hypothetical
+     scenarios, promo asides) must be omitted from the summary.
+  2. A new `分類規則` bullet in §3 clarifying that a mail with
+     ONE real transaction plus boilerplate stays `消費支出`,
+     not `消費資訊彙整`. Cites the SMBC Olive example verbatim
+     with the 110 JPY fee text so the model sees the concrete
+     failure pattern.
+- `EXPENSE_EXTRACT_SYSTEM_PROMPT` gains rule 10 (`條款 vs.
+  實際交易`) so even if a similar mail slips past classification,
+  the extractor won't pull `amount=110` from an ATM-fee disclaimer.
+  Same SMBC Olive citation for consistency.
+- 3 regression tests in `TestAnalyzePromptRules` /
+  `TestExpenseExtractPromptRules` — pinned string checks (`反幻想`,
+  `boilerplate`, `SMBC Olive`, `承認番号`, `110`) so a future
+  prompt rewrite that keeps only the intent but drops the concrete
+  example still trips the test and surfaces to review.
+
+#### Catch `LengthFinishReasonError` in the analyze node
+
+- When an email + system prompt exceeds the LLM's context window
+  (in the wild: a 31k-prompt email exhausted the 32k window
+  mid-generation, `finish_reason=length`), `openai` raises
+  `LengthFinishReasonError` from
+  `_parse_chat_completion`. Previously it escaped the graph and
+  surfaced as `Unhandled error during tick; will retry`, which
+  meant the poller re-tried the same doomed LLM call every tick
+  until Gmail's ~7-day history retention rolled the message off.
+- `_analyze` now catches the error, logs the prompt/completion
+  token counts, and returns
+  `{"analysis": None, "side_effect": AnalysisFailed(...)}`.
+  The graph completes normally, notify sends the user a Telegram
+  message describing the failure, and `handle_email` skips
+  persistence (no placeholder row in `email_analyses`).
+- New `AnalysisFailed` variant added to the `SideEffect` union
+  (`kind="analysis_failed"`, `reason: Literal["content_too_long"]`,
+  optional `detail` for token counts). Extensible if future
+  analyze failure modes need distinct handling.
+- New `_format_analysis_failed` renderer produces the whole
+  Telegram body (no analyze summary to hang it on) with the
+  offending mail's subject / sender escaped, the reason in
+  Chinese, and the raw token counts inside a `<code>` block.
+- 8 new tests in `TestAnalyzeFailure` / `TestFormatAnalysisFailed`:
+  handle_email returns normally, notify still sends, no analysis
+  row persisted, structured runnable called exactly once (no
+  retry inside the graph), content-too-long reason string, HTML
+  escape guard, detail-omitted-when-None.
+
+#### `帳單通知` category now routes to the expense subgraph
+
+- `_route_by_category` was hardcoded to `category == "消費支出"`,
+  so bill-notification emails (cloud invoices, utility bills,
+  telecom charges, etc.) went straight to `notify` and never
+  reached `ExpenseSubgraph._extract_node` — the only path that
+  downloads and reads PDF attachments. Symptom in the wild: a
+  Google Cloud Platform electronic invoice was classified as
+  `帳單通知`, the invoice PDF was fetched by the Gmail poller but
+  never opened, and the Telegram summary carried `消費金額為不明`.
+- Router now dispatches to expense for both `消費支出` and
+  `帳單通知` via a new `_EXPENSE_LIKE_CATEGORIES` tuple.
+  Adjacent categories (`消費資訊彙整`, `點數資訊彙整`, `訂閱服務`,
+  `廣告`, `促銷`) remain routed to `notify` — the tuple is the
+  single source of truth so future additions are one-line.
+- Extraction system prompt broadened from "消費支出資訊擷取助理"
+  to "消費支出 / 帳單資訊擷取助理" and now lists cloud invoice /
+  utility / subscription as valid sources. All other extraction
+  rules (nulls-not-guesses, ISO 8601, payment_method taxonomy,
+  title guidance) unchanged — bill fields map cleanly onto the
+  existing schema.
+- 10 new tests in `TestRouting`: parametrised route table for
+  both expense-like categories, regression guards that 7 other
+  categories still hit `notify`, and the `analysis is None`
+  short-circuit.
+
+#### Puller UUID duplicate guard
+
+- `NotionExpensePuller._apply_page` now reads the Notion page's
+  `UUID` property (== `expenses.transaction_id`) and, before doing
+  any update, looks up any local `ExpenseRecord` with that
+  transaction_id. If the lookup returns a row whose
+  `notion_page_id` differs from the page currently being processed,
+  the page is skipped with a log entry.
+- Motivation: during the migration window from the previous n8n
+  workflow, both systems process the same emails. A given
+  transaction can end up as two Notion pages sharing one UUID
+  (one Zashiki-linked, one n8n-created). The guard ensures an n8n
+  page that somehow slips past the marker filter cannot drive an
+  update against a row it doesn't own.
+- Pages without a UUID (transaction_id was `None` on the original
+  extraction) bypass the guard — existing behaviour preserved.
+- 4 new tests in `TestUuidDuplicateGuard`.
+
+#### Poller loop stability
+
+- **Gmail HTTP socket timeout.** `GmailClient` now builds its own
+  `httplib2.Http(timeout=…)` and wraps it in `AuthorizedHttp` before
+  passing to `googleapiclient.discovery.build`. Without this,
+  httplib2's default of `None` lets the OS TCP layer wait ~13min
+  (RTO doubling) before a dead connection surfaces as
+  `ConnectionResetError` — visibly stalling the poller. Default
+  timeout `60`s via new `GMAIL_HTTP_TIMEOUT_SECONDS` env var.
+  4 new tests in `test_client_api.py::TestHttpTimeout`.
+- **DB pool pre-ping.** `create_engine` now sets `pool_pre_ping=True`
+  and `pool_recycle=1800`. Overnight-idle connections killed by a
+  home-router NAT eviction or by Postgres server-side idle-drop
+  were surfacing as `SSL SYSCALL Operation timed out` /
+  `server closed the connection unexpectedly` on the next query;
+  both are eliminated by the cheap SELECT 1 pre-flight on checkout.
+  Both the Gmail poller and Notion puller share the singleton
+  engine, so both benefit. 2 new tests in `test_db.py::TestGetEngine`.
+
 ### Added
+
+#### Notion → DB reverse sync
+
+- New `NotionExpensePuller` (`notifications/notion_puller.py`) pulls
+  user edits in the Notion expense database back into Postgres so
+  the local store stays the source of truth after manual LLM-output
+  corrections.
+- Background thread launched from `app.run()` runs the puller every
+  `NOTION_SYNC_INTERVAL_SECONDS` (default `300`, `0` disables).
+  Shares the poller's `stop_event` so SIGTERM drains it cleanly.
+- New one-shot CLI subcommand: `zashiki-warasi sync-notion` runs a
+  single reconcile pass and exits (useful for debugging / manual
+  catch-up when the thread is disabled).
+- Query filter only matches pages stamped with the
+  `auto generated by zashiki-warasi` marker in the 備註 column, so
+  user-created Notion rows are ignored.
+- Syncable fields: title, vendor, amount, currency, transacted_at,
+  category, payment_method. Conflict policy: **Notion wins**.
+- New table `notion_sync_state` (alembic `0007`) stores the
+  per-database `last_edited_time` cursor; cursor advances to the max
+  edit time seen in the batch (not `now()`) to avoid clock-skew rewind.
+- New column `expenses.notion_synced_at` records the last reverse-sync
+  write so diffs are inspectable.
+- CLI refactored from `click.command` to `click.group` with
+  `invoke_without_command=True`, preserving the existing `--reset` UX
+  while adding subcommand surface area.
+
+#### Docker deployment
+
+- `Dockerfile` (multi-stage, uv-based) builds a slim Python 3.13
+  runtime image with the project venv. BuildKit cache mounts keep
+  cold builds under ~10s.
+- `docker/entrypoint.sh` runs `alembic upgrade head` before exec'ing
+  the CLI, so schema is always at HEAD on container boot. Uses `exec`
+  so SIGTERM from `docker stop` reaches the Python process and the
+  shutdown handlers can drain the in-flight message.
+- `docker-compose.yml` provides a self-contained stack (app + Postgres
+  16-alpine + healthcheck gate) for users without an existing
+  Postgres. OAuth client is host-mounted (`./credentials/`); the
+  refresh token cache lives in a named volume so it survives rebuilds.
+- `.dockerignore` excludes `.git`, caches, `.venv`, secrets
+  (`credential.json`, `credentials/`, `token.json`, `.env`), and
+  local-only paths (`tests/`, `scripts/`, `docs/lessons/`).
 
 #### Analyze prompt revisions (live-run feedback)
 

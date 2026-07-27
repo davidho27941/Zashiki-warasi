@@ -1,7 +1,9 @@
 # Zashiki-warasi
 
-A self-hosted Gmail polling agent that classifies and summarises incoming
-mail with an LLM. Built on [LangGraph](https://github.com/langchain-ai/langgraph),
+A self-hosted Gmail polling agent that classifies incoming mail with an LLM,
+extracts structured expense records from receipts / cloud invoices / utility
+bills (including PDF attachments), and mirrors them to a Notion database.
+Built on [LangGraph](https://github.com/langchain-ai/langgraph),
 [pydantic-settings](https://docs.pydantic.dev/latest/), and Postgres for
 durable state.
 
@@ -14,8 +16,23 @@ which is roughly what an email agent that watches your inbox is supposed to do.
 1. Polls your Gmail account using the `historyId` cursor (incremental, no
    re-fetching).
 2. For each new message, asks an LLM to produce a structured
-   `{ category, importance, summary }` analysis.
-3. Persists the analysis to Postgres, deduplicated by message ID.
+   `{ category, importance, urgency, summary, keywords }` analysis.
+3. When the category is `消費支出` (personal spending) or `帳單通知`
+   (bills / cloud-service invoices / recurring charges), routes the mail
+   into an **expense subgraph** — combines the body text with any PDF
+   attachments (pdfplumber), asks the LLM for structured payment fields
+   (`amount`, `currency`, `vendor`, `transacted_at`, `transaction_id`,
+   `payment_method`, …), dedups against existing records, and writes to
+   Postgres.
+4. Sends every analysis (with the expense record when present) as a
+   Telegram message.
+5. **Optional Notion mirror.** Successful expense records are written to
+   a Notion database. A background thread reconciles user edits made in
+   Notion (typo fixes, category corrections) back into Postgres — Notion
+   wins.
+6. LLM context-window failures are caught and surfaced as a distinct
+   `⚠️ LLM 分析失敗` Telegram message; the poller does not get stuck
+   re-firing the doomed call.
 
 Crash-safe by design: per-message dedup plus LangGraph checkpoints (keyed by
 Gmail message ID) mean a restart never loses or re-bills a message, even if
@@ -26,7 +43,9 @@ the process dies mid-LLM-call.
 newsletters) fall back to a stripped-down conversion via `html2text`
 so the LLM sees the full content instead of just Gmail's 200-char
 snippet. The snippet is the last-resort fallback when neither plain
-nor HTML is available.
+nor HTML is available. In the expense subgraph the body is further
+concatenated with the text extracted from any PDF attachments before
+the LLM sees it.
 
 ## Architecture
 
@@ -40,15 +59,37 @@ Gmail API ◀──────▶│ GmailClient (auth, fetch, history)   │
                   └────────────────┬─────────────────────┘
                                    │ EmailMessage
                   ┌────────────────▼─────────────────────┐
-                  │ EmailAgent (LangGraph: analyze node) │──▶ chat model
-                  └────────────────┬─────────────────────┘    (llama.cpp /
-                                   │                           OpenAI / ...)
-                                   │ EmailAnalysis
-                                   ▼
-            Postgres ── gmail_sync_state      (cursor)
-                     ── processed_messages    (dedup)
-                     ── email_analyses        (LLM output)
-                     ── checkpoints, …        (LangGraph state)
+                  │ EmailAgent (LangGraph)               │
+                  │                                      │
+                  │   analyze ─┬─ 消費支出 / 帳單通知 ─▶ │──▶ chat model
+                  │            │        expense_sg       │    (llama.cpp /
+                  │            │  ┌──────────────────┐   │     OpenAI / ...)
+                  │            │  │ collect_text     │──▶│──▶ pdfplumber
+                  │            │  │ (body + PDF/HTML)│   │
+                  │            │  ├──────────────────┤   │
+                  │            │  │ extract (LLM)    │   │
+                  │            │  ├──────────────────┤   │
+                  │            │  │ persist + dedup  │   │
+                  │            │  └────────┬─────────┘   │
+                  │            │           │             │
+                  │            ▼           ▼             │
+                  │          notify (Telegram)           │──▶ Telegram
+                  └───────────────────┬──────────────────┘
+                                      │
+              ┌───────────────────────┴─────────────────────────┐
+              ▼                                                 ▼
+   Postgres                                     Notion (optional)
+   ── gmail_sync_state       (poll cursor)      ── expense DB
+   ── notion_sync_state      (puller cursor)          ▲       │
+   ── processed_messages     (dedup)                  │       │
+   ── email_analyses         (LLM output)     write ──┘       │
+   ── expenses               (payments)          (NotionExpenseRecorder)
+   ── checkpoints, …         (LangGraph state)               │
+                                                             │
+                                                     read ◀──┘
+                                                     (NotionExpensePuller,
+                                                     background thread,
+                                                     reverse-syncs edits)
 ```
 
 ## Requirements
@@ -106,8 +147,25 @@ managed by Alembic.
    `client_secret_*.json` file.
 2. Save it as `credentials.json` in the project root (or set
    `GMAIL_CREDENTIALS_PATH`).
-3. The first run will open a browser for one-time consent; the refresh
+3. **Publish the OAuth consent screen** (APIs & Services → OAuth consent
+   screen → `PUBLISH APP`). A consent screen left in **Testing** status
+   expires every refresh token after **7 days**, so the poller will
+   crash weekly with `invalid_grant: Token has been expired or revoked`.
+   Individual Gmail accounts can publish without Google verification —
+   external users just see an "unverified app" warning.
+4. The first run will open a browser for one-time consent; the refresh
    token is then cached at `~/.config/zashiki-warasi/token.json`.
+
+If the refresh token is later revoked (Google security action, manual
+revoke, or the 50-refresh-tokens-per-user cap being hit during dev),
+the poller sends a Telegram alert and exits with code 78. To recover:
+
+```bash
+uv run zashiki-warasi reauth
+```
+
+This deletes the stale `token.json` and re-runs the browser consent
+flow. Then restart the poller.
 
 ### 4. LLM
 
@@ -193,6 +251,70 @@ The Notion mirror is **not** touched — any rows previously written
 to Notion stay there. If you want a matching wipe, delete them
 manually in the Notion UI.
 
+#### Notion → DB reverse sync
+
+Edits the user makes in the Notion expense database are pulled back
+into Postgres so the local store stays the source of truth even after
+manual corrections (e.g. fixing an LLM-misextracted vendor / amount).
+
+- The puller runs as a background thread inside the poller; cadence
+  is `NOTION_SYNC_INTERVAL_SECONDS` (default `300`s, `0` disables).
+- Only pages stamped with the `auto generated by zashiki-warasi`
+  marker in the 備註 column are touched — manually-added Notion rows
+  are ignored.
+- Syncable fields: `消費名稱`, `消費店家`, `消費金額`, `幣別`,
+  `消費日期`, `消費類別`, `支付方式`. `UUID` and `備註` are immutable.
+- Conflict policy: **Notion wins** (latest-write-wins). The assumption
+  is that you edit Notion when the LLM extracted something wrong.
+
+One-shot manual sync (e.g. for debugging or after `NOTION_SYNC_INTERVAL_SECONDS=0`):
+
+```bash
+uv run zashiki-warasi sync-notion
+```
+
+## Docker
+
+A self-contained stack (app + Postgres) is provided for users without
+an existing Postgres. Migrations are run automatically by the
+entrypoint before the poller boots.
+
+```bash
+cp .env.example .env                                # fill in LLM / Telegram / Notion
+mkdir credentials && cp /path/to/credentials.json credentials/   # OAuth client
+docker compose up --build
+```
+
+First boot: the container needs to complete OAuth interactively.
+Until `credentials/token.json` exists on the host, run the flow once
+with stdin attached:
+
+```bash
+docker compose run --rm app
+# follow the OAuth URL, paste the code; token.json gets cached in the
+# named volume so subsequent runs are non-interactive.
+```
+
+CLI flags pass through `docker compose run`:
+
+```bash
+docker compose run --rm app --reset -y
+docker compose run --rm app sync-notion
+```
+
+**Using your own Postgres** — don't `docker compose up`. Build the
+image and `docker run` it directly with `DATABASE_URL` pointing at
+your existing instance:
+
+```bash
+docker build -t zashiki-warasi .
+docker run --rm -it \
+  --env-file .env \
+  -v "$PWD/credentials:/app/credentials:ro" \
+  -v zashiki_token:/root/.config/zashiki-warasi \
+  zashiki-warasi
+```
+
 ## Configuration
 
 All settings come from environment variables (a `.env` file in the
@@ -204,11 +326,16 @@ project root is supported via `pydantic-settings`).
 | `GMAIL_CREDENTIALS_PATH` | `credentials.json` | OAuth client secrets JSON |
 | `GMAIL_TOKEN_PATH` | `~/.config/zashiki-warasi/token.json` | Cached user token |
 | `GMAIL_SCOPES` | `https://www.googleapis.com/auth/gmail.readonly` | Comma-separated OAuth scopes |
+| `GMAIL_HTTP_TIMEOUT_SECONDS` | `60` | Per-request socket timeout; prevents dead-connection blocking of the poller loop |
 | `LLM_PROVIDER` | `llamacpp` | One of `llamacpp`, `openai`, `anthropic` |
 | `LLM_BASE_URL` | `http://localhost:8080/v1` | OpenAI-compatible endpoint (used by `llamacpp` and `openai`) |
 | `LLM_API_KEY` | `not-needed` | API key for the provider |
 | `LLM_MODEL` | `local-model` | Model identifier passed to the provider |
 | `LLM_TEMPERATURE` | `0.2` | Sampling temperature |
+| `NOTION_TOKEN` | _(empty)_ | Internal integration token (`secret_…`); empty disables Notion |
+| `NOTION_EXPENSE_DATABASE_ID` | _(empty)_ | UUID of the target Notion database |
+| `NOTION_TIMEOUT_SECONDS` | `10.0` | Notion API request timeout |
+| `NOTION_SYNC_INTERVAL_SECONDS` | `300` | Background Notion→DB sync cadence; `0` disables the puller thread |
 
 Switching to `anthropic` additionally requires `uv add langchain-anthropic`.
 
@@ -216,22 +343,40 @@ Switching to `anthropic` additionally requires `uv add langchain-anthropic`.
 
 ```
 src/zashiki_warasi/
-├── app.py              # entry point (uv run zashiki-warasi)
+├── app.py              # entry point (uv run zashiki-warasi) — click group,
+│                       # boots poller + Notion puller thread, shared stop_event
 ├── core/
-│   ├── config.py       # GmailSettings / DatabaseSettings / LLMSettings
-│   ├── db.py           # SQLAlchemy engine + session factory
-│   ├── models.py       # ORM: GmailSyncState, ProcessedMessage, EmailAnalysis
-│   └── schemas.py      # Pydantic: EmailMessage, AttachmentMeta, EmailAnalysis, …
+│   ├── config.py       # GmailSettings / DatabaseSettings / LLMSettings /
+│   │                   # TelegramSettings / NotionSettings
+│   ├── db.py           # SQLAlchemy engine (pool_pre_ping + recycle),
+│   │                   # session factory, reset_database()
+│   ├── models.py       # ORM: GmailSyncState, ProcessedMessage,
+│   │                   # EmailAnalysis, ExpenseRecord, NotionSyncState
+│   └── schemas.py      # Pydantic: EmailMessage, AttachmentMeta,
+│                       # EmailAnalysis, ExpenseDraft / Logged / NeedsReview,
+│                       # AnalysisFailed, SideEffect discriminated union
 ├── gmail/
 │   ├── auth.py         # OAuth Installed App flow
-│   ├── client.py       # Gmail API wrapper (tool-call friendly)
+│   ├── client.py       # Gmail API wrapper (with HTTP timeout, tool-friendly)
 │   ├── exceptions.py   # GmailError hierarchy
 │   └── poller.py       # historyId-based polling loop
-└── agents/
-    ├── llm.py          # Chat model factory (provider-agnostic)
-    └── email_agent.py  # LangGraph triage agent
-alembic/                # Database migrations for domain tables
-tests/                  # Pytest scaffolding
+├── agents/
+│   ├── llm.py          # Chat model factory (provider-agnostic)
+│   ├── email_agent.py  # Analyze node + router; catches
+│   │                   # LengthFinishReasonError → AnalysisFailed
+│   └── verticals/
+│       ├── expense.py  # ExpenseSubgraph: extract → persist → Notion sync
+│       ├── pdf.py      # pdfplumber wrapper + collect_text(body + PDFs)
+│       └── html_text.py# html2text wrapper for HTML-only mails
+└── notifications/
+    ├── telegram.py     # TelegramNotifier
+    ├── notion.py       # NotionExpenseRecorder (write side)
+    └── notion_puller.py# NotionExpensePuller (background reverse-sync)
+alembic/versions/       # 0001–0007 domain migrations (LangGraph tables self-init)
+docker/                 # entrypoint.sh (alembic upgrade head → exec CLI)
+Dockerfile              # multi-stage uv build
+docker-compose.yml      # bundled Postgres 16 + app (for new users)
+tests/                  # Pytest scaffolding (357 tests as of this branch)
 ```
 
 ## How crash recovery works
@@ -247,6 +392,99 @@ tests/                  # Pytest scaffolding
   `history.list` returns 404; the poller catches `HistoryExpiredError`
   and re-baselines from the current `historyId` (backlog is skipped, as
   on first run).
+- **Idle network connections killed by NAT / Postgres server timeout.**
+  Both the Gmail HTTP client and the SQLAlchemy engine are hardened for
+  overnight idle: Gmail requests carry an explicit 60 s socket timeout
+  (`GMAIL_HTTP_TIMEOUT_SECONDS`) so a half-open TCP doesn't stall the
+  loop for the ~13 min OS-level RTO; the DB engine uses
+  `pool_pre_ping=True` + `pool_recycle=1800` so a connection killed by
+  a router NAT eviction is detected on checkout and replaced instead of
+  crashing the next query.
+- **Gmail OAuth refresh token expired or revoked.** A `RefreshError`
+  from Google's auth library is unrecoverable in-process — retrying the
+  same refresh will always fail and would just hammer the token
+  endpoint until Google rate-limits us. The poller (or startup path)
+  catches it, sends a Telegram alert naming the failure, and exits with
+  code `78` (`EX_CONFIG`). Recover with `zashiki-warasi reauth`, then
+  restart. Container orchestrators using `restart: on-failure` will
+  keep restarting the process, but each restart will land on the same
+  bad token and exit immediately — the alert is the actionable signal,
+  not the log spam.
+
+## How LLM analyze failures are handled
+
+The analyze node can hit a hard ceiling if the email + system prompt
+overflows the LLM's context window. `openai` surfaces this as
+`LengthFinishReasonError` after `finish_reason=length`. Left uncaught
+it escapes the LangGraph invoke, the poller logs
+`Unhandled error during tick; will retry`, and the same doomed call
+re-fires every 30 s until Gmail's history retention rolls the message
+off — meanwhile no other emails get processed.
+
+`_analyze` catches the error, logs the prompt / completion token counts,
+and returns an `AnalysisFailed` side-effect. The graph completes
+normally, `notify` sends a distinct Telegram message
+
+```
+⚠️ LLM 分析失敗
+
+標題: <the offending mail's subject>
+寄件者: <sender>
+
+原因: 郵件內容超過 LLM token 上限,無法完成結構化分析。
+用量: prompt=31059 completion=1709
+
+→ 請打開原信手動處理。
+```
+
+and no placeholder row lands in `email_analyses` — analyze failures
+don't pollute the analytics table.
+
+## How the analyze prompt separates real transactions from boilerplate
+
+Bank / card / cloud-service notification emails routinely include a
+disclaimer line at the bottom about a hypothetical fee — for example
+SMBC Olive デビット's `ご利用のお知らせ` mail carries a single real
+transaction block
+
+```
+◇利用日  : 2026/07/03 09:43:03
+◇利用先  : SEVEN-ELEVEN
+◇利用金額: 280円
+◇承認番号: 498134
+```
+
+followed by
+
+```
+※海外ATMでの現地通貨の引き出しは上記金額にATM利用手数料110円を
+加えて引き落とし致します。
+```
+
+The 110 is a hypothetical fee for an ATM withdrawal that didn't
+happen, not a second transaction. A naïve read of the mail sees
+two amounts, decides "this is a multi-transaction digest", and
+misclassifies it as `消費資訊彙整` — which does **not** route
+into the expense subgraph, so no `ExpenseRecord` gets persisted
+and the phantom 110 leaks into the Telegram summary.
+
+The analyze prompt makes this distinction explicit:
+
+- **Summary rule:** a line only counts as a transaction if it has
+  date + vendor + amount all three present. Fee disclaimers,
+  hypothetical scenarios, and boilerplate promo asides are
+  excluded from the summary regardless of what numbers they
+  contain.
+- **Classification rule:** `消費資訊彙整` requires **multiple**
+  real transactions in the mail. One real transaction plus any
+  amount of boilerplate stays `消費支出` and gets routed to the
+  expense subgraph.
+
+The expense extraction prompt carries the same guard as rule 10 —
+so even if the classification is ever wrong, the extractor won't
+pull `amount=110` from a fee disclaimer either. Both guards are
+pinned by regression tests that assert the concrete SMBC Olive
+example survives future prompt rewrites.
 
 ## How expense deduplication works
 

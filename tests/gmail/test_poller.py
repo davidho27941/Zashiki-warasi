@@ -15,6 +15,8 @@ import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
 
+from google.auth.exceptions import RefreshError
+
 from zashiki_warasi.core.models import (
     Base,
     GmailSyncState,
@@ -23,10 +25,12 @@ from zashiki_warasi.core.models import (
 from zashiki_warasi.core.schemas import EmailMessage, ProfileInfo
 from zashiki_warasi.gmail.client import GmailClient
 from zashiki_warasi.gmail.exceptions import (
+    CredentialRefreshError,
     HistoryExpiredError,
     MessageNotFoundError,
 )
 from zashiki_warasi.gmail.poller import Poller
+from zashiki_warasi.notifications.telegram import TelegramError
 
 
 EMAIL = "user@example.com"
@@ -508,6 +512,102 @@ class TestGracefulShutdown:
         poller.run()
 
         assert tick_count["n"] == 1  # exactly one tick, then exit
+
+    def test_credential_refresh_failure_at_startup_raises_and_stops(
+        self, mock_client, session_factory, mock_handler
+    ):
+        """RefreshError from the first get_profile() must not be
+        swallowed by the tick loop — it needs to surface so the app
+        can exit non-zero and the user can reauth."""
+        mock_client.get_profile.side_effect = RefreshError(
+            "invalid_grant: revoked"
+        )
+        notifier = MagicMock()
+        poller = Poller(
+            client=mock_client,
+            session_factory=session_factory,
+            handler=mock_handler,
+            notifier=notifier,
+        )
+
+        with pytest.raises(CredentialRefreshError) as exc_info:
+            poller.run()
+
+        assert "reauth" in str(exc_info.value)
+        assert poller.stop_event.is_set()
+        notifier.send_message.assert_called_once()
+
+    def test_credential_refresh_failure_mid_loop_raises_and_stops(
+        self, mock_client, session_factory, mock_handler
+    ):
+        """RefreshError from a mid-loop client call — the tick's
+        `except Exception` must NOT swallow it; the outer handler
+        notifies + stops + re-raises."""
+        with session_factory() as session:
+            session.add(
+                GmailSyncState(email_address=EMAIL, history_id=500)
+            )
+            session.commit()
+        # First call succeeds (get_profile at startup); second call in
+        # _tick raises RefreshError.
+        mock_client.list_history.side_effect = RefreshError(
+            "invalid_grant: token revoked mid-loop"
+        )
+        notifier = MagicMock()
+        poller = Poller(
+            client=mock_client,
+            session_factory=session_factory,
+            handler=mock_handler,
+            interval_seconds=999,
+            notifier=notifier,
+        )
+
+        with pytest.raises(CredentialRefreshError):
+            poller.run()
+
+        assert poller.stop_event.is_set()
+        notifier.send_message.assert_called_once()
+        args, kwargs = notifier.send_message.call_args
+        alert_body = args[0] if args else kwargs.get("text", "")
+        assert "reauth" in alert_body
+        assert "Gmail" in alert_body
+
+    def test_credential_refresh_failure_without_notifier_still_raises(
+        self, mock_client, session_factory, mock_handler
+    ):
+        """No notifier configured -> we still stop + raise, just no alert."""
+        mock_client.get_profile.side_effect = RefreshError("invalid_grant")
+        poller = Poller(
+            client=mock_client,
+            session_factory=session_factory,
+            handler=mock_handler,
+        )
+
+        with pytest.raises(CredentialRefreshError):
+            poller.run()
+
+        assert poller.stop_event.is_set()
+
+    def test_credential_refresh_failure_survives_telegram_error(
+        self, mock_client, session_factory, mock_handler
+    ):
+        """If Telegram is down, we must still stop and raise the auth
+        error — losing the alert is bad, silently ignoring a dead token
+        is worse."""
+        mock_client.get_profile.side_effect = RefreshError("invalid_grant")
+        notifier = MagicMock()
+        notifier.send_message.side_effect = TelegramError("api down")
+        poller = Poller(
+            client=mock_client,
+            session_factory=session_factory,
+            handler=mock_handler,
+            notifier=notifier,
+        )
+
+        with pytest.raises(CredentialRefreshError):
+            poller.run()
+
+        assert poller.stop_event.is_set()
 
     def test_stop_event_wakes_inter_tick_sleep(
         self, mock_client, session_factory, mock_handler

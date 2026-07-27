@@ -43,6 +43,22 @@ class TestGetEngine:
         engine = db.get_engine()
         assert str(engine.url) == "sqlite+pysqlite:///:memory:"
 
+    def test_pool_pre_ping_enabled(self, sqlite_url):
+        # Regression guard: without pool_pre_ping, connections killed
+        # by NAT idle-timeout or Postgres server-side idle-drop are
+        # handed to callers and blow up on first query with
+        # `SSL SYSCALL timed out` / `server closed the connection`.
+        engine = db.get_engine()
+        assert engine.pool._pre_ping is True
+
+    def test_pool_recycle_set_below_common_nat_timeout(self, sqlite_url):
+        # Belt-and-braces for the same failure mode — home NAT
+        # timeouts typically sit at 30-60min, so a recycle threshold
+        # <= 30min keeps us out of the danger zone even if pre_ping
+        # somehow misses a stale connection.
+        engine = db.get_engine()
+        assert 0 < engine.pool._recycle <= 1800
+
 
 class TestGetSessionFactory:
     def test_returns_sessionmaker(self, sqlite_url):

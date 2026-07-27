@@ -107,9 +107,32 @@ class ExpenseRecord(Base):
     notion_sync_error: Mapped[str | None] = mapped_column(
         Text, nullable=True,
     )
+    # Last time the puller pulled this row back from Notion. NULL means
+    # the row has never been reverse-synced (created from email only).
+    notion_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
+        nullable=False,
+    )
+
+
+class NotionSyncState(Base):
+    """Polling cursor for `NotionExpensePuller`. Keyed by database_id
+    so a future multi-DB setup needs no schema change."""
+
+    __tablename__ = "notion_sync_state"
+
+    database_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    last_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
         nullable=False,
     )
