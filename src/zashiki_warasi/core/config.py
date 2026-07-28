@@ -116,6 +116,62 @@ class TelegramSettings(BaseSettings):
     timeout_seconds: float = 10.0
 
 
+_VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+
+
+class LoggingSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="LOG_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        # Normalize casing + whitespace at coercion time so validators
+        # below only need to police membership — no per-field
+        # .strip().upper() boilerplate.
+        str_strip_whitespace=True,
+        str_to_upper=True,
+    )
+
+    # Root logger level. Applied to every logger that hasn't been
+    # given a specific override — including third-party ones (which
+    # the bootstrap explicitly quiets to WARNING, see
+    # zashiki_warasi.core.logging.configure_logging).
+    level: str = Field(default="INFO")
+
+    # Level for the `zashiki_warasi.*` tree specifically. Lets an
+    # operator flip DEBUG for our code without unmuting httpx /
+    # google.auth / openai chatter. None = inherit from root.
+    # Field name matches env (`LOG_` prefix + `LEVEL_ZASHIKI` =
+    # `LOG_LEVEL_ZASHIKI`) — no alias.
+    level_zashiki: str | None = Field(default=None)
+
+    @field_validator("level", mode="after")
+    @classmethod
+    def _check_root_level(cls, value: str) -> str:
+        # Empty env vars (LOG_LEVEL="") already stripped to "" by
+        # str_strip_whitespace — treat as "unset" and use default.
+        if not value:
+            return "INFO"
+        _reject_unknown_level(value)
+        return value
+
+    @field_validator("level_zashiki", mode="after")
+    @classmethod
+    def _check_zashiki_level(cls, value: str | None) -> str | None:
+        if not value:
+            return None
+        _reject_unknown_level(value)
+        return value
+
+
+def _reject_unknown_level(value: str) -> None:
+    if value not in _VALID_LOG_LEVELS:
+        raise ValueError(
+            f"invalid log level {value!r}; must be one of "
+            f"{sorted(_VALID_LOG_LEVELS)}"
+        )
+
+
 class NotionSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="NOTION_",

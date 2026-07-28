@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal
 from unittest.mock import MagicMock
@@ -946,3 +947,108 @@ class TestNotionSync:
             )
             assert row.notion_page_id == "freshly-synced-page"
             assert row.notion_sync_error is None
+
+
+# ---------- node tracing ----------
+
+
+class TestNodeTracing:
+    """Expense subgraph nodes (`expense.extract`, `expense.persist`) must
+    emit DEBUG enter/exit + INFO state transitions all stamped with
+    `message_id` so an operator grepping one email's lifecycle sees the
+    whole graph, not just email_agent."""
+
+    def test_extract_emits_debug_enter_exit_with_message_id(
+        self, session_factory, mock_client, fake_email, fake_analysis, caplog
+    ):
+        draft = _draft()
+        model = _build_model_returning(draft)
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=model,
+        )
+        with caplog.at_level(
+            logging.DEBUG,
+            logger="zashiki_warasi.agents.verticals.expense",
+        ):
+            subgraph.graph.invoke(
+                _initial_state(fake_email, fake_analysis),
+                config={"configurable": {"thread_id": fake_email.id}},
+            )
+        extract_records = [
+            r for r in caplog.records
+            if "node=expense.extract" in r.getMessage()
+        ]
+        assert any("enter" in r.getMessage() for r in extract_records)
+        assert any(
+            "exit" in r.getMessage() and "elapsed_ms=" in r.getMessage()
+            for r in extract_records
+        )
+        assert all(
+            getattr(r, "message_id", None) == fake_email.id
+            for r in extract_records
+        )
+
+    def test_persist_emits_debug_enter_exit_with_message_id(
+        self, session_factory, mock_client, fake_email, fake_analysis, caplog
+    ):
+        draft = _draft()
+        model = _build_model_returning(draft)
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=model,
+        )
+        with caplog.at_level(
+            logging.DEBUG,
+            logger="zashiki_warasi.agents.verticals.expense",
+        ):
+            subgraph.graph.invoke(
+                _initial_state(fake_email, fake_analysis),
+                config={"configurable": {"thread_id": fake_email.id}},
+            )
+        persist_records = [
+            r for r in caplog.records
+            if "node=expense.persist" in r.getMessage()
+        ]
+        assert any("enter" in r.getMessage() for r in persist_records)
+        assert any(
+            "exit" in r.getMessage() and "elapsed_ms=" in r.getMessage()
+            for r in persist_records
+        )
+        assert all(
+            getattr(r, "message_id", None) == fake_email.id
+            for r in persist_records
+        )
+
+    def test_info_persisted_line_carries_message_id(
+        self, session_factory, mock_client, fake_email, fake_analysis, caplog
+    ):
+        """INFO catalog: `expense: persisted record ...` must carry
+        the message_id context field so a grep pulls both the analyze-
+        side classification and the expense-side persist for one mail."""
+        draft = _draft()
+        model = _build_model_returning(draft)
+        subgraph = ExpenseSubgraph(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            client=mock_client,
+            model=model,
+        )
+        with caplog.at_level(
+            logging.INFO,
+            logger="zashiki_warasi.agents.verticals.expense",
+        ):
+            subgraph.graph.invoke(
+                _initial_state(fake_email, fake_analysis),
+                config={"configurable": {"thread_id": fake_email.id}},
+            )
+        persisted = [
+            r for r in caplog.records
+            if "persisted record" in r.getMessage()
+        ]
+        assert len(persisted) == 1
+        assert persisted[0].message_id == fake_email.id

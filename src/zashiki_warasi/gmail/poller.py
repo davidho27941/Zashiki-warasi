@@ -186,9 +186,14 @@ class Poller:
                     state.history_id = max_history_id
                     session.commit()
                     logger.info(
-                        f"Advanced historyId {start} -> {max_history_id} "
-                        f"({processed_count} new messages)"
+                        f"tick: {processed_count} new messages, cursor "
+                        f"{start} -> {max_history_id}"
                     )
+        else:
+            # Steady-state "loop alive" heartbeat — INFO would flood
+            # (30s cadence × 2880/day just for zero-op ticks). DEBUG
+            # keeps it visible when explicitly enabled.
+            logger.debug(f"tick: 0 new, cursor unchanged at {start}")
 
     def _process_message(self, msg_id: str) -> EmailMessage | None:
         # D1: already processed

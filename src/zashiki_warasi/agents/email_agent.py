@@ -26,6 +26,7 @@ from zashiki_warasi.agents.llm import get_chat_model
 from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
 from zashiki_warasi.agents.verticals.html_text import html_to_text
 from zashiki_warasi.core.config import LLMSettings
+from zashiki_warasi.core.logging import bind_message_context, node_trace
 from zashiki_warasi.core.models import EmailAnalysis as EmailAnalysisORM
 from zashiki_warasi.core.schemas import (
     AnalysisFailed,
@@ -204,53 +205,68 @@ class EmailAgent:
 
     # ----- nodes -----
 
+    def _log(
+        self, state: AgentState
+    ) -> logging.Logger | logging.LoggerAdapter:
+        """Return a LoggerAdapter that stamps `message_id` onto every
+        record emitted from inside a node. Nodes always call this at
+        the top so `grep message_id=<id>` follows one email's
+        lifecycle across module boundaries.
+
+        Falls back to the plain module logger when `state` has no
+        `email` — real invocations always carry one (it's set before
+        the graph starts), but unit tests that exercise a single
+        router in isolation may not.
+        """
+        email = state.get("email")
+        if email is None:
+            return logger
+        return bind_message_context(logger, message_id=email.id)
+
     def _analyze(self, state: AgentState) -> dict:
-        email = state["email"]
-        # Body fallback chain: text/plain → HTML converted on demand →
-        # Gmail snippet. Covers HTML-only mails (modern e-receipts,
-        # marketing newsletters) that previously degraded to the
-        # ~200-char snippet alone.
-        body = (
-            email.body_plain
-            or html_to_text(email.body_html)
-            or email.snippet
-            or ""
-        )
-        user_text = (
-            f"From: {email.from_address}\n"
-            f"Subject: {email.subject}\n"
-            f"Date: {email.received_at.isoformat()}\n"
-            f"\n"
-            f"{body}"
-        )
-        try:
-            analysis = self._analyze_model.invoke(
-                [
-                    SystemMessage(content=ANALYZE_SYSTEM_PROMPT),
-                    HumanMessage(content=user_text),
-                ]
+        log = self._log(state)
+        with node_trace(log, "analyze"):
+            email = state["email"]
+            # Body fallback chain: text/plain → HTML converted on
+            # demand → Gmail snippet. Covers HTML-only mails (modern
+            # e-receipts, marketing newsletters) that previously
+            # degraded to the ~200-char snippet alone.
+            body = (
+                email.body_plain
+                or html_to_text(email.body_html)
+                or email.snippet
+                or ""
             )
-        except LengthFinishReasonError as exc:
-            # LLM ran out of completion tokens mid-structured-output.
-            # Poller would otherwise re-tick and fail identically until
-            # the message dropped off history; instead we emit an
-            # `AnalysisFailed` side-effect so notify still pings the
-            # user and the graph completes normally.
-            usage = exc.completion.usage
-            detail = (
-                f"prompt={usage.prompt_tokens} "
-                f"completion={usage.completion_tokens}"
+            user_text = (
+                f"From: {email.from_address}\n"
+                f"Subject: {email.subject}\n"
+                f"Date: {email.received_at.isoformat()}\n"
+                f"\n"
+                f"{body}"
             )
-            logger.warning(
-                f"analyze: LLM hit token limit for {email.id} ({detail})"
-            )
-            return {
-                "analysis": None,
-                "side_effect": AnalysisFailed(
-                    reason="content_too_long", detail=detail
-                ),
-            }
-        return {"analysis": analysis}
+            try:
+                analysis = self._analyze_model.invoke(
+                    [
+                        SystemMessage(content=ANALYZE_SYSTEM_PROMPT),
+                        HumanMessage(content=user_text),
+                    ]
+                )
+            except LengthFinishReasonError as exc:
+                usage = exc.completion.usage
+                detail = (
+                    f"prompt={usage.prompt_tokens} "
+                    f"completion={usage.completion_tokens}"
+                )
+                log.warning(f"analyze: LLM hit token limit ({detail})")
+                return {
+                    "analysis": None,
+                    "side_effect": AnalysisFailed(
+                        reason="content_too_long", detail=detail
+                    ),
+                }
+            if analysis is not None:
+                log.info(f"classified as {analysis.category}")
+            return {"analysis": analysis}
 
     # Categories that go through the expense subgraph — where PDF /
     # HTML attachments are pulled and the LLM extracts structured
@@ -260,32 +276,43 @@ class EmailAgent:
     _EXPENSE_LIKE_CATEGORIES = ("消費支出", "帳單通知")
 
     def _route_by_category(self, state: AgentState) -> str:
+        log = self._log(state)
         analysis = state.get("analysis")
         if analysis is None:
+            log.info("routing to notify (no analysis)")
             return "notify"
-        if analysis.category in self._EXPENSE_LIKE_CATEGORIES:
-            return "expense"
-        return "notify"
+        target = (
+            "expense"
+            if analysis.category in self._EXPENSE_LIKE_CATEGORIES
+            else "notify"
+        )
+        log.info(f"routing to {target} (category={analysis.category})")
+        return target
 
     def _notify(self, state: AgentState) -> dict:
-        analysis = state["analysis"]
-        side_effect = state.get("side_effect")
-        if analysis is None:
-            # Analyze itself failed — no structured summary to render.
-            # If it left us an AnalysisFailed marker we still ping the
-            # user (they need to open the mail manually); otherwise we
-            # log and skip since something else went off-script.
-            if isinstance(side_effect, AnalysisFailed):
-                text = _format_analysis_failed(state["email"], side_effect)
-                self._notifier.send_message(text)
+        log = self._log(state)
+        with node_trace(log, "notify"):
+            analysis = state["analysis"]
+            side_effect = state.get("side_effect")
+            if analysis is None:
+                # Analyze itself failed — no structured summary to
+                # render. If it left us an AnalysisFailed marker we
+                # still ping the user (they need to open the mail
+                # manually); otherwise we log and skip since something
+                # else went off-script.
+                if isinstance(side_effect, AnalysisFailed):
+                    text = _format_analysis_failed(
+                        state["email"], side_effect
+                    )
+                    self._notifier.send_message(text)
+                    log.info("notified user of analyze failure")
+                    return {}
+                log.warning("notify: skipping — no analysis")
                 return {}
-            logger.warning(
-                f"notify: skipping {state['email'].id} — no analysis"
-            )
+            text = _format_message(state["email"], analysis, side_effect)
+            self._notifier.send_message(text)
+            log.info("notified user")
             return {}
-        text = _format_message(state["email"], analysis, side_effect)
-        self._notifier.send_message(text)
-        return {}
 
     # ----- entry point -----
 

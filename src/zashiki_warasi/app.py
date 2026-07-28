@@ -24,6 +24,7 @@ from zashiki_warasi.core.config import (
     NotionSettings,
 )
 from zashiki_warasi.core.db import get_session_factory, reset_database
+from zashiki_warasi.core.logging import configure_logging
 from zashiki_warasi.gmail.auth import get_credentials
 from zashiki_warasi.gmail.client import GmailClient
 from zashiki_warasi.gmail.exceptions import CredentialRefreshError
@@ -39,11 +40,13 @@ logger = logging.getLogger(__name__)
 
 
 def _init_logging() -> None:
-    """Configure root logging once. Idempotent — repeat calls no-op."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    """Configure root logging once via `configure_logging()`.
+
+    Thin wrapper kept so that the app's process entry point still owns
+    logging bootstrap (rather than callers into it having to remember).
+    Idempotent — see `zashiki_warasi.core.logging.configure_logging`.
+    """
+    configure_logging()
 
 
 def _libpq_url(sqlalchemy_url: str) -> str:
