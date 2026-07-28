@@ -336,8 +336,58 @@ project root is supported via `pydantic-settings`).
 | `NOTION_EXPENSE_DATABASE_ID` | _(empty)_ | UUID of the target Notion database |
 | `NOTION_TIMEOUT_SECONDS` | `10.0` | Notion API request timeout |
 | `NOTION_SYNC_INTERVAL_SECONDS` | `300` | Background Notion→DB sync cadence; `0` disables the puller thread |
+| `LOG_LEVEL` | `INFO` | Root logger level. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive) |
+| `LOG_LEVEL_ZASHIKI` | _(inherit)_ | Level for our `zashiki_warasi.*` tree only — flip DEBUG on our code without unmuting httpx / google.auth / openai chatter |
 
 Switching to `anthropic` additionally requires `uv add langchain-anthropic`.
+
+## Logging
+
+Every message-processing log line carries a `message_id=<gmail_id>`
+context field so `grep` follows one email's entire lifecycle across
+`email_agent`, the expense subgraph, and the notification sinks:
+
+```
+$ zashiki-warasi 2>&1 | grep 'message_id=17c8f1a9b3d4e5f6'
+2026-07-28T09:12:34+0000 INFO  zashiki_warasi.agents.email_agent[message_id=17c8f1a9b3d4e5f6]: classified as 消費支出
+2026-07-28T09:12:34+0000 INFO  zashiki_warasi.agents.email_agent[message_id=17c8f1a9b3d4e5f6]: routing to expense (category=消費支出)
+2026-07-28T09:12:35+0000 INFO  zashiki_warasi.agents.verticals.expense[message_id=17c8f1a9b3d4e5f6]: expense: extracted vendor=SEVEN-ELEVEN amount=803 currency=JPY
+2026-07-28T09:12:35+0000 INFO  zashiki_warasi.agents.verticals.expense[message_id=17c8f1a9b3d4e5f6]: expense: persisted record 42
+2026-07-28T09:12:36+0000 INFO  zashiki_warasi.agents.email_agent[message_id=17c8f1a9b3d4e5f6]: notified user
+```
+
+### Level policy
+
+| Level | What you'll see | When to use |
+| --- | --- | --- |
+| `DEBUG` | Per-node entry/exit + `elapsed_ms`, decision inputs, tick heartbeats (`tick: 0 new`) | Interactive debugging session, incident triage. Do NOT leave on in production — DEBUG on `zashiki_warasi.*` is chatty (dozens of lines per message) |
+| `INFO` | State transitions worth knowing about after the fact: classified, routed, extracted, persisted, notified, tick advanced, credentials refreshed | Default steady-state cadence |
+| `WARNING` | Recoverable anomalies: HistoryExpiredError rebaseline, Notion write failure marked on the row, LLM token limit hit (falls back to `AnalysisFailed`) | Should surface even in quiet operation — worth glancing at daily |
+| `ERROR` | A specific unit of work failed and was abandoned; poller keeps running | Always visible; typically indicates a bug or bad data |
+| `CRITICAL` | Process cannot continue without operator action: `CredentialRefreshError`, Postgres lost | Always visible; exit code `78` follows |
+
+### Two knobs, one common recipe
+
+- **Quiet steady state, loud on our code when I need it:**
+  `LOG_LEVEL=INFO LOG_LEVEL_ZASHIKI=DEBUG` — our per-node traces
+  visible, third-party (`httpx`, `google.auth`, `openai._base_client`,
+  etc.) muted to WARNING regardless.
+- **Everything quiet except real anomalies:**
+  `LOG_LEVEL=WARNING` — poller boots silently, only WARN+ surfaces.
+- **Full firehose:**
+  `LOG_LEVEL=DEBUG` — DEBUG on everything we own. The hard-coded
+  WARNING pins on `httpx` / `httpcore` / `urllib3` / `google.auth` /
+  `google_auth_httplib2` / `openai._base_client` / `httpx._client`
+  stay in effect (they would otherwise dominate the output during a
+  Gmail history burst). To unmute one of those for a specific
+  investigation, override with e.g.
+  `python -c "import logging; logging.getLogger('httpx').setLevel(logging.DEBUG)"`
+  in a shell before importing the app — or add a targeted env knob
+  in a follow-up change.
+
+An unknown level (`LOG_LEVEL=verbose`) fails the process at startup
+with a clear error — silent fallback to `INFO` would let you believe
+DEBUG was on when it wasn't.
 
 ## Project layout
 

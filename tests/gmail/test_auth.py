@@ -98,6 +98,28 @@ class TestRefreshPath:
         # Persisted to disk after refresh
         assert settings.token_path.exists()
 
+    def test_successful_refresh_emits_info_log(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """INFO catalog pin: silent success used to be invisible —
+        operators reported "did the refresh even run?". Emit one line."""
+        import logging as _logging
+
+        settings = _settings(tmp_path)
+        settings.token_path.parent.mkdir(parents=True, exist_ok=True)
+        settings.token_path.write_text("{}")
+        cached = _fake_creds(valid=False, expired=True, refresh_token="rt")
+        monkeypatch.setattr(
+            "zashiki_warasi.gmail.auth.Credentials.from_authorized_user_file",
+            MagicMock(return_value=cached),
+        )
+        with caplog.at_level(_logging.INFO, logger="zashiki_warasi.gmail.auth"):
+            auth.get_credentials(settings)
+        assert any(
+            "credentials refreshed" in r.getMessage()
+            for r in caplog.records
+        )
+
 
 # --- refresh path: RefreshError -> CredentialRefreshError ---
 

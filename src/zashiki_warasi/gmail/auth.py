@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Sequence
@@ -14,6 +15,8 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from zashiki_warasi.core.config import GmailSettings
 from zashiki_warasi.gmail.exceptions import CredentialRefreshError
 
+logger = logging.getLogger(__name__)
+
 
 def get_credentials(settings: GmailSettings | None = None) -> Credentials:
     settings = settings or GmailSettings()
@@ -25,12 +28,16 @@ def get_credentials(settings: GmailSettings | None = None) -> Credentials:
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
+            logger.info("credentials refreshed successfully")
         except RefreshError as exc:
             raise CredentialRefreshError(
                 _refresh_error_message(settings.token_path, exc)
             ) from exc
     else:
         creds = _run_installed_flow(settings.credentials_path, settings.scopes)
+        logger.info(
+            f"credentials obtained via InstalledAppFlow → {settings.token_path}"
+        )
 
     _persist(creds, settings.token_path)
     return creds

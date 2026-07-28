@@ -8,6 +8,7 @@ dependencies.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
@@ -726,6 +727,71 @@ class TestExpenseExtractPromptRules:
 
 
 # ---------- analyze-model max_tokens wiring ----------
+
+
+class TestNodeTracing:
+    """Every LangGraph node in EmailAgent wraps its body with
+    `node_trace(log, name)` and binds `message_id` on the adapter, so
+    `grep 'message_id=<id>'` finds one email's entire graph lifecycle
+    across module boundaries at DEBUG."""
+
+    def test_analyze_emits_debug_enter_exit_with_message_id(
+        self, agent, fake_email, caplog
+    ):
+        with caplog.at_level(
+            logging.DEBUG, logger="zashiki_warasi.agents.email_agent"
+        ):
+            agent.handle_email(fake_email)
+        analyze_records = [
+            r for r in caplog.records if "node=analyze" in r.getMessage()
+        ]
+        # Both enter and exit at DEBUG.
+        assert any("enter" in r.getMessage() for r in analyze_records)
+        assert any(
+            "exit" in r.getMessage() and "elapsed_ms=" in r.getMessage()
+            for r in analyze_records
+        )
+        # message_id propagates onto each record.
+        assert all(
+            getattr(r, "message_id", None) == fake_email.id
+            for r in analyze_records
+        )
+
+    def test_notify_emits_debug_enter_exit_with_message_id(
+        self, agent, fake_email, caplog
+    ):
+        with caplog.at_level(
+            logging.DEBUG, logger="zashiki_warasi.agents.email_agent"
+        ):
+            agent.handle_email(fake_email)
+        notify_records = [
+            r for r in caplog.records if "node=notify" in r.getMessage()
+        ]
+        assert any("enter" in r.getMessage() for r in notify_records)
+        assert any(
+            "exit" in r.getMessage() and "elapsed_ms=" in r.getMessage()
+            for r in notify_records
+        )
+        assert all(
+            getattr(r, "message_id", None) == fake_email.id
+            for r in notify_records
+        )
+
+    def test_info_classified_line_carries_message_id(
+        self, agent, fake_email, caplog
+    ):
+        """INFO catalog: analyze emits `classified as <category>` at INFO
+        and it must carry the message_id context so operators can grep
+        `message_id=... classified as` for a single decision."""
+        with caplog.at_level(
+            logging.INFO, logger="zashiki_warasi.agents.email_agent"
+        ):
+            agent.handle_email(fake_email)
+        classified = [
+            r for r in caplog.records if "classified as" in r.getMessage()
+        ]
+        assert len(classified) == 1
+        assert classified[0].message_id == fake_email.id
 
 
 class TestAnalyzeMaxTokensWiring:

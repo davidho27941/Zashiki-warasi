@@ -12,6 +12,7 @@ from click.testing import CliRunner
 from zashiki_warasi import app
 from zashiki_warasi.app import (
     EXIT_CREDENTIAL_FAILURE,
+    _init_logging,
     _install_shutdown_handlers,
     _libpq_url,
 )
@@ -48,6 +49,18 @@ class TestLibpqUrl:
 
     def test_does_not_touch_non_postgres_urls(self):
         assert _libpq_url("sqlite:///x.db") == "sqlite:///x.db"
+
+
+class TestInitLogging:
+    """Bootstrap must delegate to configure_logging so the whole app
+    gets the ContextFormatter, third-party level suppression, and
+    env-driven levels — not just the old bare basicConfig."""
+
+    def test_init_logging_calls_configure_logging(self, monkeypatch):
+        spy = MagicMock()
+        monkeypatch.setattr("zashiki_warasi.app.configure_logging", spy)
+        _init_logging()
+        spy.assert_called_once_with()
 
 
 class TestInstallShutdownHandlers:

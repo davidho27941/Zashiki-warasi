@@ -16,6 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from zashiki_warasi.agents.verticals.pdf import collect_text
+from zashiki_warasi.core.logging import bind_message_context, node_trace
 from zashiki_warasi.core.models import ExpenseRecord
 from zashiki_warasi.core.schemas import (
     EmailAnalysis,
@@ -290,152 +291,180 @@ class ExpenseSubgraph:
 
     # ----- nodes -----
 
+    def _log(
+        self, state: ExpenseState
+    ) -> logging.Logger | logging.LoggerAdapter:
+        """Bind message_id from state for uniform per-message tracing."""
+        email = state.get("email")
+        if email is None:
+            return logger
+        return bind_message_context(logger, message_id=email.id)
+
     def _extract_node(self, state: ExpenseState) -> dict:
-        email = state["email"]
-        text, unreadable_pdfs = collect_text(email, self._client)
+        log = self._log(state)
+        with node_trace(log, "expense.extract"):
+            email = state["email"]
+            text, unreadable_pdfs = collect_text(email, self._client)
 
-        # Early bail: PDF present but unreadable AND no body text — no
-        # signal to extract from; do not hallucinate.
-        if not text and unreadable_pdfs:
-            logger.info(
-                f"expense: {email.id} has only unreadable PDFs "
-                "→ needs_review"
+            # Early bail: PDF present but unreadable AND no body text —
+            # no signal to extract from; do not hallucinate.
+            if not text and unreadable_pdfs:
+                log.info("expense: only unreadable PDFs → needs_review")
+                return {
+                    "side_effect": ExpenseNeedsReview(
+                        reason="image_pdf_unreadable",
+                        unreadable_attachments=unreadable_pdfs,
+                    ),
+                    "extracted": None,
+                }
+
+            if not text:
+                log.info("expense: no text extractable → needs_review")
+                return {
+                    "side_effect": ExpenseNeedsReview(
+                        reason="extraction_yielded_nulls",
+                    ),
+                    "extracted": None,
+                }
+
+            user_prompt = self._build_user_prompt(email, text)
+            draft: ExpenseDraft = self._structured_model.invoke(
+                [
+                    SystemMessage(content=EXPENSE_EXTRACT_SYSTEM_PROMPT),
+                    HumanMessage(content=user_prompt),
+                ]
             )
-            return {
-                "side_effect": ExpenseNeedsReview(
-                    reason="image_pdf_unreadable",
-                    unreadable_attachments=unreadable_pdfs,
-                ),
-                "extracted": None,
-            }
-
-        if not text:
-            return {
-                "side_effect": ExpenseNeedsReview(
-                    reason="extraction_yielded_nulls",
-                ),
-                "extracted": None,
-            }
-
-        user_prompt = self._build_user_prompt(email, text)
-        draft: ExpenseDraft = self._structured_model.invoke(
-            [
-                SystemMessage(content=EXPENSE_EXTRACT_SYSTEM_PROMPT),
-                HumanMessage(content=user_prompt),
-            ]
-        )
-        return {"extracted": draft}
+            log.info(
+                f"expense: extracted vendor={draft.vendor} "
+                f"amount={draft.amount} currency={draft.currency}"
+            )
+            return {"extracted": draft}
 
     def _persist_node(self, state: ExpenseState) -> dict:
-        # If extract already set a side_effect (needs_review), nothing
-        # to persist — pass through.
-        if state.get("side_effect") is not None:
-            return {}
+        log = self._log(state)
+        with node_trace(log, "expense.persist"):
+            # If extract already set a side_effect (needs_review),
+            # nothing to persist — pass through.
+            if state.get("side_effect") is not None:
+                return {}
 
-        draft = state.get("extracted")
-        if draft is None or (draft.amount is None and draft.vendor is None):
-            logger.info(
-                "expense: LLM extraction too sparse (no amount & no vendor) "
-                "→ needs_review"
+            draft = state.get("extracted")
+            if draft is None or (draft.amount is None and draft.vendor is None):
+                log.info(
+                    "expense: LLM extraction too sparse "
+                    "(no amount & no vendor) → needs_review"
+                )
+                return {
+                    "side_effect": ExpenseNeedsReview(
+                        reason="extraction_yielded_nulls",
+                    )
+                }
+
+            transaction_id = draft.transaction_id or auto_transaction_id(
+                state["email"].id
             )
+
+            with self._session_factory() as session:
+                # Cross-email dedup: detect "different email, same
+                # actual transaction" (e.g. SMBC Olive confirmation +
+                # Starbucks merchant receipt) before writing a second
+                # row.
+                existing = find_duplicate(draft, session)
+                is_new_record = existing is None
+                if existing is not None:
+                    log.info(
+                        f"expense: matches existing record {existing.id} "
+                        "(duplicate transaction) → skip persist"
+                    )
+                    record = existing
+                else:
+                    record = ExpenseRecord(
+                        message_id=state["email"].id,
+                        title=draft.title,
+                        amount=draft.amount,
+                        currency=draft.currency,
+                        transacted_at=draft.transacted_at,
+                        vendor=draft.vendor,
+                        location=draft.location,
+                        category=draft.category,
+                        transaction_id=transaction_id,
+                        payment_method=draft.payment_method,
+                        raw_extraction=draft.model_dump(mode="json"),
+                    )
+                    session.add(record)
+                    try:
+                        session.commit()
+                        log.info(f"expense: persisted record {record.id}")
+                    except IntegrityError:
+                        # message_id UNIQUE collided — already
+                        # persisted on a prior tick (LangGraph resume
+                        # scenario, NOT cross-email dedup which is
+                        # handled above). Use the existing row for
+                        # the SideEffect.
+                        session.rollback()
+                        record = session.scalar(
+                            select(ExpenseRecord).where(
+                                ExpenseRecord.message_id
+                                == state["email"].id
+                            )
+                        )
+                        is_new_record = False
+                        log.info(
+                            f"expense: resumed existing record {record.id} "
+                            "(idempotent replay)"
+                        )
+
+                # Best-effort Notion sync. Attempted whenever the
+                # chosen record has no successful sync yet — covers
+                # both new inserts AND dedup hits whose original
+                # write failed Notion (so we self-heal historical
+                # failures the moment a second email about the same
+                # transaction arrives). Successfully-synced records
+                # are not re-attempted.
+                if (
+                    self._notion is not None
+                    and record.notion_page_id is None
+                ):
+                    try:
+                        record.notion_page_id = self._notion.record_expense(
+                            record
+                        )
+                        # Clear any stale error from a prior failed
+                        # attempt so the SideEffect / Telegram message
+                        # reflects the current successful state.
+                        record.notion_sync_error = None
+                        log.info(
+                            f"expense: synced {record.id} to Notion page "
+                            f"{record.notion_page_id}"
+                        )
+                    except NotionSyncError as exc:
+                        err = str(exc)[:500]  # keep DB row size sane
+                        record.notion_sync_error = err
+                        log.warning(
+                            f"expense: Notion sync failed for "
+                            f"{record.id}: {err}"
+                        )
+                    # record is attached to the open session; commit
+                    # flushes whichever of notion_page_id /
+                    # notion_sync_error we set.
+                    session.commit()
+
             return {
-                "side_effect": ExpenseNeedsReview(
-                    reason="extraction_yielded_nulls",
+                "side_effect": ExpenseLogged(
+                    record_id=str(record.id),
+                    title=record.title,
+                    amount=record.amount,
+                    currency=record.currency,  # type: ignore[arg-type]
+                    vendor=record.vendor,
+                    location=record.location,
+                    category=record.category,
+                    transacted_at=record.transacted_at,
+                    payment_method=record.payment_method,  # type: ignore[arg-type]
+                    transaction_id=record.transaction_id,
+                    notion_page_id=record.notion_page_id,
+                    notion_sync_error=record.notion_sync_error,
                 )
             }
-
-        transaction_id = draft.transaction_id or auto_transaction_id(
-            state["email"].id
-        )
-
-        with self._session_factory() as session:
-            # Cross-email dedup: detect "different email, same actual
-            # transaction" (e.g. SMBC Olive confirmation + Starbucks
-            # merchant receipt) before writing a second row.
-            existing = find_duplicate(draft, session)
-            is_new_record = existing is None
-            if existing is not None:
-                logger.info(
-                    f"expense: {state['email'].id} matches existing record "
-                    f"{existing.id} (duplicate transaction) → skip persist"
-                )
-                record = existing
-            else:
-                record = ExpenseRecord(
-                    message_id=state["email"].id,
-                    title=draft.title,
-                    amount=draft.amount,
-                    currency=draft.currency,
-                    transacted_at=draft.transacted_at,
-                    vendor=draft.vendor,
-                    location=draft.location,
-                    category=draft.category,
-                    transaction_id=transaction_id,
-                    payment_method=draft.payment_method,
-                    raw_extraction=draft.model_dump(mode="json"),
-                )
-                session.add(record)
-                try:
-                    session.commit()
-                except IntegrityError:
-                    # message_id UNIQUE collided — already persisted on
-                    # a prior tick (LangGraph resume scenario, NOT
-                    # cross-email dedup which is handled above). Use
-                    # the existing row for the SideEffect.
-                    session.rollback()
-                    record = session.scalar(
-                        select(ExpenseRecord).where(
-                            ExpenseRecord.message_id == state["email"].id
-                        )
-                    )
-                    is_new_record = False
-
-            # Best-effort Notion sync. Attempted whenever the chosen
-            # record has no successful sync yet — covers both new
-            # inserts AND dedup hits whose original write failed
-            # Notion (so we self-heal historical failures the moment
-            # a second email about the same transaction arrives).
-            # Successfully-synced records are not re-attempted.
-            if (
-                self._notion is not None
-                and record.notion_page_id is None
-            ):
-                try:
-                    record.notion_page_id = self._notion.record_expense(record)
-                    # Clear any stale error from a prior failed attempt
-                    # so the SideEffect / Telegram message reflects the
-                    # current successful state.
-                    record.notion_sync_error = None
-                    logger.info(
-                        f"expense: synced {record.id} to Notion page "
-                        f"{record.notion_page_id}"
-                    )
-                except NotionSyncError as exc:
-                    err = str(exc)[:500]  # keep DB row size sane
-                    record.notion_sync_error = err
-                    logger.warning(
-                        f"expense: Notion sync failed for {record.id}: {err}"
-                    )
-                # record is attached to the open session; commit flushes
-                # whichever of notion_page_id / notion_sync_error we set.
-                session.commit()
-
-        return {
-            "side_effect": ExpenseLogged(
-                record_id=str(record.id),
-                title=record.title,
-                amount=record.amount,
-                currency=record.currency,  # type: ignore[arg-type]
-                vendor=record.vendor,
-                location=record.location,
-                category=record.category,
-                transacted_at=record.transacted_at,
-                payment_method=record.payment_method,  # type: ignore[arg-type]
-                transaction_id=record.transaction_id,
-                notion_page_id=record.notion_page_id,
-                notion_sync_error=record.notion_sync_error,
-            )
-        }
 
     # ----- prompt construction -----
 
