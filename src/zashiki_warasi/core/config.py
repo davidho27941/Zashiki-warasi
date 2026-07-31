@@ -52,15 +52,47 @@ class GmailSettings(BaseSettings):
 
 class DatabaseSettings(BaseSettings):
     model_config = SettingsConfigDict(
+        env_prefix="DATABASE_",
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
 
+    # `DATABASE_URL` is the de-facto Twelve-Factor / Heroku env name;
+    # keeping the alias so operators don't have to relearn it just
+    # because we added a prefix for the new pool fields below.
     database_url: str = Field(
         default="postgresql+psycopg://localhost/zashiki_warasi",
         alias="DATABASE_URL",
     )
+
+    # LangGraph checkpointer connection pool tunables. Env names match
+    # field names (prefix `DATABASE_` + name) — no aliases. Defaults are
+    # sized for a single-threaded homelab poller; raise max_size for a
+    # chattier deployment. All four enforce `gt=0` (a zero would either
+    # starve the pool or silently defeat recycling).
+    checkpointer_pool_min_size: int = Field(default=1, gt=0)
+    checkpointer_pool_max_size: int = Field(default=5, gt=0)
+    checkpointer_pool_max_lifetime_seconds: float = Field(
+        default=1800.0, gt=0
+    )
+    checkpointer_pool_max_idle_seconds: float = Field(
+        default=600.0, gt=0
+    )
+
+    @field_validator("checkpointer_pool_max_size")
+    @classmethod
+    def _check_pool_size_ordering(cls, value: int, info) -> int:
+        # A misconfigured `max < min` would deadlock the pool at open()
+        # because it can't provision `min_size` connections without
+        # exceeding `max_size`. Fail fast at startup.
+        min_size = info.data.get("checkpointer_pool_min_size")
+        if min_size is not None and value < min_size:
+            raise ValueError(
+                f"checkpointer_pool_max_size ({value}) must be >= "
+                f"checkpointer_pool_min_size ({min_size})"
+            )
+        return value
 
 
 class LLMSettings(BaseSettings):

@@ -15,7 +15,11 @@ import sys
 import threading
 
 import click
+import psycopg
+import psycopg_pool
 from langgraph.checkpoint.postgres import PostgresSaver
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 from zashiki_warasi.agents.email_agent import EmailAgent
 from zashiki_warasi.core.config import (
@@ -242,6 +246,99 @@ def sync_notion_cmd() -> None:
 
 
 EXIT_CREDENTIAL_FAILURE = 78  # sysexits.h EX_CONFIG — user must intervene
+EXIT_DB_UNREACHABLE = 71  # sysexits.h EX_OSERR — infra beyond app's control
+
+# psycopg's `application_name` label — surfaces in `pg_stat_activity`
+# so the operator can distinguish checkpointer connections from any
+# other client (Notion puller, one-shot sync-notion, ad-hoc psql).
+_CHECKPOINTER_APPLICATION_NAME = "zashiki-warasi-checkpointer"
+
+
+def _build_checkpointer_pool(
+    settings: DatabaseSettings,
+    db_url: str,
+    stop_event: threading.Event,
+    unreachable_flag: threading.Event,
+) -> ConnectionPool:
+    """Return an unopened `ConnectionPool` configured for LangGraph.
+
+    The caller is expected to enter it with `with pool: ...` so shutdown
+    ordering (pool close AFTER checkpointer exit) is enforced by
+    nesting. See design D6.
+
+    `unreachable_flag` is set only by the `reconnect_failed` callback,
+    so the caller can distinguish an operator shutdown (Ctrl+C /
+    SIGTERM) from an infra-driven shutdown (pool gave up).
+    """
+
+    def _configure(conn: psycopg.Connection) -> None:
+        # Runs once per newly-created pool connection. Sets the label
+        # visible in pg_stat_activity + logs the creation at DEBUG
+        # (per level policy in the logging capability). LangGraph's
+        # PostgresSaver expects autocommit + dict_row on the pool's
+        # kwargs (below); this callback only handles session-level
+        # settings that must be applied AFTER connection is open.
+        # `SET` is a utility statement and does NOT accept `%s` params
+        # (Postgres errors with `syntax error at or near "$1"`), so we
+        # go through `set_config()` — a regular function that accepts
+        # them and returns the applied value.
+        conn.execute(
+            "SELECT set_config('application_name', %s, false)",
+            (_CHECKPOINTER_APPLICATION_NAME,),
+        )
+        logger.debug(
+            f"checkpointer conn created "
+            f"(application_name={_CHECKPOINTER_APPLICATION_NAME})"
+        )
+
+    def _check(conn: psycopg.Connection) -> None:
+        # On-checkout health check. Delegates to psycopg-pool's builtin
+        # (a `SELECT 1`), but wraps it so we can log a WARNING when the
+        # pool discards a stale connection. Re-raising is load-bearing:
+        # the pool's discard path is triggered by the raised exception.
+        # Import path via `psycopg_pool` (not the module-level
+        # `ConnectionPool` alias) so tests that monkeypatch
+        # `app.ConnectionPool` still exercise the real check.
+        try:
+            psycopg_pool.ConnectionPool.check_connection(conn)
+        except Exception:
+            logger.warning(
+                "checkpointer pool: discarded stale connection, reconnecting"
+            )
+            raise
+
+    def _reconnect_failed(pool: ConnectionPool) -> None:
+        # Fires when the pool has been unable to establish a connection
+        # for `reconnect_timeout` (default 300s). Treated as
+        # unrecoverable — parallel to CredentialRefreshError: log
+        # CRITICAL, flag the failure so `run()` can exit non-zero, and
+        # set the shutdown event so the poller loop returns cleanly.
+        logger.critical(
+            f"checkpointer pool: reconnect failed after "
+            f"{pool.reconnect_timeout}s — DB unreachable"
+        )
+        unreachable_flag.set()
+        stop_event.set()
+
+    return ConnectionPool(
+        db_url,
+        min_size=settings.checkpointer_pool_min_size,
+        max_size=settings.checkpointer_pool_max_size,
+        max_lifetime=settings.checkpointer_pool_max_lifetime_seconds,
+        max_idle=settings.checkpointer_pool_max_idle_seconds,
+        # LangGraph's PostgresSaver requires these on every connection
+        # it uses. Passed here so freshly-provisioned pool connections
+        # come pre-configured — no per-checkout reconfiguration.
+        kwargs={
+            "autocommit": True,
+            "prepare_threshold": 0,
+            "row_factory": dict_row,
+        },
+        check=_check,
+        configure=_configure,
+        reconnect_failed=_reconnect_failed,
+        open=False,  # caller owns lifecycle via `with pool: ...`
+    )
 
 
 def run() -> None:
@@ -265,29 +362,57 @@ def run() -> None:
 
     _start_notion_sync_thread(NotionSettings(), session_factory, stop_event)
 
-    db_url = _libpq_url(DatabaseSettings().database_url)
-    with PostgresSaver.from_conn_string(db_url) as checkpointer:
-        checkpointer.setup()
-        agent = EmailAgent(
-            checkpointer=checkpointer,
-            session_factory=session_factory,
-            notifier=notifier,
-            client=client,
-            notion=notion,
-        )
-        poller = Poller(
-            client=client,
-            session_factory=session_factory,
-            handler=agent.handle_email,
-            stop_event=stop_event,
-            notifier=notifier,
-        )
-        try:
-            poller.run()
-        except CredentialRefreshError:
-            # Poller already notified and set stop_event; propagate as
-            # non-zero exit so operators know to run `reauth`.
-            sys.exit(EXIT_CREDENTIAL_FAILURE)
+    db_settings = DatabaseSettings()
+    db_url = _libpq_url(db_settings.database_url)
+    # Dedicated flag so `run()` can distinguish "pool gave up, exit 71"
+    # from "operator Ctrl+C, exit 0" without inferring from stop_event.
+    db_unreachable = threading.Event()
+    pool = _build_checkpointer_pool(
+        db_settings, db_url, stop_event, db_unreachable
+    )
+    try:
+        with pool:
+            logger.info(
+                f"checkpointer pool opened "
+                f"(min={db_settings.checkpointer_pool_min_size} "
+                f"max={db_settings.checkpointer_pool_max_size} "
+                f"max_lifetime={db_settings.checkpointer_pool_max_lifetime_seconds}s "
+                f"max_idle={db_settings.checkpointer_pool_max_idle_seconds}s)"
+            )
+            # PostgresSaver constructed with a pool is NOT a context
+            # manager (only `from_conn_string` returns one via
+            # @contextmanager). Direct construction returns a bare
+            # object whose connections' lifecycle is owned by the pool
+            # above — no separate enter/exit needed.
+            checkpointer = PostgresSaver(pool)
+            checkpointer.setup()
+            agent = EmailAgent(
+                checkpointer=checkpointer,
+                session_factory=session_factory,
+                notifier=notifier,
+                client=client,
+                notion=notion,
+            )
+            poller = Poller(
+                client=client,
+                session_factory=session_factory,
+                handler=agent.handle_email,
+                stop_event=stop_event,
+                notifier=notifier,
+            )
+            try:
+                poller.run()
+            except CredentialRefreshError:
+                # Poller already notified and set stop_event; propagate
+                # as non-zero exit so operators know to run `reauth`.
+                # Falls through to pool close.
+                sys.exit(EXIT_CREDENTIAL_FAILURE)
+    finally:
+        # Symmetric with the open INFO so `grep 'checkpointer pool'`
+        # always shows both endpoints.
+        logger.info("checkpointer pool closed")
+    if db_unreachable.is_set():
+        sys.exit(EXIT_DB_UNREACHABLE)
 
 
 def _notify_credential_failure(
