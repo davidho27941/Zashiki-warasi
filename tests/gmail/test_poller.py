@@ -8,6 +8,7 @@ D3 normal) or the per-tick cursor advance contract.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
@@ -637,3 +638,163 @@ class TestGracefulShutdown:
             f"run() took {elapsed:.2f}s — sleep was not interrupted by the "
             "stop event"
         )
+
+
+# ---------- heartbeat ----------
+
+
+class TestHeartbeat:
+    """Periodic 'poller alive, cursor=X' INFO so absence of the line
+    is itself a signal that the loop stopped. Timer uses
+    time.monotonic() so freeze/resume produces exactly one heartbeat,
+    not a burst catching up."""
+
+    def _make_poller(
+        self, mock_client, session_factory, mock_handler,
+        *, heartbeat_interval_seconds: int
+    ) -> Poller:
+        return Poller(
+            client=mock_client,
+            session_factory=session_factory,
+            handler=mock_handler,
+            interval_seconds=1,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+        )
+
+    def _prime_state(self, session_factory, history_id: int) -> None:
+        with session_factory() as session:
+            session.add(
+                GmailSyncState(email_address=EMAIL, history_id=history_id)
+            )
+            session.commit()
+
+    def test_fires_after_interval_of_noop_ticks(
+        self, mock_client, session_factory, mock_handler, caplog
+    ):
+        import time as _time
+
+        self._prime_state(session_factory, 500)
+        poller = self._make_poller(
+            mock_client, session_factory, mock_handler,
+            heartbeat_interval_seconds=0,  # will override after init
+        )
+        # Force the interval AFTER __init__ so _last_info_at reflects a
+        # real construction moment (not artificially older).
+        poller._heartbeat_interval_seconds = 0.05
+        # Also rewind the timer past the threshold so the very next
+        # tick will emit — the test shouldn't require a real sleep.
+        poller._last_info_at = _time.monotonic() - 1.0
+
+        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
+            poller._tick(EMAIL)
+
+        alive_records = [
+            r for r in caplog.records if "poller alive" in r.getMessage()
+        ]
+        assert len(alive_records) == 1
+        assert "cursor=500" in alive_records[0].getMessage()
+
+    def test_does_not_fire_within_interval(
+        self, mock_client, session_factory, mock_handler, caplog
+    ):
+        self._prime_state(session_factory, 500)
+        poller = self._make_poller(
+            mock_client, session_factory, mock_handler,
+            heartbeat_interval_seconds=100,  # much longer than test wall-clock
+        )
+        # _last_info_at freshly initialized in __init__ — well under 100s.
+        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
+            for _ in range(5):
+                poller._tick(EMAIL)
+        alive_records = [
+            r for r in caplog.records if "poller alive" in r.getMessage()
+        ]
+        assert alive_records == []
+
+    def test_advance_tick_resets_heartbeat_timer(
+        self, mock_client, session_factory, mock_handler, caplog
+    ):
+        """Any tick that already emits INFO (advance line) is
+        heartbeat-equivalent — the following no-op tick within the
+        interval must NOT double-log."""
+        import time as _time
+
+        self._prime_state(session_factory, 500)
+        poller = self._make_poller(
+            mock_client, session_factory, mock_handler,
+            heartbeat_interval_seconds=0,
+        )
+        # Set a tiny interval that would normally fire.
+        poller._heartbeat_interval_seconds = 0.05
+        poller._last_info_at = _time.monotonic() - 1.0
+
+        # First tick: process a real message → advance INFO fires and
+        # resets the timer.
+        mock_client.list_history.return_value = iter(["msg-1"])
+        mock_client.get_message.return_value = _make_email("msg-1", 600)
+
+        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
+            poller._tick(EMAIL)
+
+        first_records = [r.getMessage() for r in caplog.records]
+        assert any("tick: 1 new messages" in m for m in first_records)
+        assert not any("poller alive" in m for m in first_records), (
+            "advance tick must not double-emit heartbeat"
+        )
+
+        # Second tick immediately after: no-op, interval has NOT
+        # elapsed since the advance INFO reset the timer.
+        caplog.clear()
+        mock_client.list_history.return_value = iter([])
+        mock_client.get_message.reset_mock()
+
+        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
+            poller._tick(EMAIL)
+
+        second_records = [r.getMessage() for r in caplog.records]
+        assert not any("poller alive" in m for m in second_records)
+
+    def test_interval_zero_disables_heartbeat(
+        self, mock_client, session_factory, mock_handler, caplog
+    ):
+        import time as _time
+
+        self._prime_state(session_factory, 500)
+        poller = self._make_poller(
+            mock_client, session_factory, mock_handler,
+            heartbeat_interval_seconds=0,
+        )
+        # Even if _last_info_at is ancient, interval=0 skips the emit.
+        poller._last_info_at = _time.monotonic() - 10_000.0
+
+        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
+            for _ in range(5):
+                poller._tick(EMAIL)
+
+        assert not [
+            r for r in caplog.records if "poller alive" in r.getMessage()
+        ]
+
+    def test_heartbeat_message_names_current_cursor(
+        self, mock_client, session_factory, mock_handler, caplog
+    ):
+        """Heartbeat cursor value reflects the CURRENT state (after
+        any advance this tick), not a stale start-of-tick snapshot."""
+        import time as _time
+
+        self._prime_state(session_factory, 999)
+        poller = self._make_poller(
+            mock_client, session_factory, mock_handler,
+            heartbeat_interval_seconds=0,
+        )
+        poller._heartbeat_interval_seconds = 0.05
+        poller._last_info_at = _time.monotonic() - 1.0
+
+        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
+            poller._tick(EMAIL)
+
+        alive = [
+            r.getMessage() for r in caplog.records
+            if "poller alive" in r.getMessage()
+        ]
+        assert alive == ["poller alive, cursor=999"]

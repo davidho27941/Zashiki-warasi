@@ -12,6 +12,7 @@ from zashiki_warasi.core.config import (
     GmailSettings,
     LLMSettings,
     LoggingSettings,
+    PollerSettings,
 )
 
 
@@ -304,3 +305,40 @@ class TestLoggingSettings:
         for level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             monkeypatch.setenv("LOG_LEVEL", level)
             assert LoggingSettings().level == level
+
+
+# --- PollerSettings ---
+
+
+class TestPollerSettings:
+    """Heartbeat cadence config. Default 1200 s = one heartbeat per
+    20 min on a quiet mailbox; 0 disables entirely."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_env(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", raising=False)
+
+    def test_default_is_1200_seconds(self):
+        s = PollerSettings()
+        assert s.heartbeat_interval_seconds == 1200
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "600")
+        s = PollerSettings()
+        assert s.heartbeat_interval_seconds == 600
+
+    def test_zero_accepted_as_disable(self, monkeypatch):
+        """0 = "no heartbeat ever" — explicit disable path, must not
+        be rejected as "invalid" (that's what negative is for)."""
+        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "0")
+        s = PollerSettings()
+        assert s.heartbeat_interval_seconds == 0
+
+    def test_negative_rejected(self, monkeypatch):
+        """Fail-fast on typos / bad config. Silently falling back to
+        default would let the operator think heartbeat was on when it
+        wasn't (or vice versa)."""
+        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "-5")
+        with pytest.raises(Exception):
+            PollerSettings()

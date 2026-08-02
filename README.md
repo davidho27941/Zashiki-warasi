@@ -342,6 +342,7 @@ project root is supported via `pydantic-settings`).
 | `NOTION_SYNC_INTERVAL_SECONDS` | `300` | Background Notion→DB sync cadence; `0` disables the puller thread |
 | `LOG_LEVEL` | `INFO` | Root logger level. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive) |
 | `LOG_LEVEL_ZASHIKI` | _(inherit)_ | Level for our `zashiki_warasi.*` tree only — flip DEBUG on our code without unmuting httpx / google.auth / openai chatter |
+| `POLLER_HEARTBEAT_INTERVAL_SECONDS` | `1200` | Periodic INFO `poller alive, cursor=<id>` when no tick emits INFO. Enough that a multi-hour silence in the log is a clear "poller stopped" signal. Set to `0` to disable |
 
 Switching to `anthropic` additionally requires `uv add langchain-anthropic`.
 
@@ -365,7 +366,7 @@ $ zashiki-warasi 2>&1 | grep 'message_id=17c8f1a9b3d4e5f6'
 | Level | What you'll see | When to use |
 | --- | --- | --- |
 | `DEBUG` | Per-node entry/exit + `elapsed_ms`, decision inputs, tick heartbeats (`tick: 0 new`) | Interactive debugging session, incident triage. Do NOT leave on in production — DEBUG on `zashiki_warasi.*` is chatty (dozens of lines per message) |
-| `INFO` | State transitions worth knowing about after the fact: classified, routed, extracted, persisted, notified, tick advanced, credentials refreshed, checkpointer pool opened/closed | Default steady-state cadence |
+| `INFO` | State transitions worth knowing about after the fact: classified, routed, extracted, persisted, notified, tick advanced, credentials refreshed, checkpointer pool opened/closed, and a periodic `poller alive, cursor=<id>` heartbeat (once per `POLLER_HEARTBEAT_INTERVAL_SECONDS`) so absence of the line is itself a "loop stopped" signal | Default steady-state cadence |
 | `WARNING` | Recoverable anomalies: HistoryExpiredError rebaseline, Notion write failure marked on the row, LLM token limit hit (falls back to `AnalysisFailed`), checkpointer pool discards a stale connection | Should surface even in quiet operation — worth glancing at daily |
 | `ERROR` | A specific unit of work failed and was abandoned; poller keeps running | Always visible; typically indicates a bug or bad data |
 | `CRITICAL` | Process cannot continue without operator action: `CredentialRefreshError` (exit `78`), checkpointer pool exhausted its reconnect budget (exit `71`) | Always visible |
@@ -399,6 +400,11 @@ $ zashiki-warasi 2>&1 | grep 'message_id=17c8f1a9b3d4e5f6'
   hiccups on an incident timeline.
 - `grep 'node=' | grep 'exit '` — per-node timing across the graph
   (requires DEBUG on `zashiki_warasi.*`).
+- `grep 'poller alive'` — quick liveness check on a running instance.
+  Should appear at the configured `POLLER_HEARTBEAT_INTERVAL_SECONDS`
+  cadence; a gap much wider than that is a "loop stopped" signal
+  (past incident: 10 h silence overnight → mails piling up
+  in-mailbox unnoticed until manual restart).
 
 An unknown level (`LOG_LEVEL=verbose`) fails the process at startup
 with a clear error — silent fallback to `INFO` would let you believe
@@ -488,6 +494,18 @@ tests/                  # Pytest scaffolding (357 tests as of this branch)
   keep restarting the process, but each restart will land on the same
   bad token and exit immediately — the alert is the actionable signal,
   not the log spam.
+- **Poller loop silently stops (process throttled, macOS sleep,
+  App Nap, deep pause).** The poller emits a periodic INFO
+  `poller alive, cursor=<id>` at `POLLER_HEARTBEAT_INTERVAL_SECONDS`
+  cadence (default 20 min). The heartbeat timer uses
+  `time.monotonic()`, so if the process is truly frozen it freezes
+  with it — the log stops advancing, and the *absence* of the
+  expected line is the signal that the loop is not running. On
+  resume, exactly one heartbeat fires from the next tick (not a
+  burst catching up), so recovery reads cleanly in the log. Detection
+  is operator-side (grep, `journalctl` scroll, or an external
+  watchdog on the log stream); the app does not auto-recover from
+  this state.
 
 ## How LLM analyze failures are handled
 

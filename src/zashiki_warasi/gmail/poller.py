@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Callable, NoReturn
 
 from google.auth.exceptions import RefreshError
@@ -55,16 +56,47 @@ class Poller:
         interval_seconds: int = 30,
         stop_event: threading.Event | None = None,
         notifier: TelegramNotifier | None = None,
+        heartbeat_interval_seconds: int = 1200,
     ) -> None:
         self._client = client
         self._session_factory = session_factory
         self._handler = handler
         self._interval = interval_seconds
         self._notifier = notifier
+        # Periodic "poller alive, cursor=X" INFO so absence of a
+        # heartbeat in the log is itself an operator signal that the
+        # loop stopped. `time.monotonic()` freezes with the process
+        # (macOS sleep, App Nap, kill -STOP) — on resume, exactly one
+        # heartbeat fires from the next tick, not a catch-up burst.
+        # 0 disables. See design D2/D3.
+        self._heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._last_info_at: float = time.monotonic()
         # Exposed publicly so the app entry point can `stop_event.set()`
         # from a signal handler without holding a reference to a private
         # attribute.
         self.stop_event = stop_event or threading.Event()
+
+    def _note_info_emitted(self) -> None:
+        """Reset the heartbeat timer whenever ANY INFO event just fired
+        from the tick loop (advance INFO, heartbeat, rebaseline, etc.).
+        Prevents doubling up: a busy tick that already emitted advance
+        INFO won't also emit a heartbeat right behind it.
+        """
+        self._last_info_at = time.monotonic()
+
+    def _maybe_emit_heartbeat(self, cursor: int) -> None:
+        """Emit `poller alive, cursor=<id>` INFO if the configured
+        interval has elapsed since the last INFO. No-op when disabled
+        (interval=0) or when the timer hasn't elapsed yet."""
+        if self._heartbeat_interval_seconds <= 0:
+            return
+        if (
+            time.monotonic() - self._last_info_at
+            < self._heartbeat_interval_seconds
+        ):
+            return
+        logger.info(f"poller alive, cursor={cursor}")
+        self._note_info_emitted()
 
     def run(self) -> None:
         """Poll Gmail until `stop_event` is set, then return cleanly.
@@ -179,6 +211,7 @@ class Poller:
                 if message.history_id > max_history_id:
                     max_history_id = message.history_id
 
+        final_cursor = start
         if max_history_id > start:
             with self._session_factory() as session:
                 state = session.get(GmailSyncState, email)
@@ -189,11 +222,19 @@ class Poller:
                         f"tick: {processed_count} new messages, cursor "
                         f"{start} -> {max_history_id}"
                     )
+                    self._note_info_emitted()
+                final_cursor = state.history_id
         else:
             # Steady-state "loop alive" heartbeat — INFO would flood
             # (30s cadence × 2880/day just for zero-op ticks). DEBUG
             # keeps it visible when explicitly enabled.
             logger.debug(f"tick: 0 new, cursor unchanged at {start}")
+
+        # Periodic INFO liveness signal so a multi-hour silence in the
+        # log is itself a "poller stopped" clue. No-op when this tick
+        # already emitted advance INFO (timer just got reset) or when
+        # the heartbeat is disabled.
+        self._maybe_emit_heartbeat(final_cursor)
 
     def _process_message(self, msg_id: str) -> EmailMessage | None:
         # D1: already processed
@@ -234,3 +275,4 @@ class Poller:
         logger.info(
             f"Re-baselined to historyId={profile.history_id} for {email}"
         )
+        self._note_info_emitted()

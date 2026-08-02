@@ -122,6 +122,25 @@ class LLMSettings(BaseSettings):
     analyze_max_tokens: int = Field(default=10922, gt=0)
 
 
+class PollerSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="POLLER_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Periodic INFO "poller alive, cursor=<id>" cadence. Runs on top
+    # of the existing tick loop; if a tick already emits an advance
+    # INFO the heartbeat timer resets (no double-log). At default
+    # 1200 s a quiet mailbox produces ~72 lines/day — enough that a
+    # multi-hour silence in the log is a clear "poller stopped"
+    # signal, few enough not to drown real events.
+    # Set to 0 to disable the heartbeat entirely. Negative rejected
+    # via `ge=0` — silent fallback would mask the operator's intent.
+    heartbeat_interval_seconds: int = Field(default=1200, ge=0)
+
+
 class TelegramSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="TELEGRAM_",

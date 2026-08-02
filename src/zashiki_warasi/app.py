@@ -26,6 +26,7 @@ from zashiki_warasi.core.config import (
     DatabaseSettings,
     GmailSettings,
     NotionSettings,
+    PollerSettings,
 )
 from zashiki_warasi.core.db import get_session_factory, reset_database
 from zashiki_warasi.core.logging import configure_logging
@@ -393,12 +394,16 @@ def run() -> None:
                 client=client,
                 notion=notion,
             )
+            poller_settings = PollerSettings()
             poller = Poller(
                 client=client,
                 session_factory=session_factory,
                 handler=agent.handle_email,
                 stop_event=stop_event,
                 notifier=notifier,
+                heartbeat_interval_seconds=(
+                    poller_settings.heartbeat_interval_seconds
+                ),
             )
             try:
                 poller.run()
