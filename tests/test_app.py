@@ -12,6 +12,8 @@ from click.testing import CliRunner
 from zashiki_warasi import app
 from zashiki_warasi.app import (
     EXIT_CREDENTIAL_FAILURE,
+    EXIT_DB_UNREACHABLE,
+    _build_checkpointer_pool,
     _init_logging,
     _install_shutdown_handlers,
     _libpq_url,
@@ -354,6 +356,353 @@ class TestRunStartupCredentialFailure:
             app.run()
 
         assert exc_info.value.code == EXIT_CREDENTIAL_FAILURE
+
+
+class TestCheckpointerPoolLogging:
+    """`run()` emits INFO lines symmetric on pool open/close so
+    `grep 'checkpointer pool'` always shows both endpoints of a session
+    (aids incident timelines). `_build_checkpointer_pool` emits DEBUG
+    per new connection via the configure callback."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_run_deps(self, monkeypatch):
+        # Give `run()` a working notifier + creds + client + session
+        # so it reaches the pool block. Poller is stubbed to return
+        # immediately (empty tick) so we're not blocked on a real loop.
+        monkeypatch.setattr(
+            app, "TelegramNotifier", lambda: MagicMock()
+        )
+        monkeypatch.setattr(
+            app, "get_session_factory", lambda: MagicMock()
+        )
+        monkeypatch.setattr(
+            app, "get_credentials", MagicMock(return_value=MagicMock())
+        )
+        monkeypatch.setattr(app, "GmailClient", MagicMock())
+        monkeypatch.setattr(app, "_build_notion", lambda: None)
+        monkeypatch.setattr(
+            app, "_start_notion_sync_thread", lambda *a, **k: None
+        )
+        monkeypatch.setattr(app, "_install_shutdown_handlers", lambda _e: None)
+
+        # Fake pool + PostgresSaver as no-op context managers so `run()`
+        # can enter/exit both without touching Postgres.
+        self.fake_pool_class = MagicMock()
+        self.fake_pool_instance = MagicMock()
+        self.fake_pool_class.return_value = self.fake_pool_instance
+        self.fake_pool_instance.__enter__.return_value = self.fake_pool_instance
+        self.fake_pool_instance.__exit__.return_value = False
+        monkeypatch.setattr(app, "ConnectionPool", self.fake_pool_class)
+
+        # PostgresSaver(pool) is NOT a context manager — direct
+        # construction is fine, only from_conn_string wraps it.
+        fake_saver = MagicMock()
+        monkeypatch.setattr(app, "PostgresSaver", lambda pool: fake_saver)
+
+        # EmailAgent + Poller — the loop returns immediately.
+        fake_agent = MagicMock()
+        fake_agent.handle_email = MagicMock()
+        monkeypatch.setattr(app, "EmailAgent", lambda **kw: fake_agent)
+
+        fake_poller = MagicMock()
+        fake_poller.run.return_value = None
+        monkeypatch.setattr(app, "Poller", lambda **kw: fake_poller)
+
+    def test_run_emits_info_on_pool_open_with_resolved_params(
+        self, monkeypatch, caplog
+    ):
+        import logging as _logging
+
+        monkeypatch.setenv("DATABASE_CHECKPOINTER_POOL_MIN_SIZE", "2")
+        monkeypatch.setenv("DATABASE_CHECKPOINTER_POOL_MAX_SIZE", "8")
+        monkeypatch.setenv(
+            "DATABASE_CHECKPOINTER_POOL_MAX_LIFETIME_SECONDS", "900"
+        )
+        monkeypatch.setenv(
+            "DATABASE_CHECKPOINTER_POOL_MAX_IDLE_SECONDS", "300"
+        )
+
+        with caplog.at_level(_logging.INFO, logger="zashiki_warasi.app"):
+            app.run()
+
+        open_records = [
+            r for r in caplog.records
+            if "checkpointer pool opened" in r.getMessage()
+        ]
+        assert len(open_records) == 1
+        msg = open_records[0].getMessage()
+        # All four resolved params surface so operators can verify env
+        # overrides took effect without turning DEBUG on.
+        assert "min=2" in msg
+        assert "max=8" in msg
+        assert "max_lifetime=900" in msg
+        assert "max_idle=300" in msg
+
+    def test_run_emits_info_on_pool_close(self, caplog):
+        import logging as _logging
+
+        with caplog.at_level(_logging.INFO, logger="zashiki_warasi.app"):
+            app.run()
+
+        close_records = [
+            r for r in caplog.records
+            if "checkpointer pool closed" in r.getMessage()
+        ]
+        assert len(close_records) == 1
+
+    def test_configure_callback_logs_debug_with_application_name(
+        self, monkeypatch, caplog
+    ):
+        """`configure` runs once per newly-created pool connection.
+        Logs DEBUG naming the application_name so `pg_stat_activity`
+        entries can be cross-referenced against our own log."""
+        import logging as _logging
+
+        from zashiki_warasi.app import (
+            _CHECKPOINTER_APPLICATION_NAME,
+            _build_checkpointer_pool,
+        )
+        from zashiki_warasi.core.config import DatabaseSettings
+
+        # Capture the configure callback via the same fake-pool pattern.
+        captured: dict = {}
+
+        class _FakePool:
+            def __init__(self, conninfo, **kwargs):
+                captured.update(kwargs)
+
+            def __enter__(self): return self
+            def __exit__(self, *e): return False
+
+        monkeypatch.setattr(app, "ConnectionPool", _FakePool)
+        _build_checkpointer_pool(
+            DatabaseSettings(),
+            "postgresql://x",
+            threading.Event(),
+            threading.Event(),
+        )
+        configure = captured["configure"]
+
+        # Fake connection whose `execute` succeeds silently — SET
+        # application_name never actually reaches a real DB.
+        fake_conn = MagicMock()
+
+        with caplog.at_level(_logging.DEBUG, logger="zashiki_warasi.app"):
+            configure(fake_conn)
+
+        # `SET` doesn't accept `%s` params in Postgres (utility
+        # statement) — we route through `set_config()` instead.
+        fake_conn.execute.assert_called_once_with(
+            "SELECT set_config('application_name', %s, false)",
+            (_CHECKPOINTER_APPLICATION_NAME,),
+        )
+        # And we logged the fact.
+        assert any(
+            "checkpointer conn created" in r.getMessage()
+            and _CHECKPOINTER_APPLICATION_NAME in r.getMessage()
+            for r in caplog.records
+        )
+
+
+class TestRunWiresPollerHeartbeat:
+    """`run()` reads `PollerSettings.heartbeat_interval_seconds` from
+    env and passes it into `Poller(...)`. Pin this so the env override
+    can't silently be dropped by a future refactor."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_run_deps(self, monkeypatch):
+        # Same run() stubs as TestCheckpointerPoolLogging above —
+        # everything faked so we reach the Poller construction.
+        monkeypatch.setattr(app, "TelegramNotifier", lambda: MagicMock())
+        monkeypatch.setattr(app, "get_session_factory", lambda: MagicMock())
+        monkeypatch.setattr(
+            app, "get_credentials", MagicMock(return_value=MagicMock())
+        )
+        monkeypatch.setattr(app, "GmailClient", MagicMock())
+        monkeypatch.setattr(app, "_build_notion", lambda: None)
+        monkeypatch.setattr(
+            app, "_start_notion_sync_thread", lambda *a, **k: None
+        )
+        monkeypatch.setattr(app, "_install_shutdown_handlers", lambda _e: None)
+
+        fake_pool = MagicMock()
+        fake_pool.__enter__.return_value = fake_pool
+        fake_pool.__exit__.return_value = False
+        monkeypatch.setattr(app, "ConnectionPool", lambda *a, **k: fake_pool)
+        monkeypatch.setattr(app, "PostgresSaver", lambda pool: MagicMock())
+        monkeypatch.setattr(app, "EmailAgent", lambda **kw: MagicMock())
+
+        # Capture whatever kwargs `run()` passes into Poller(...) so we
+        # can assert the heartbeat setting round-tripped.
+        self.captured_kwargs: dict = {}
+
+        def _fake_poller(**kw):
+            self.captured_kwargs.update(kw)
+            fake = MagicMock()
+            fake.run.return_value = None
+            return fake
+
+        monkeypatch.setattr(app, "Poller", _fake_poller)
+
+    def test_default_interval_reaches_poller(self, monkeypatch):
+        monkeypatch.delenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", raising=False)
+        app.run()
+        assert self.captured_kwargs["heartbeat_interval_seconds"] == 1200
+
+    def test_env_override_reaches_poller(self, monkeypatch):
+        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "600")
+        app.run()
+        assert self.captured_kwargs["heartbeat_interval_seconds"] == 600
+
+    def test_zero_reaches_poller_and_disables(self, monkeypatch):
+        """`=0` is a valid config that disables the heartbeat — must
+        propagate as-is to Poller (which knows to no-op on 0), not be
+        rewritten to a "sensible" default along the way."""
+        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "0")
+        app.run()
+        assert self.captured_kwargs["heartbeat_interval_seconds"] == 0
+
+
+class TestBuildCheckpointerPool:
+    """`_build_checkpointer_pool` constructs a psycopg-pool `ConnectionPool`
+    parameterized from DatabaseSettings with LangGraph-required kwargs
+    (autocommit, dict_row, prepare_threshold=0), and the three callbacks
+    (check, configure, reconnect_failed) wired to our logging + shutdown
+    plumbing. Tests spy on the ConnectionPool constructor so we don't
+    need a real Postgres to run them."""
+
+    def _capture_pool_kwargs(self, monkeypatch):
+        captured: dict = {}
+
+        class _FakePool:
+            def __init__(self, conninfo, **kwargs):
+                captured["conninfo"] = conninfo
+                captured.update(kwargs)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(app, "ConnectionPool", _FakePool)
+        return captured
+
+    def test_pool_sized_from_settings(self, monkeypatch):
+        from zashiki_warasi.core.config import DatabaseSettings
+
+        captured = self._capture_pool_kwargs(monkeypatch)
+        settings = DatabaseSettings(
+            checkpointer_pool_min_size=2,
+            checkpointer_pool_max_size=7,
+            checkpointer_pool_max_lifetime_seconds=900,
+            checkpointer_pool_max_idle_seconds=300,
+        )
+        _build_checkpointer_pool(
+            settings, "postgresql://x", threading.Event(), threading.Event()
+        )
+        assert captured["min_size"] == 2
+        assert captured["max_size"] == 7
+        assert captured["max_lifetime"] == 900
+        assert captured["max_idle"] == 300
+
+    def test_pool_receives_langgraph_required_conn_kwargs(self, monkeypatch):
+        """PostgresSaver requires autocommit + dict_row row_factory +
+        prepare_threshold=0 on every connection. Wired via `kwargs`
+        so freshly-provisioned pool connections come pre-configured."""
+        from psycopg.rows import dict_row
+        from zashiki_warasi.core.config import DatabaseSettings
+
+        captured = self._capture_pool_kwargs(monkeypatch)
+        _build_checkpointer_pool(
+            DatabaseSettings(),
+            "postgresql://x",
+            threading.Event(),
+            threading.Event(),
+        )
+        assert captured["kwargs"]["autocommit"] is True
+        assert captured["kwargs"]["prepare_threshold"] == 0
+        assert captured["kwargs"]["row_factory"] is dict_row
+
+    def test_pool_opens_lazily(self, monkeypatch):
+        """`open=False` — caller owns the `with pool:` block. If pool
+        opened eagerly we'd race with the caller's context-manager
+        exit ordering (checkpointer must flush before pool closes)."""
+        from zashiki_warasi.core.config import DatabaseSettings
+
+        captured = self._capture_pool_kwargs(monkeypatch)
+        _build_checkpointer_pool(
+            DatabaseSettings(),
+            "postgresql://x",
+            threading.Event(),
+            threading.Event(),
+        )
+        assert captured["open"] is False
+
+    def test_check_callback_reraises_and_logs_warning(self, monkeypatch, caplog):
+        import logging
+
+        from zashiki_warasi.core.config import DatabaseSettings
+
+        captured = self._capture_pool_kwargs(monkeypatch)
+        _build_checkpointer_pool(
+            DatabaseSettings(),
+            "postgresql://x",
+            threading.Event(),
+            threading.Event(),
+        )
+        check = captured["check"]
+
+        # Stub the underlying builtin so we can force a "stale" outcome
+        # without a live Postgres.
+        stub_check = MagicMock(side_effect=RuntimeError("dead conn"))
+        monkeypatch.setattr(
+            "psycopg_pool.ConnectionPool.check_connection", stub_check
+        )
+
+        with caplog.at_level(logging.WARNING, logger="zashiki_warasi.app"):
+            with pytest.raises(RuntimeError, match="dead conn"):
+                check(MagicMock())
+
+        # Load-bearing: pool's discard path is triggered by the raised
+        # exception — swallowing would leave the dead conn in circulation.
+        stub_check.assert_called_once()
+        assert any(
+            "discarded stale connection" in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_reconnect_failed_callback_sets_flag_and_logs_critical(
+        self, monkeypatch, caplog
+    ):
+        import logging
+
+        from zashiki_warasi.core.config import DatabaseSettings
+
+        captured = self._capture_pool_kwargs(monkeypatch)
+        stop_event = threading.Event()
+        unreachable = threading.Event()
+        _build_checkpointer_pool(
+            DatabaseSettings(), "postgresql://x", stop_event, unreachable
+        )
+        reconnect_failed = captured["reconnect_failed"]
+
+        fake_pool = MagicMock()
+        fake_pool.reconnect_timeout = 300
+
+        with caplog.at_level(logging.CRITICAL, logger="zashiki_warasi.app"):
+            reconnect_failed(fake_pool)
+
+        assert unreachable.is_set()
+        assert stop_event.is_set()
+        critical_msgs = [
+            r.getMessage()
+            for r in caplog.records
+            if r.levelno == logging.CRITICAL
+        ]
+        assert any(
+            "reconnect failed" in m and "300s" in m for m in critical_msgs
+        )
 
 
 class TestSyncNotionCommand:

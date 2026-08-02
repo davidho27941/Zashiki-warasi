@@ -322,7 +322,11 @@ project root is supported via `pydantic-settings`).
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | `postgresql+psycopg://localhost/zashiki_warasi` | SQLAlchemy connection string |
+| `DATABASE_URL` | `postgresql+psycopg://localhost/zashiki_warasi` | Postgres connection string. Consumed by both the SQLAlchemy engine (app tables) and the LangGraph checkpointer connection pool (below) — same DB, two distinct client stacks |
+| `DATABASE_CHECKPOINTER_POOL_MIN_SIZE` | `1` | Connections kept warm in the checkpointer pool at all times |
+| `DATABASE_CHECKPOINTER_POOL_MAX_SIZE` | `5` | Hard cap on concurrent checkpointer connections. Must be `>= MIN_SIZE` |
+| `DATABASE_CHECKPOINTER_POOL_MAX_LIFETIME_SECONDS` | `1800` | Force-recycle checkpointer connections older than this. Matches the SQLAlchemy engine's `pool_recycle` for consistency |
+| `DATABASE_CHECKPOINTER_POOL_MAX_IDLE_SECONDS` | `600` | Recycle idle checkpointer connections. Sized below typical NAT eviction windows (5-15 min) so the pool retires the connection before the router silently drops it |
 | `GMAIL_CREDENTIALS_PATH` | `credentials.json` | OAuth client secrets JSON |
 | `GMAIL_TOKEN_PATH` | `~/.config/zashiki-warasi/token.json` | Cached user token |
 | `GMAIL_SCOPES` | `https://www.googleapis.com/auth/gmail.readonly` | Comma-separated OAuth scopes |
@@ -338,6 +342,7 @@ project root is supported via `pydantic-settings`).
 | `NOTION_SYNC_INTERVAL_SECONDS` | `300` | Background Notion→DB sync cadence; `0` disables the puller thread |
 | `LOG_LEVEL` | `INFO` | Root logger level. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive) |
 | `LOG_LEVEL_ZASHIKI` | _(inherit)_ | Level for our `zashiki_warasi.*` tree only — flip DEBUG on our code without unmuting httpx / google.auth / openai chatter |
+| `POLLER_HEARTBEAT_INTERVAL_SECONDS` | `1200` | Periodic INFO `poller alive, cursor=<id>` when no tick emits INFO. Enough that a multi-hour silence in the log is a clear "poller stopped" signal. Set to `0` to disable |
 
 Switching to `anthropic` additionally requires `uv add langchain-anthropic`.
 
@@ -361,10 +366,10 @@ $ zashiki-warasi 2>&1 | grep 'message_id=17c8f1a9b3d4e5f6'
 | Level | What you'll see | When to use |
 | --- | --- | --- |
 | `DEBUG` | Per-node entry/exit + `elapsed_ms`, decision inputs, tick heartbeats (`tick: 0 new`) | Interactive debugging session, incident triage. Do NOT leave on in production — DEBUG on `zashiki_warasi.*` is chatty (dozens of lines per message) |
-| `INFO` | State transitions worth knowing about after the fact: classified, routed, extracted, persisted, notified, tick advanced, credentials refreshed | Default steady-state cadence |
-| `WARNING` | Recoverable anomalies: HistoryExpiredError rebaseline, Notion write failure marked on the row, LLM token limit hit (falls back to `AnalysisFailed`) | Should surface even in quiet operation — worth glancing at daily |
+| `INFO` | State transitions worth knowing about after the fact: classified, routed, extracted, persisted, notified, tick advanced, credentials refreshed, checkpointer pool opened/closed, and a periodic `poller alive, cursor=<id>` heartbeat (once per `POLLER_HEARTBEAT_INTERVAL_SECONDS`) so absence of the line is itself a "loop stopped" signal | Default steady-state cadence |
+| `WARNING` | Recoverable anomalies: HistoryExpiredError rebaseline, Notion write failure marked on the row, LLM token limit hit (falls back to `AnalysisFailed`), checkpointer pool discards a stale connection | Should surface even in quiet operation — worth glancing at daily |
 | `ERROR` | A specific unit of work failed and was abandoned; poller keeps running | Always visible; typically indicates a bug or bad data |
-| `CRITICAL` | Process cannot continue without operator action: `CredentialRefreshError`, Postgres lost | Always visible; exit code `78` follows |
+| `CRITICAL` | Process cannot continue without operator action: `CredentialRefreshError` (exit `78`), checkpointer pool exhausted its reconnect budget (exit `71`) | Always visible |
 
 ### Two knobs, one common recipe
 
@@ -377,13 +382,29 @@ $ zashiki-warasi 2>&1 | grep 'message_id=17c8f1a9b3d4e5f6'
 - **Full firehose:**
   `LOG_LEVEL=DEBUG` — DEBUG on everything we own. The hard-coded
   WARNING pins on `httpx` / `httpcore` / `urllib3` / `google.auth` /
-  `google_auth_httplib2` / `openai._base_client` / `httpx._client`
-  stay in effect (they would otherwise dominate the output during a
-  Gmail history burst). To unmute one of those for a specific
-  investigation, override with e.g.
+  `google_auth_httplib2` / `openai._base_client` / `httpx._client` /
+  `psycopg.pool` stay in effect (they would otherwise dominate the
+  output during a Gmail history burst). To unmute one of those for
+  a specific investigation, override with e.g.
   `python -c "import logging; logging.getLogger('httpx').setLevel(logging.DEBUG)"`
   in a shell before importing the app — or add a targeted env knob
   in a follow-up change.
+
+**Grep recipes:**
+
+- `grep 'message_id=<gmail_id>'` — one email's full lifecycle across
+  modules (shown above).
+- `grep 'checkpointer pool'` — full lifetime of the LangGraph
+  checkpointer pool: `pool opened (…)` → any `discarded stale
+  connection` events → `pool closed`. Useful when investigating DB
+  hiccups on an incident timeline.
+- `grep 'node=' | grep 'exit '` — per-node timing across the graph
+  (requires DEBUG on `zashiki_warasi.*`).
+- `grep 'poller alive'` — quick liveness check on a running instance.
+  Should appear at the configured `POLLER_HEARTBEAT_INTERVAL_SECONDS`
+  cadence; a gap much wider than that is a "loop stopped" signal
+  (past incident: 10 h silence overnight → mails piling up
+  in-mailbox unnoticed until manual restart).
 
 An unknown level (`LOG_LEVEL=verbose`) fails the process at startup
 with a clear error — silent fallback to `INFO` would let you believe
@@ -450,6 +471,19 @@ tests/                  # Pytest scaffolding (357 tests as of this branch)
   `pool_pre_ping=True` + `pool_recycle=1800` so a connection killed by
   a router NAT eviction is detected on checkout and replaced instead of
   crashing the next query.
+- **LangGraph checkpointer connection dropped mid-run.** The
+  checkpointer's Postgres connection is wired through a
+  `psycopg_pool.ConnectionPool` (env-tunable via
+  `DATABASE_CHECKPOINTER_POOL_*`, see Configuration). Every checkout
+  runs a `SELECT 1` health check; a stale connection is discarded
+  and a fresh one provisioned, logged as one WARNING
+  (`checkpointer pool: discarded stale connection, reconnecting`) —
+  no manual restart, no missed history batch beyond the tick that
+  was in flight. If the DB stays unreachable for longer than the
+  pool's `reconnect_timeout` (default 300 s), the pool's
+  `reconnect_failed` callback logs CRITICAL and the process exits
+  with code `71` (`EX_OSERR`) so `restart: on-failure` in Docker /
+  systemd kicks in without our own retry loop competing.
 - **Gmail OAuth refresh token expired or revoked.** A `RefreshError`
   from Google's auth library is unrecoverable in-process — retrying the
   same refresh will always fail and would just hammer the token
@@ -460,6 +494,18 @@ tests/                  # Pytest scaffolding (357 tests as of this branch)
   keep restarting the process, but each restart will land on the same
   bad token and exit immediately — the alert is the actionable signal,
   not the log spam.
+- **Poller loop silently stops (process throttled, macOS sleep,
+  App Nap, deep pause).** The poller emits a periodic INFO
+  `poller alive, cursor=<id>` at `POLLER_HEARTBEAT_INTERVAL_SECONDS`
+  cadence (default 20 min). The heartbeat timer uses
+  `time.monotonic()`, so if the process is truly frozen it freezes
+  with it — the log stops advancing, and the *absence* of the
+  expected line is the signal that the loop is not running. On
+  resume, exactly one heartbeat fires from the next tick (not a
+  burst catching up), so recovery reads cleanly in the log. Detection
+  is operator-side (grep, `journalctl` scroll, or an external
+  watchdog on the log stream); the app does not auto-recover from
+  this state.
 
 ## How LLM analyze failures are handled
 

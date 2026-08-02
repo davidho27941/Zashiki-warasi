@@ -39,6 +39,11 @@ _CHATTY_THIRD_PARTY_LOGGERS: tuple[str, ...] = (
     "google_auth_httplib2",
     "openai._base_client",
     "httpx._client",
+    # psycopg-pool logs INFO on every pool open/resize/close and DEBUG
+    # on every connection lifecycle event. We own our checkpointer
+    # pool's INFO lines in `zashiki_warasi.app`, so muting the library
+    # keeps our format consistent and avoids double-signaling.
+    "psycopg.pool",
 )
 
 # Allowlist of `extra` keys the formatter will render inside the

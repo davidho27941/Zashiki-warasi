@@ -12,6 +12,7 @@ from zashiki_warasi.core.config import (
     GmailSettings,
     LLMSettings,
     LoggingSettings,
+    PollerSettings,
 )
 
 
@@ -91,6 +92,90 @@ class TestDatabaseSettings:
         )
         s = DatabaseSettings()
         assert s.database_url == "postgresql+psycopg://user:pw@db.example/zw"
+
+    # --- checkpointer pool tunables ---
+
+    def _clean_env(self, monkeypatch):
+        for var in (
+            "DATABASE_CHECKPOINTER_POOL_MIN_SIZE",
+            "DATABASE_CHECKPOINTER_POOL_MAX_SIZE",
+            "DATABASE_CHECKPOINTER_POOL_MAX_LIFETIME_SECONDS",
+            "DATABASE_CHECKPOINTER_POOL_MAX_IDLE_SECONDS",
+        ):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_pool_defaults(self, monkeypatch, tmp_path):
+        """Sized for a single-threaded homelab poller. max_idle=600 sits
+        below typical NAT eviction windows (5-15 min); max_lifetime=1800
+        matches SQLAlchemy engine's pool_recycle for consistency."""
+        monkeypatch.chdir(tmp_path)
+        self._clean_env(monkeypatch)
+        s = DatabaseSettings()
+        assert s.checkpointer_pool_min_size == 1
+        assert s.checkpointer_pool_max_size == 5
+        assert s.checkpointer_pool_max_lifetime_seconds == 1800.0
+        assert s.checkpointer_pool_max_idle_seconds == 600.0
+
+    def test_pool_min_size_env_override(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("DATABASE_CHECKPOINTER_POOL_MIN_SIZE", "3")
+        s = DatabaseSettings()
+        assert s.checkpointer_pool_min_size == 3
+
+    def test_pool_max_size_env_override(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("DATABASE_CHECKPOINTER_POOL_MAX_SIZE", "10")
+        s = DatabaseSettings()
+        assert s.checkpointer_pool_max_size == 10
+
+    def test_pool_max_lifetime_env_override(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv(
+            "DATABASE_CHECKPOINTER_POOL_MAX_LIFETIME_SECONDS", "3600"
+        )
+        s = DatabaseSettings()
+        assert s.checkpointer_pool_max_lifetime_seconds == 3600.0
+
+    def test_pool_max_idle_env_override(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv(
+            "DATABASE_CHECKPOINTER_POOL_MAX_IDLE_SECONDS", "300"
+        )
+        s = DatabaseSettings()
+        assert s.checkpointer_pool_max_idle_seconds == 300.0
+
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "DATABASE_CHECKPOINTER_POOL_MIN_SIZE",
+            "DATABASE_CHECKPOINTER_POOL_MAX_SIZE",
+            "DATABASE_CHECKPOINTER_POOL_MAX_LIFETIME_SECONDS",
+            "DATABASE_CHECKPOINTER_POOL_MAX_IDLE_SECONDS",
+        ],
+    )
+    def test_pool_field_rejects_zero(self, monkeypatch, tmp_path, field):
+        """gt=0 constraint — a zero would either starve the pool
+        (min_size=0 + max_size=0 → nothing to hand out) or silently
+        defeat recycling (max_lifetime=0)."""
+        monkeypatch.chdir(tmp_path)
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv(field, "0")
+        with pytest.raises(Exception):
+            DatabaseSettings()
+
+    def test_pool_max_smaller_than_min_rejected(self, monkeypatch, tmp_path):
+        """max < min would deadlock the pool at open() — can't
+        provision `min_size` connections without exceeding `max_size`."""
+        monkeypatch.chdir(tmp_path)
+        self._clean_env(monkeypatch)
+        monkeypatch.setenv("DATABASE_CHECKPOINTER_POOL_MIN_SIZE", "5")
+        monkeypatch.setenv("DATABASE_CHECKPOINTER_POOL_MAX_SIZE", "1")
+        with pytest.raises(Exception, match="must be >="):
+            DatabaseSettings()
 
 
 # --- LLMSettings ---
@@ -220,3 +305,40 @@ class TestLoggingSettings:
         for level in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"):
             monkeypatch.setenv("LOG_LEVEL", level)
             assert LoggingSettings().level == level
+
+
+# --- PollerSettings ---
+
+
+class TestPollerSettings:
+    """Heartbeat cadence config. Default 1200 s = one heartbeat per
+    20 min on a quiet mailbox; 0 disables entirely."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_env(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", raising=False)
+
+    def test_default_is_1200_seconds(self):
+        s = PollerSettings()
+        assert s.heartbeat_interval_seconds == 1200
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "600")
+        s = PollerSettings()
+        assert s.heartbeat_interval_seconds == 600
+
+    def test_zero_accepted_as_disable(self, monkeypatch):
+        """0 = "no heartbeat ever" — explicit disable path, must not
+        be rejected as "invalid" (that's what negative is for)."""
+        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "0")
+        s = PollerSettings()
+        assert s.heartbeat_interval_seconds == 0
+
+    def test_negative_rejected(self, monkeypatch):
+        """Fail-fast on typos / bad config. Silently falling back to
+        default would let the operator think heartbeat was on when it
+        wasn't (or vice versa)."""
+        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "-5")
+        with pytest.raises(Exception):
+            PollerSettings()
