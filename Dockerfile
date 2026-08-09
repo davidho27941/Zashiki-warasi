@@ -71,7 +71,14 @@ ENV PATH="/app/.venv/bin:${PATH}" \
     GMAIL_CREDENTIALS_PATH=/secrets/credentials.json \
     GMAIL_TOKEN_PATH=/data/token.json \
     HTTP_BIND_HOST=0.0.0.0 \
-    HTTP_BIND_PORT=8080
+    HTTP_BIND_PORT=8080 \
+    # Google's token endpoint returns ALL scopes previously granted to
+    # the user/client pair — often a superset of what we asked for
+    # (e.g. Drive scopes from a prior consent). oauthlib's strict
+    # scope-match then rejects the token with `Scope has changed`.
+    # This env var (documented by google-auth-oauthlib) relaxes the
+    # check to a warning. See docs/oauth-redirect-uri.md.
+    OAUTHLIB_RELAX_TOKEN_SCOPE=1
 
 USER zashiki
 EXPOSE 8080

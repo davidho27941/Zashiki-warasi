@@ -10,13 +10,21 @@ lifespan, CLI entry) via `build_services()`; torn down via
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 
-from langgraph.checkpoint.postgres import PostgresSaver
-from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
-from sqlalchemy.orm import sessionmaker
+# Set BEFORE any oauthlib import path fires. Google's token endpoint
+# returns every scope previously granted to the user/client pair —
+# often a superset of what we asked for. oauthlib's default is to
+# reject the token with `Scope has changed`; the env var relaxes it
+# to a warning. Container ENV takes precedence when both are set.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
+from langgraph.checkpoint.postgres import PostgresSaver  # noqa: E402
+from psycopg.rows import dict_row  # noqa: E402
+from psycopg_pool import ConnectionPool  # noqa: E402
+from sqlalchemy.orm import sessionmaker  # noqa: E402
 
 from zashiki_warasi.agents.email_agent import EmailAgent
 from zashiki_warasi.coordination.oauth_flow_store import (

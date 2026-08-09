@@ -174,6 +174,20 @@ curl -X POST http://<your-service>:8080/reauth -H "X-API-Key: $HTTP_API_KEY"
   BOTH the URI Google received and the URI you registered — a
   character-diff of the two tells you what to fix (common: trailing
   slash, wrong port, `http` vs `https`).
+- **`fetch_token_failed: (invalid_grant) Missing code verifier`:**
+  the OAuth flow store lost the PKCE `code_verifier` between
+  `/auth/start` and `/auth/callback`. Should not happen in v1.0 —
+  fixed by persisting `code_verifier` in the flow store's JSON
+  payload. If you hit this on a build older than the fix, rebuild.
+- **`fetch_token_failed: Scope has changed from "..." to "..."`:**
+  Google's token endpoint returned every scope previously granted
+  to your Google account for this OAuth client — often a superset
+  of what the app asks for (e.g. Drive scopes from a past consent).
+  oauthlib rejects the mismatch by default. Set the environment
+  variable `OAUTHLIB_RELAX_TOKEN_SCOPE=1` to downgrade the check to
+  a warning. The container image and `build_services()` already set
+  this via `os.environ.setdefault`; only worth touching if you're
+  running an old build or a bare CLI outside the container.
 
 ## Rotating and adding URIs
 
