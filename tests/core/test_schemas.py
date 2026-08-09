@@ -75,3 +75,54 @@ class TestImportanceCoercion:
         # Unmappable labels surface as validation error so we know.
         with pytest.raises(Exception):
             _make("definitely not a level")
+
+
+# --- AnalysisFailed ---
+
+
+class TestAnalysisFailedReasons:
+    """`reason` is a Literal with two variants, each mapping to a
+    distinct operator remediation. Test both round-trip and reject
+    unknown values so a typo in code doesn't silently coerce."""
+
+    def test_content_too_long_roundtrip(self):
+        from zashiki_warasi.core.schemas import AnalysisFailed
+
+        af = AnalysisFailed(
+            reason="content_too_long",
+            detail="prompt=1745 completion=31023",
+        )
+        assert af.kind == "analysis_failed"
+        assert af.reason == "content_too_long"
+        assert af.detail == "prompt=1745 completion=31023"
+
+    def test_prompt_too_long_roundtrip(self):
+        """New variant added by handle-analyze-prompt-overflow. Same
+        shape as content_too_long, different Literal value so the
+        formatter can branch cleanly."""
+        from zashiki_warasi.core.schemas import AnalysisFailed
+
+        af = AnalysisFailed(
+            reason="prompt_too_long",
+            detail="prompt=58245 n_ctx=32768",
+        )
+        assert af.kind == "analysis_failed"
+        assert af.reason == "prompt_too_long"
+        assert af.detail == "prompt=58245 n_ctx=32768"
+
+    def test_unknown_reason_rejected(self):
+        """Guard against typos ("prompt_to_long", "content_too_ling",
+        etc.) — Literal must fail-fast at construction, not silently
+        accept."""
+        from zashiki_warasi.core.schemas import AnalysisFailed
+
+        with pytest.raises(Exception):
+            AnalysisFailed(reason="prompt_to_long")  # typo
+
+    def test_detail_optional(self):
+        """detail can be None — some failure modes may not have a
+        useful numeric summary to attach."""
+        from zashiki_warasi.core.schemas import AnalysisFailed
+
+        af = AnalysisFailed(reason="prompt_too_long")
+        assert af.detail is None

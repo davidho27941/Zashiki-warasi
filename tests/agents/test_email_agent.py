@@ -66,6 +66,29 @@ def _make_length_finish_error(
     return LengthFinishReasonError(completion=completion)
 
 
+def _make_bad_request_error(body: dict, message: str = "Bad Request"):
+    """Build a real `openai.BadRequestError` — its constructor requires
+    a real `httpx.Response` because internal `.status_code` /
+    `.headers` / `.text` accesses happen. Synthesise the minimum
+    viable request/response pair from httpx primitives; do NOT reach
+    for MagicMock because openai's `APIStatusError.__init__` calls
+    `response.request.url` etc.
+    """
+    import json as _json
+
+    import httpx
+    from openai import BadRequestError
+
+    request = httpx.Request("POST", "http://test/v1/chat/completions")
+    response = httpx.Response(
+        status_code=400,
+        request=request,
+        headers={"content-type": "application/json"},
+        content=_json.dumps(body).encode("utf-8"),
+    )
+    return BadRequestError(message=message, response=response, body=body)
+
+
 @dataclass
 class MockChat:
     """Bundle returned by the mock_chat_model fixture.
@@ -932,7 +955,11 @@ class TestAnalyzeFailure:
         mock_notifier.send_message.assert_called_once()
         text = mock_notifier.send_message.call_args.args[0]
         assert "LLM 分析失敗" in text
-        assert "token 上限" in text
+        # New reason-specific wording — names the physical failure
+        # (finish_reason=length output truncation) so operator
+        # remediation is distinct from the prompt-overflow variant.
+        assert "產出被截斷" in text
+        assert "finish_reason=length" in text
         # Detail (prompt/completion token counts) is surfaced so the
         # user can eyeball whether it's a genuinely huge email or a
         # runaway generation.
@@ -964,6 +991,157 @@ class TestAnalyzeFailure:
         structured.invoke.assert_called_once()
 
 
+class TestAnalyzePromptOverflow:
+    """`_analyze` must catch the prompt-context-overflow flavor of
+    `openai.BadRequestError` (input alone > model context) and emit
+    `AnalysisFailed(reason="prompt_too_long")`, parallel to how it
+    already handles `LengthFinishReasonError`. Any OTHER 400 must
+    propagate — swallowing a real bug (auth, tool schema) as
+    AnalysisFailed would silently mask it forever."""
+
+    def _agent_that_raises(
+        self, monkeypatch, session_factory, mock_notifier, mock_client,
+        exc,
+    ):
+        structured = MagicMock(name="structured_output")
+        structured.invoke.side_effect = exc
+        model = MagicMock(name="chat_model")
+        model.with_structured_output.return_value = structured
+        monkeypatch.setattr(
+            "zashiki_warasi.agents.email_agent.get_chat_model",
+            lambda *a, **kw: model,
+        )
+        return EmailAgent(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            notifier=mock_notifier,
+            client=mock_client,
+        )
+
+    def test_llama_cpp_context_overflow_produces_analysis_failed(
+        self, monkeypatch, session_factory, mock_notifier,
+        mock_client, fake_email,
+    ):
+        """08-02 verbatim payload — llama-cpp-server 400 with
+        structured n_prompt_tokens/n_ctx."""
+        exc = _make_bad_request_error({
+            "error": {
+                "code": 400,
+                "message": "request (58245 tokens) exceeds the "
+                           "available context size (32768 tokens)",
+                "type": "exceed_context_size_error",
+                "n_prompt_tokens": 58245,
+                "n_ctx": 32768,
+            }
+        })
+        agent = self._agent_that_raises(
+            monkeypatch, session_factory, mock_notifier, mock_client, exc,
+        )
+        # Must not raise — graph completes with AnalysisFailed side_effect.
+        agent.handle_email(fake_email)
+
+        # Telegram was called with the prompt_too_long-flavored body.
+        mock_notifier.send_message.assert_called_once()
+        text = mock_notifier.send_message.call_args.args[0]
+        assert "58245" in text
+        assert "32768" in text
+        # Formatter picked the prompt_too_long branch, not content_too_long.
+        # If detail bled through without the reason-specific line, this
+        # would fail — proves the plumbing not just the message shape.
+        assert "上下文" in text
+        assert "產出被截斷" not in text
+
+    def test_openai_context_overflow_produces_analysis_failed(
+        self, monkeypatch, session_factory, mock_notifier,
+        mock_client, fake_email,
+    ):
+        """OpenAI-official code path (no n_prompt_tokens field)."""
+        exc = _make_bad_request_error({
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "This model's maximum context length is "
+                           "8192 tokens. However, your messages "
+                           "resulted in 12345 tokens.",
+                "type": "invalid_request_error",
+            }
+        })
+        agent = self._agent_that_raises(
+            monkeypatch, session_factory, mock_notifier, mock_client, exc,
+        )
+        agent.handle_email(fake_email)
+
+        mock_notifier.send_message.assert_called_once()
+        text = mock_notifier.send_message.call_args.args[0]
+        # Falls back to message text, which carries the counts.
+        assert "8192" in text or "12345" in text
+
+    def test_unrelated_400_propagates(
+        self, monkeypatch, session_factory, mock_notifier,
+        mock_client, fake_email,
+    ):
+        """Auth-style 400 must NOT be swallowed — silently treating
+        it as AnalysisFailed would mask a real credential/config bug
+        forever."""
+        from openai import BadRequestError
+
+        exc = _make_bad_request_error({
+            "error": {
+                "code": "invalid_api_key",
+                "message": "Incorrect API key provided",
+                "type": "invalid_request_error",
+            }
+        })
+        agent = self._agent_that_raises(
+            monkeypatch, session_factory, mock_notifier, mock_client, exc,
+        )
+        with pytest.raises(BadRequestError):
+            agent.handle_email(fake_email)
+
+        # No AnalysisFailed emission → no Telegram.
+        mock_notifier.send_message.assert_not_called()
+
+    def test_prompt_overflow_does_not_persist_analysis(
+        self, monkeypatch, session_factory, mock_notifier,
+        mock_client, fake_email,
+    ):
+        """Analyze failure must not pollute email_analyses — same
+        guarantee as LengthFinishReasonError path."""
+        exc = _make_bad_request_error({
+            "error": {
+                "type": "exceed_context_size_error",
+                "n_prompt_tokens": 58245,
+                "n_ctx": 32768,
+                "message": "request exceeds context",
+            }
+        })
+        agent = self._agent_that_raises(
+            monkeypatch, session_factory, mock_notifier, mock_client, exc,
+        )
+        agent.handle_email(fake_email)
+        assert _count_analyses(session_factory) == 0
+
+    def test_prompt_overflow_only_calls_llm_once(
+        self, monkeypatch, session_factory, mock_notifier,
+        mock_client, fake_email,
+    ):
+        """Regression guard: graph must not retry the analyze node
+        after the 400 — a retry would just re-raise the same 400
+        every ~30 s until Gmail retention rolls the mail off."""
+        exc = _make_bad_request_error({
+            "error": {
+                "type": "exceed_context_size_error",
+                "n_prompt_tokens": 58245,
+                "n_ctx": 32768,
+                "message": "request exceeds context",
+            }
+        })
+        agent = self._agent_that_raises(
+            monkeypatch, session_factory, mock_notifier, mock_client, exc,
+        )
+        agent.handle_email(fake_email)
+        agent._analyze_model.invoke.assert_called_once()
+
+
 class TestFormatAnalysisFailed:
     """Direct tests on the formatter — subject / sender injection
     guard and reason text coverage."""
@@ -981,6 +1159,8 @@ class TestFormatAnalysisFailed:
         return EmailMessage(**base)
 
     def test_content_too_long_reason_renders(self):
+        """Output-truncation flavor: message names finish_reason=length
+        so operator distinguishes from prompt-overflow at a glance."""
         from zashiki_warasi.agents.email_agent import (
             _format_analysis_failed,
         )
@@ -992,8 +1172,51 @@ class TestFormatAnalysisFailed:
         text = _format_analysis_failed(self._email(), effect)
         assert "⚠️" in text
         assert "LLM 分析失敗" in text
-        assert "token 上限" in text
+        assert "產出被截斷" in text
+        assert "finish_reason=length" in text
         assert "prompt=31059" in text
+        assert "手動" in text
+
+    def test_prompt_too_long_reason_renders(self):
+        """Input-overflow flavor: distinct message so operator knows
+        the mail is too big rather than the LLM misbehaving."""
+        from zashiki_warasi.agents.email_agent import (
+            _format_analysis_failed,
+        )
+
+        effect = AnalysisFailed(
+            reason="prompt_too_long",
+            detail="prompt=58245 n_ctx=32768",
+        )
+        text = _format_analysis_failed(self._email(), effect)
+        assert "⚠️" in text
+        assert "LLM 分析失敗" in text
+        assert "上下文" in text
+        assert "HTTP 400" in text
+        assert "58245" in text
+        assert "32768" in text
+        assert "手動" in text
+        # Must NOT bleed the content_too_long phrasing into this case.
+        assert "產出被截斷" not in text
+
+    def test_unknown_reason_still_produces_readable_message(self):
+        """Fall-through path: a future reason variant added in code
+        but not yet in the formatter's if/elif must still produce a
+        Telegram body that names the reason string so operator has
+        something to grep on."""
+        from zashiki_warasi.agents.email_agent import (
+            _format_analysis_failed,
+        )
+
+        # Construct via .model_construct to skip Literal validation —
+        # simulates the "code drifted ahead of formatter" scenario.
+        effect = AnalysisFailed.model_construct(
+            kind="analysis_failed",
+            reason="future_variant_xyz",  # type: ignore[arg-type]
+            detail="something",
+        )
+        text = _format_analysis_failed(self._email(), effect)
+        assert "future_variant_xyz" in text
         assert "手動" in text
 
     def test_html_special_chars_in_subject_are_escaped(self):
@@ -1292,3 +1515,152 @@ class TestNotionLinkInNotify:
         text = _format_expense_logged(effect)
         assert "⚠️ 其他" in text
         assert "請檢查信件確認" in text
+
+
+# ---------- prompt-context-overflow detection helpers ----------
+
+
+class TestIsContextLengthError:
+    """`_is_context_length_error` is the narrow allowlist that decides
+    whether a 400 becomes AnalysisFailed vs. propagates. False
+    positives = silently swallowed real bugs; false negatives =
+    infinite retry on doomed request. Pin all three signal paths."""
+
+    def test_llama_cpp_type_field_matches(self):
+        """The 2026-08-02 verbatim payload — llama-cpp-server's
+        structured `exceed_context_size_error` type field."""
+        from zashiki_warasi.agents.email_agent import _is_context_length_error
+
+        exc = _make_bad_request_error({
+            "error": {
+                "code": 400,
+                "message": "request (58245 tokens) exceeds the "
+                           "available context size (32768 tokens)",
+                "type": "exceed_context_size_error",
+                "n_prompt_tokens": 58245,
+                "n_ctx": 32768,
+            }
+        })
+        assert _is_context_length_error(exc)
+
+    def test_openai_code_field_matches(self):
+        """OpenAI-official code for the same failure mode."""
+        from zashiki_warasi.agents.email_agent import _is_context_length_error
+
+        exc = _make_bad_request_error({
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "This model's maximum context length is 8192 tokens.",
+                "type": "invalid_request_error",
+            }
+        })
+        assert _is_context_length_error(exc)
+
+    def test_message_text_fallback_matches(self):
+        """Generic fallback for other OpenAI-compatible endpoints that
+        use their own wording — needs BOTH 'context' and a length
+        word to reduce false positives."""
+        from zashiki_warasi.agents.email_agent import _is_context_length_error
+
+        exc = _make_bad_request_error({
+            "error": {
+                "message": "Prompt exceeds maximum context window",
+                "type": "some_other_type",
+            }
+        })
+        assert _is_context_length_error(exc)
+
+    def test_unrelated_400_rejected(self):
+        """Auth-style 400 must NOT match — would silently swallow a
+        real credential/config bug."""
+        from zashiki_warasi.agents.email_agent import _is_context_length_error
+
+        exc = _make_bad_request_error({
+            "error": {
+                "code": "invalid_api_key",
+                "message": "Incorrect API key provided",
+                "type": "invalid_request_error",
+            }
+        })
+        assert not _is_context_length_error(exc)
+
+    def test_tool_schema_error_rejected(self):
+        """Tool/schema violations are real bugs — must propagate,
+        not become AnalysisFailed."""
+        from zashiki_warasi.agents.email_agent import _is_context_length_error
+
+        exc = _make_bad_request_error({
+            "error": {
+                "code": "invalid_request_error",
+                "message": "Invalid tools[0].function.parameters",
+                "type": "invalid_request_error",
+            }
+        })
+        assert not _is_context_length_error(exc)
+
+    def test_message_only_context_without_length_word_rejected(self):
+        """Fallback needs BOTH signals — 'context' alone isn't enough
+        to justify treating a 400 as prompt overflow."""
+        from zashiki_warasi.agents.email_agent import _is_context_length_error
+
+        exc = _make_bad_request_error({
+            "error": {"message": "invalid context id"}
+        })
+        assert not _is_context_length_error(exc)
+
+
+class TestExtractContextLengthDetail:
+    """`_extract_context_length_detail` produces the string that ends
+    up in Telegram via AnalysisFailed.detail. Different payload shapes
+    → different-but-informative output."""
+
+    def test_llama_cpp_shape_uses_structured_token_counts(self):
+        from zashiki_warasi.agents.email_agent import (
+            _extract_context_length_detail,
+        )
+
+        exc = _make_bad_request_error({
+            "error": {
+                "type": "exceed_context_size_error",
+                "n_prompt_tokens": 58245,
+                "n_ctx": 32768,
+                "message": "request (58245 tokens) exceeds context",
+            }
+        })
+        detail = _extract_context_length_detail(exc)
+        assert detail == "prompt=58245 n_ctx=32768"
+
+    def test_openai_shape_falls_back_to_message(self):
+        """No `n_prompt_tokens` / `n_ctx` structured fields on
+        openai-official errors — fall back to the message text so the
+        operator at least sees what the server said."""
+        from zashiki_warasi.agents.email_agent import (
+            _extract_context_length_detail,
+        )
+
+        exc = _make_bad_request_error({
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "This model's maximum context length is "
+                           "8192 tokens. However, your messages "
+                           "resulted in 12345 tokens.",
+                "type": "invalid_request_error",
+            }
+        })
+        detail = _extract_context_length_detail(exc)
+        assert "8192" in detail
+        assert "12345" in detail
+
+    def test_detail_truncated_to_bound_telegram_payload(self):
+        """A pathological server error message shouldn't blow up the
+        Telegram body. Cap at 200 chars."""
+        from zashiki_warasi.agents.email_agent import (
+            _extract_context_length_detail,
+        )
+
+        huge = "x" * 1000
+        exc = _make_bad_request_error({
+            "error": {"message": huge}
+        })
+        detail = _extract_context_length_detail(exc)
+        assert len(detail) <= 200

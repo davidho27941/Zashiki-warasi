@@ -19,7 +19,7 @@ from typing import TypedDict
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.graph import END, START, StateGraph
-from openai import LengthFinishReasonError
+from openai import BadRequestError, LengthFinishReasonError
 from sqlalchemy.orm import sessionmaker
 
 from zashiki_warasi.agents.llm import get_chat_model
@@ -144,6 +144,66 @@ none         = 沒有急迫性
 """
 
 
+# ----- prompt-context-overflow detection -----
+#
+# `openai.BadRequestError` (HTTP 400) fires for many unrelated reasons
+# — bad auth, bad tool spec, schema violations. We only translate the
+# "your prompt exceeded my context window" subset into AnalysisFailed;
+# every other 400 MUST propagate so we notice new failure classes fast.
+#
+# Signal priority (first match wins) — structural fields are
+# preferred; string-match fallback is intentionally last so a
+# false-positive requires both (a) an unrelated 400 and (b) its
+# message happening to contain "context" + a length word.
+
+_CONTEXT_LENGTH_TEXT_MARKERS: tuple[str, ...] = ("length", "size", "window")
+
+
+def _is_context_length_error(exc: BadRequestError) -> bool:
+    """True iff a 400 is specifically "prompt exceeded context window".
+
+    Consulted signals (see design D2):
+      1. error.type == "exceed_context_size_error"   (llama-cpp-server)
+      2. error.code == "context_length_exceeded"     (OpenAI-official)
+      3. message contains "context" + one of length/size/window
+    """
+    body = getattr(exc, "body", None) or {}
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        if error.get("type") == "exceed_context_size_error":
+            return True
+        if error.get("code") == "context_length_exceeded":
+            return True
+        message = error.get("message") or ""
+    else:
+        message = str(exc)
+    lowered = message.lower()
+    if "context" not in lowered:
+        return False
+    return any(marker in lowered for marker in _CONTEXT_LENGTH_TEXT_MARKERS)
+
+
+def _extract_context_length_detail(exc: BadRequestError) -> str:
+    """Best-effort short summary for AnalysisFailed.detail.
+
+    Prefers llama-cpp-server's structured `n_prompt_tokens` /
+    `n_ctx` fields when present; otherwise falls back to the raw
+    message (truncated so a giant model error can't blow up the
+    Telegram payload).
+    """
+    body = getattr(exc, "body", None) or {}
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict):
+        n_prompt = error.get("n_prompt_tokens")
+        n_ctx = error.get("n_ctx")
+        if n_prompt is not None and n_ctx is not None:
+            return f"prompt={n_prompt} n_ctx={n_ctx}"
+        message = error.get("message") or ""
+        if message:
+            return message[:200]
+    return str(exc)[:200]
+
+
 class AgentState(TypedDict):
     email: EmailMessage
     analysis: EmailAnalysis | None
@@ -262,6 +322,24 @@ class EmailAgent:
                     "analysis": None,
                     "side_effect": AnalysisFailed(
                         reason="content_too_long", detail=detail
+                    ),
+                }
+            except BadRequestError as exc:
+                # HTTP 400 covers many unrelated failures (auth, bad
+                # tool spec, schema violations) — narrow to only the
+                # prompt-context-overflow subset so real bugs still
+                # propagate loudly to the poller's outer handler.
+                if not _is_context_length_error(exc):
+                    raise
+                detail = _extract_context_length_detail(exc)
+                log.warning(f"analyze: prompt exceeds context ({detail})")
+                # Cheap forensics: raw error body at DEBUG so post-
+                # incident triage has the server's own wording.
+                log.debug(f"analyze: 400 body = {getattr(exc, 'body', None)}")
+                return {
+                    "analysis": None,
+                    "side_effect": AnalysisFailed(
+                        reason="prompt_too_long", detail=detail
                     ),
                 }
             if analysis is not None:
@@ -510,10 +588,22 @@ def _format_analysis_failed(
         f"<b>寄件者:</b> {html.escape(email.from_address)}",
         "",
     ]
+    # Reason-specific one-liner so the operator knows which physical
+    # failure hit (output truncation vs. input overflow — different
+    # remediation). Fall-through covers any future variant so the
+    # message never comes out with zero context.
     if effect.reason == "content_too_long":
         lines.append(
-            "原因: 郵件內容超過 LLM token 上限,無法完成結構化分析。"
+            "原因: LLM 產出被截斷 (finish_reason=length),"
+            "結構化分析未完成。"
         )
+    elif effect.reason == "prompt_too_long":
+        lines.append(
+            "原因: 郵件內容超出 LLM 上下文視窗 (HTTP 400),"
+            "無法送出分析請求。"
+        )
+    else:
+        lines.append(f"原因: {html.escape(effect.reason)}")
     if effect.detail:
         lines.append(f"用量: <code>{html.escape(effect.detail)}</code>")
     lines.append("→ 請打開原信手動處理。")
