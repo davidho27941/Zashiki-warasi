@@ -65,16 +65,24 @@ class TestEndpointRegistration:
         assert r.status_code == 200
         assert r.json()["status"] == "healthy"
 
-    def test_auth_start_registered_but_not_implemented(self, client):
-        # /auth/* stays a stub until Group 9.
-        r = client.get("/auth/start?csrf=abc")
-        assert r.status_code == 501
-        assert "not_implemented" in r.json()["detail"]
+    def test_auth_start_registered(self, client, mock_services):
+        # /auth/* real bodies land in Group 9. Here we only assert the
+        # route exists (not 404). Behaviour tests live in
+        # tests/web/test_auth_flow.py.
+        mock_services.oauth_settings.redirect_uri = None
+        r = client.get("/auth/start?csrf=abc", follow_redirects=False)
+        # 500 (missing OAUTH_REDIRECT_URI) or 400 (csrf not in store)
+        # — both prove the handler ran; what matters is NOT 404.
+        assert r.status_code in (400, 500)
 
-    def test_auth_callback_registered_but_not_implemented(self, client):
+    def test_auth_callback_registered(self, client, mock_services):
+        # Return-value default of MagicMock().pop(...) is a MagicMock
+        # (truthy), which the real callback would try to fetch_token on;
+        # override to None so the handler takes the "unknown state" path.
+        mock_services.oauth_flow_store.pop.return_value = None
         r = client.get("/auth/callback?code=xyz&state=abc")
-        assert r.status_code == 501
-        assert "not_implemented" in r.json()["detail"]
+        assert r.status_code == 400
+        assert "unknown_or_expired_state" in r.json()["detail"]
 
     def test_undocumented_path_is_404(self, client):
         r = client.get("/does-not-exist")

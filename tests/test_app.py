@@ -141,89 +141,89 @@ class TestInstallShutdownHandlers:
 
 
 class TestMainCliRouting:
-    """`main` (click command) — confirms --reset / --yes flow through
-    to `reset_database` and that `run` is invoked / skipped correctly.
-
-    All tests use `CliRunner.invoke`, which captures stdout, simulates
-    `[y/N]` prompts via `input=`, and exposes the underlying exception
-    as `result.exception` rather than propagating it."""
+    """v1.0 CLI: `main` is a click Group that requires a subcommand.
+    Subcommands: `serve` (uvicorn wrapper), `tick` (one-off tick_once),
+    `reauth` (InstalledAppFlow), `sync-notion`, and `run-legacy` (the
+    v0.x default entry, retained hidden for backward compat)."""
 
     @pytest.fixture(autouse=True)
     def _stub_dependencies(self, monkeypatch):
-        # Replace the side-effectful pieces with mocks so the test
-        # exercises only the CLI layer, not Postgres or the poller.
         self.mock_reset = MagicMock()
         self.mock_run = MagicMock()
         monkeypatch.setattr(app, "reset_database", self.mock_reset)
         monkeypatch.setattr(app, "run", self.mock_run)
         self.runner = CliRunner()
 
-    def test_no_args_skips_reset(self):
+    def test_no_args_shows_help_and_exits_non_zero(self):
+        # Click's default: a Group with no subcommand shows help + 2.
         result = self.runner.invoke(app.main, [])
-        assert result.exit_code == 0
-        self.mock_reset.assert_not_called()
-        self.mock_run.assert_called_once_with()
-
-    def test_reset_with_y_response_calls_reset_and_run(self):
-        result = self.runner.invoke(app.main, ["--reset"], input="y\n")
-        assert result.exit_code == 0
-        self.mock_reset.assert_called_once_with()
-        self.mock_run.assert_called_once_with()
-
-    def test_reset_with_n_response_aborts(self):
-        # click.confirm(abort=True) exits with code 1 and does NOT
-        # call reset_database or run.
-        result = self.runner.invoke(app.main, ["--reset"], input="n\n")
-        assert result.exit_code == 1
-        self.mock_reset.assert_not_called()
+        assert result.exit_code == 2 or "Usage:" in result.output
         self.mock_run.assert_not_called()
 
-    def test_reset_with_short_yes_skips_prompt(self):
-        # `-y` provided → no input needed; if click DID prompt the
-        # runner's empty input stream would EOF and fail.
-        result = self.runner.invoke(app.main, ["--reset", "-y"])
-        assert result.exit_code == 0
-        self.mock_reset.assert_called_once_with()
-        self.mock_run.assert_called_once_with()
-        # Sanity: the confirmation question should not appear in
-        # stdout when -y bypasses the prompt.
-        assert "Continue?" not in result.output
-
-    def test_reset_with_long_yes_also_skips_prompt(self):
-        result = self.runner.invoke(app.main, ["--reset", "--yes"])
-        assert result.exit_code == 0
-        self.mock_reset.assert_called_once_with()
-
-    def test_run_is_called_after_reset(self):
-        order = []
-        self.mock_reset.side_effect = lambda: order.append("reset")
-        self.mock_run.side_effect = lambda: order.append("run")
-
-        result = self.runner.invoke(app.main, ["--reset", "-y"])
-
-        assert result.exit_code == 0
-        assert order == ["reset", "run"]
-
-    def test_help_shows_reset_flag(self):
+    def test_help_lists_new_subcommands(self):
         result = self.runner.invoke(app.main, ["--help"])
         assert result.exit_code == 0
-        assert "--reset" in result.output
-        assert "-y" in result.output
-
-    def test_help_lists_sync_notion_subcommand(self):
-        result = self.runner.invoke(app.main, ["--help"])
-        assert result.exit_code == 0
+        assert "serve" in result.output
+        assert "tick" in result.output
+        assert "reauth" in result.output
         assert "sync-notion" in result.output
 
-    def test_reset_with_subcommand_errors(self):
-        # --reset only makes sense for the default (poller) invocation;
-        # combining it with a subcommand must be a UsageError so users
-        # don't expect both behaviours.
-        result = self.runner.invoke(app.main, ["--reset", "sync-notion"])
-        assert result.exit_code != 0
-        assert "only valid without a subcommand" in result.output
-        self.mock_reset.assert_not_called()
-        self.mock_run.assert_not_called()
+    def test_serve_invokes_uvicorn(self, monkeypatch):
+        mock_uvicorn_run = MagicMock()
+        # Patch the uvicorn module's `run` — `serve_cmd` imports uvicorn
+        # inside the function, so patch there.
+        import uvicorn as _uv
+
+        monkeypatch.setattr(_uv, "run", mock_uvicorn_run)
+
+        result = self.runner.invoke(
+            app.main, ["serve", "--host", "0.0.0.0", "--port", "9000"]
+        )
+        assert result.exit_code == 0, result.output
+        mock_uvicorn_run.assert_called_once()
+        _args, kwargs = mock_uvicorn_run.call_args
+        assert kwargs["host"] == "0.0.0.0"
+        assert kwargs["port"] == 9000
+
+    def test_tick_prints_tickresult_json(self, monkeypatch):
+        from zashiki_warasi.core.schemas import TickResult
+
+        fake_services = MagicMock()
+        fake_services.poller.tick_once.return_value = TickResult(
+            duration_ms=5,
+            messages_processed=1,
+            cursor_before=100,
+            cursor_after=101,
+        )
+        # tick_cmd imports build_services + close_services inside the
+        # function; patch on the module where they live.
+        import zashiki_warasi.core.services as services_mod
+
+        monkeypatch.setattr(
+            services_mod, "build_services", lambda: fake_services
+        )
+        monkeypatch.setattr(
+            services_mod, "close_services", lambda _s: None
+        )
+
+        result = self.runner.invoke(app.main, ["tick"])
+
+        assert result.exit_code == 0, result.output
+        # Output is JSON-formatted TickResult.
+        assert '"messages_processed": 1' in result.output
+        assert '"cursor_after": 101' in result.output
+
+    def test_run_legacy_with_yes_calls_reset_and_run(self):
+        result = self.runner.invoke(
+            app.main, ["run-legacy", "--reset", "-y"]
+        )
+        assert result.exit_code == 0, result.output
+        self.mock_reset.assert_called_once_with()
+        self.mock_run.assert_called_once_with()
+
+    def test_run_legacy_hidden_from_help(self):
+        result = self.runner.invoke(app.main, ["--help"])
+        assert "run-legacy" not in result.output
 
 
 class TestReauthCommand:

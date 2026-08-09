@@ -13,7 +13,6 @@ import logging
 import threading
 from dataclasses import dataclass
 
-from google.oauth2.credentials import Credentials
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
@@ -60,7 +59,6 @@ class Services:
     checkpointer_pool: ConnectionPool
     checkpointer: PostgresSaver
     session_factory: sessionmaker
-    credentials: Credentials
     gmail_client: GmailClient
     agent: EmailAgent
     poller: Poller
@@ -68,6 +66,14 @@ class Services:
     notion: NotionExpenseRecorder | None
     oauth_flow_store: OAuthFlowStore
     stop_event: threading.Event
+
+    # Credentials always live on `gmail_client.credentials` (single
+    # source of truth — reload_credentials updates them there). This
+    # thin property keeps the historical `services.credentials` call
+    # site working without duplicating state.
+    @property
+    def credentials(self):
+        return self.gmail_client.credentials
 
 
 def _libpq_url(sqlalchemy_url: str) -> str:
@@ -176,6 +182,7 @@ def build_services(
     gmail_client = GmailClient(
         credentials,
         http_timeout_seconds=gmail_settings.http_timeout_seconds,
+        settings=gmail_settings,
     )
 
     pool = _build_pool(db_settings, stop_event, unreachable_flag)
@@ -219,7 +226,6 @@ def build_services(
         checkpointer_pool=pool,
         checkpointer=checkpointer,
         session_factory=session_factory,
-        credentials=credentials,
         gmail_client=gmail_client,
         agent=agent,
         poller=poller,

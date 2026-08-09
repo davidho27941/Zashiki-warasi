@@ -130,13 +130,21 @@ class TestPublicEndpointsUnaffected:
 
     def test_auth_start_open_even_with_key_configured(self, app):
         services = _services(api_key="shhh")
+        # Handler needs a redirect_uri to reach the store lookup; force
+        # a well-defined error path so the assertion is stable — the
+        # point is only that the API-key gate isn't blocking this route.
+        services.oauth_settings.redirect_uri = None
         app.dependency_overrides[get_services] = lambda: services
-        r = TestClient(app).get("/auth/start?csrf=abc")
-        # Stub returns 501 today; the point is it's not 401.
+        r = TestClient(app).get(
+            "/auth/start?csrf=abc", follow_redirects=False
+        )
         assert r.status_code != 401
+        assert r.status_code == 500  # missing OAUTH_REDIRECT_URI
 
     def test_auth_callback_open_even_with_key_configured(self, app):
         services = _services(api_key="shhh")
+        services.oauth_flow_store.pop.return_value = None
         app.dependency_overrides[get_services] = lambda: services
         r = TestClient(app).get("/auth/callback?code=xyz&state=abc")
         assert r.status_code != 401
+        assert r.status_code == 400  # unknown state

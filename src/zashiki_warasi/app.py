@@ -151,44 +151,88 @@ def _start_notion_sync_thread(
 
 @click.group(
     context_settings={"help_option_names": ["-h", "--help"]},
-    invoke_without_command=True,
     help=(
-        "Self-hosted Gmail polling AI email agent. Run with no "
-        "subcommand to boot the poller; use a subcommand for one-shot "
-        "operations."
+        "Self-hosted Gmail polling AI email agent. v1.0 replaces the "
+        "long-running daemon with an HTTP service — use `serve` to run "
+        "the FastAPI listener, `tick` for a one-off in-process poll, "
+        "or `reauth` for the CLI OAuth flow."
     ),
 )
-@click.option(
-    "--reset",
-    "reset",
-    is_flag=True,
-    help=(
-        "TRUNCATE all data (app tables + LangGraph checkpoints) "
-        "before starting the poller. Asks for confirmation unless "
-        "-y is also given. Only valid without a subcommand."
-    ),
-)
-@click.option(
-    "-y",
-    "--yes",
-    "yes",
-    is_flag=True,
-    help="Skip the confirmation prompt for --reset.",
-)
-@click.pass_context
-def main(ctx: click.Context, reset: bool, yes: bool) -> None:
-    """CLI entry point. With no subcommand: starts the poller (with
-    optional `--reset`). With a subcommand: runs that one-shot
-    operation and exits."""
+def main() -> None:
+    """CLI entry group. All work happens in a subcommand."""
     _init_logging()
 
-    if ctx.invoked_subcommand is not None:
-        if reset:
-            raise click.UsageError(
-                "--reset is only valid without a subcommand."
-            )
-        return
 
+@main.command("serve")
+@click.option(
+    "--host",
+    default=None,
+    help="Bind address override. Default: HTTP_BIND_HOST env or 127.0.0.1.",
+)
+@click.option(
+    "--port",
+    type=int,
+    default=None,
+    help="Bind port override. Default: HTTP_BIND_PORT env or 8080.",
+)
+def serve_cmd(host: str | None, port: int | None) -> None:
+    """Start the FastAPI service via uvicorn (development / manual run).
+
+    In production, prefer running uvicorn directly under a process
+    supervisor (systemd, docker CMD) so lifecycle / restart policy is
+    orchestrator-owned. This subcommand is for smoke and dev only.
+    """
+    import uvicorn
+
+    from zashiki_warasi.core.config import HttpSettings
+
+    settings = HttpSettings()
+    bind_host = host or settings.bind_host
+    bind_port = port or settings.bind_port
+    click.echo(
+        f"Starting uvicorn on http://{bind_host}:{bind_port} — "
+        "Ctrl+C to stop."
+    )
+    uvicorn.run(
+        "zashiki_warasi.web:app",
+        host=bind_host,
+        port=bind_port,
+        reload=False,
+    )
+
+
+@main.command("tick")
+def tick_cmd() -> None:
+    """Run one poll cycle in-process and print the resulting TickResult
+    as JSON. Useful for cron smoke and one-off debugging without
+    standing up the HTTP surface."""
+    import json as _json
+
+    from zashiki_warasi.core.services import build_services, close_services
+    from zashiki_warasi.gmail.poller import tick_once as _tick_once
+
+    services = build_services()
+    try:
+        result = _tick_once(services.poller)
+    finally:
+        close_services(services)
+    click.echo(_json.dumps(result.model_dump(), default=str, indent=2))
+
+
+@main.command(
+    "run-legacy",
+    hidden=True,
+    help=(
+        "[Deprecated] One-shot equivalent of the v0.x daemon entry, "
+        "kept for backward compat with existing wrappers. Prefer "
+        "`serve` (HTTP) or `tick` (one-off). Removed in a future "
+        "release."
+    ),
+)
+@click.option("--reset", is_flag=True)
+@click.option("-y", "--yes", "yes", is_flag=True)
+def run_legacy(reset: bool, yes: bool) -> None:
+    """Legacy one-shot equivalent of `python -m zashiki_warasi` in v0.x."""
     if reset:
         if not yes:
             click.confirm(
@@ -197,7 +241,6 @@ def main(ctx: click.Context, reset: bool, yes: bool) -> None:
                 abort=True,
             )
         reset_database()
-
     run()
 
 
