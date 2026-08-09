@@ -13,12 +13,17 @@ import logging
 import threading
 from dataclasses import dataclass
 
+from google.oauth2.credentials import Credentials
 from langgraph.checkpoint.postgres import PostgresSaver
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from sqlalchemy.orm import sessionmaker
 
 from zashiki_warasi.agents.email_agent import EmailAgent
+from zashiki_warasi.coordination.oauth_flow_store import (
+    OAuthFlowStore,
+    ensure_oauth_flows_table,
+)
 from zashiki_warasi.core.config import (
     DatabaseSettings,
     GmailSettings,
@@ -55,11 +60,13 @@ class Services:
     checkpointer_pool: ConnectionPool
     checkpointer: PostgresSaver
     session_factory: sessionmaker
+    credentials: Credentials
     gmail_client: GmailClient
     agent: EmailAgent
     poller: Poller
     notifier: TelegramNotifier
     notion: NotionExpenseRecorder | None
+    oauth_flow_store: OAuthFlowStore
     stop_event: threading.Event
 
 
@@ -182,6 +189,12 @@ def build_services(
     )
     checkpointer = PostgresSaver(pool)
     checkpointer.setup()
+    # Group 4: coordination schema. Idempotent — runs every startup.
+    ensure_oauth_flows_table(pool)
+    oauth_flow_store = OAuthFlowStore(
+        pool,
+        client_secrets_path=gmail_settings.credentials_path,
+    )
 
     notion = _build_notion(notion_settings)
     agent = EmailAgent(
@@ -206,11 +219,13 @@ def build_services(
         checkpointer_pool=pool,
         checkpointer=checkpointer,
         session_factory=session_factory,
+        credentials=credentials,
         gmail_client=gmail_client,
         agent=agent,
         poller=poller,
         notifier=notifier,
         notion=notion,
+        oauth_flow_store=oauth_flow_store,
         stop_event=stop_event,
     )
 

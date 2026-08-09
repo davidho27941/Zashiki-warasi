@@ -94,8 +94,9 @@ class TestServicesDependency:
             return {"is_mock": services is mock_services}
 
         app.dependency_overrides[get_services] = lambda: mock_services
-        with TestClient(app) as c:
-            r = c.get("/__probe")
+        # No `with TestClient` — the lifespan would open a real pool.
+        c = TestClient(app)
+        r = c.get("/__probe")
         assert r.status_code == 200
         assert r.json() == {"is_mock": True}
 
