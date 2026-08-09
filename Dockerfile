@@ -62,8 +62,8 @@ RUN mkdir -p /data /secrets \
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    GOOGLE_CREDENTIALS_PATH=/secrets/credentials.json \
-    GOOGLE_TOKEN_PATH=/data/token.json \
+    GMAIL_CREDENTIALS_PATH=/secrets/credentials.json \
+    GMAIL_TOKEN_PATH=/data/token.json \
     HTTP_BIND_HOST=0.0.0.0 \
     HTTP_BIND_PORT=8080
 

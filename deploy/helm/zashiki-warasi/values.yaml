@@ -54,9 +54,9 @@ env:
   # Notion (leave commented to disable)
   # NOTION_TIMEOUT_SECONDS: "10"
   # NOTION_SYNC_INTERVAL_SECONDS: "300"
-  # Gmail scopes / paths / tuning
-  GOOGLE_CREDENTIALS_PATH: "/secrets/credentials.json"
-  GOOGLE_TOKEN_PATH: "/data/token.json"
+  # Gmail scopes / paths / tuning (all read via GmailSettings env_prefix=GMAIL_)
+  GMAIL_CREDENTIALS_PATH: "/secrets/credentials.json"
+  GMAIL_TOKEN_PATH: "/data/token.json"
   # GMAIL_HTTP_TIMEOUT_SECONDS: "60"
   # GMAIL_SCOPES: "https://www.googleapis.com/auth/gmail.readonly"
   # Checkpointer pool tuning (see db-connection-resilience spec).

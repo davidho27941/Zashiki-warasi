@@ -24,7 +24,7 @@ services:
     volumes:
       # OAuth client secrets: read-only mount from the host so
       # rotating credentials.json is a `cp` + container restart.
-      - ${GOOGLE_CREDENTIALS_HOST_PATH:-./secrets/credentials.json}:/secrets/credentials.json:ro
+      - ${GMAIL_CREDENTIALS_HOST_PATH:-./secrets/credentials.json}:/secrets/credentials.json:ro
       # Writable data dir for token.json (OAuth web flow writes here
       # on successful reauth). Persist across container restarts by
       # using a host bind mount or a named volume.

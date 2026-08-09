@@ -72,7 +72,7 @@ container-swap + scheduler-install + old-daemon-stop.
    cp /path/to/your/v0.6.x/token.json data/token.json    # if you have one
    chmod 600 data/token.json                              # match the app's expectation
    ```
-   Adjust `GOOGLE_CREDENTIALS_HOST_PATH` / `DATA_DIR` in `.env` if
+   Adjust `GMAIL_CREDENTIALS_HOST_PATH` / `DATA_DIR` in `.env` if
    your files live elsewhere.
 
 4. **Stop the v0.6.x daemon.** Do this BEFORE starting v1.0 so both
@@ -197,7 +197,7 @@ No data-format change. Both versions can read the same
 
 ### `/healthz` returns 503 with `oauth: false`
 
-- The `token.json` file at `$GOOGLE_TOKEN_PATH` inside the container
+- The `token.json` file at `$GMAIL_TOKEN_PATH` inside the container
   is missing, unreadable, expired without a refresh token, or has
   the wrong scopes.
 - Fix: bootstrap via CLI reauth (option A above) OR headless reauth

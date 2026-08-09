@@ -28,7 +28,7 @@ HELM_VALUES = REPO_ROOT / "deploy" / "helm" / "zashiki-warasi" / "values.yaml"
 COMPOSE_ONLY: frozenset[str] = frozenset(
     {
         # Host-side path knobs used by docker-compose.yml volume binds.
-        "GOOGLE_CREDENTIALS_HOST_PATH",
+        "GMAIL_CREDENTIALS_HOST_PATH",
         "DATA_DIR",
     }
 )
