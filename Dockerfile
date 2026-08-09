@@ -50,6 +50,12 @@ WORKDIR /app
 COPY --from=builder --chown=zashiki:zashiki /app/.venv /app/.venv
 COPY --from=builder --chown=zashiki:zashiki /app/src /app/src
 COPY --from=builder --chown=zashiki:zashiki /app/pyproject.toml /app/README.md /app/
+# Alembic config + migration scripts. The entrypoint runs
+# `alembic upgrade head` before uvicorn so fresh DBs auto-provision.
+COPY --chown=zashiki:zashiki alembic.ini /app/
+COPY --chown=zashiki:zashiki alembic /app/alembic
+COPY --chown=root:root docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 # /data must be writable by the container user — token.json lives here
 # and the OAuth web flow writes to it on successful reauth. Compose
@@ -72,9 +78,17 @@ EXPOSE 8080
 
 # `curl -f` returns non-zero on 5xx so docker's healthcheck flips to
 # unhealthy on any /healthz 503 (our real dependency-truth signal).
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+# start-period is generous because the entrypoint runs alembic upgrade
+# head before uvicorn — a fresh DB with many migrations can take a
+# few seconds before /healthz starts answering.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8080/healthz || exit 1
 
-# Default: run the FastAPI service. Override to `zashiki-warasi tick`
-# / `... reauth` for one-shots.
+# Entrypoint runs `alembic upgrade head` against DATABASE_URL, then
+# execs CMD. Override for one-shots: `docker compose run --rm
+# --entrypoint sh zashiki-warasi -c 'zashiki-warasi tick'`.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+
+# Default CMD: run the FastAPI service. Override to `zashiki-warasi
+# tick` / `... reauth` for one-shots.
 CMD ["uvicorn", "zashiki_warasi.web:app", "--host", "0.0.0.0", "--port", "8080"]

@@ -51,6 +51,6 @@ deploy/
 *.md
 !README.md
 
-# Alembic — schemas live in DB; migrations aren't for the container image
-migrations/
-alembic.ini
+# alembic.ini + alembic/ ARE shipped in the image so the entrypoint
+# can run `alembic upgrade head` against the target DB before uvicorn
+# starts. Do NOT exclude them.
