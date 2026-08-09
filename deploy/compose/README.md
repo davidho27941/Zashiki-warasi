@@ -35,6 +35,15 @@ driving `POST /poll`.
    deploy, put it in `data/token.json`. Otherwise you'll bootstrap
    OAuth on first run via CLI reauth (see step 5).
 
+   **Fix ownership.** The container runs as uid `10001` (`zashiki`);
+   host bind-mounts inherit host ownership, so the container can't
+   read your files unless you match:
+
+   ```
+   sudo chown -R 10001:10001 secrets data
+   chmod 600 secrets/credentials.json data/token.json 2>/dev/null || true
+   ```
+
 3. **Build the image** (skip if pulling from a registry).
 
    ```

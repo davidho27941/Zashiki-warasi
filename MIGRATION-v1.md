@@ -70,7 +70,10 @@ container-swap + scheduler-install + old-daemon-stop.
    mkdir -p secrets data
    cp /path/to/your/v0.6.x/credentials.json secrets/credentials.json
    cp /path/to/your/v0.6.x/token.json data/token.json    # if you have one
-   chmod 600 data/token.json                              # match the app's expectation
+   # Container runs as uid 10001 (`zashiki`). Bind mounts inherit host
+   # ownership, so match it OR the container can't read the files:
+   sudo chown -R 10001:10001 secrets data
+   chmod 600 secrets/credentials.json data/token.json
    ```
    Adjust `GMAIL_CREDENTIALS_HOST_PATH` / `DATA_DIR` in `.env` if
    your files live elsewhere.
