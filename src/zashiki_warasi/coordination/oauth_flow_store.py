@@ -76,9 +76,15 @@ class OAuthFlowStore:
     def _serialize(flow: Flow) -> dict:
         # google-auth-oauthlib's Flow exposes scopes / redirect_uri as
         # both public props and private-ish attrs; use the public path.
+        # code_verifier is the PKCE nonce populated by authorization_url();
+        # we MUST persist it across the pop-put-pop cycle so
+        # /auth/callback's fetch_token() sends the same verifier Google
+        # is expecting (else Google returns
+        # `invalid_grant: Missing code verifier`).
         return {
             "scopes": list(flow.oauth2session.scope or []),
             "redirect_uri": flow.redirect_uri,
+            "code_verifier": getattr(flow, "code_verifier", None),
         }
 
     def _reconstruct(self, state: str, data: dict) -> Flow:
@@ -88,6 +94,11 @@ class OAuthFlowStore:
             state=state,
             redirect_uri=data["redirect_uri"],
         )
+        code_verifier = data.get("code_verifier")
+        if code_verifier:
+            # google-auth-oauthlib Flow uses this attribute to include
+            # the PKCE verifier when exchanging the auth code for tokens.
+            flow.code_verifier = code_verifier
         return flow
 
     # ---------- CRUD ----------

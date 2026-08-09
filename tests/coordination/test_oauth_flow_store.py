@@ -231,3 +231,46 @@ class TestPutPopRoundtrip:
         assert set(popped.oauth2session.scope or []) == set(
             original.oauth2session.scope or []
         )
+
+    def test_roundtrip_preserves_pkce_code_verifier(
+        self, client_secrets_file
+    ):
+        """Regression pin: if we lose code_verifier between put and pop,
+        Google returns `invalid_grant: Missing code verifier` at
+        fetch_token time because the challenge sent by /auth/start
+        won't match the (regenerated) verifier sent by /auth/callback.
+        Caught during Proxmox smoke test Phase 5.2."""
+        from google_auth_oauthlib.flow import Flow
+
+        pool, cursor = _make_pool_mock()
+        store = OAuthFlowStore(pool, client_secrets_file)
+
+        flow = Flow.from_client_secrets_file(
+            str(client_secrets_file),
+            scopes=["https://www.googleapis.com/auth/gmail.readonly"],
+            state="csrf-pkce",
+            redirect_uri="http://127.0.0.1:8080/auth/callback",
+        )
+        # Simulate what /auth/start does — this populates code_verifier
+        # on the flow instance as a side-effect.
+        flow.authorization_url(
+            access_type="offline",
+            include_granted_scopes="true",
+            state="csrf-pkce",
+        )
+        expected_verifier = flow.code_verifier
+        assert expected_verifier, (
+            "test precondition: authorization_url should populate "
+            "code_verifier — google-auth-oauthlib may have changed"
+        )
+
+        store.put("csrf-pkce", flow)
+        _put_sql, put_params = cursor.execute.call_args[0]
+        stored_payload = json.loads(put_params[1])
+        assert stored_payload["code_verifier"] == expected_verifier
+        cursor.set_row_sequence([{"flow_json": stored_payload}])
+
+        popped = store.pop("csrf-pkce")
+
+        assert popped is not None
+        assert popped.code_verifier == expected_verifier
