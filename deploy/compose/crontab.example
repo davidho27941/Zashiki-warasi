@@ -7,18 +7,26 @@
 # one minute — sub-minute cadence needs two entries offset by
 # `sleep 30 && ...` and rarely pays off.
 #
+# GOTCHAS:
+#   - cron treats `%` as end-of-command / stdin-separator, so
+#     `%{http_code}` must be escaped as `\%{http_code}`. If you
+#     forget, cron silently truncates the line at the first `%` and
+#     you see nothing in the log despite CRON firing (syslog will
+#     show a truncated CMD ending in a stray quote).
+#   - cron does NOT inherit your shell env, so `${HTTP_API_KEY}`
+#     won't expand — paste the real key value into the line. crontab
+#     files are mode-600 by default, so a plaintext key is homelab-
+#     acceptable; a systemd `EnvironmentFile=` wrapper is available
+#     if you'd rather not.
+#
 # Flags on the curl command:
 #   -f       fail on 4xx/5xx (so cron logs the failure)
 #   -s -S    silent except errors (keeps the log tail readable)
 #   -m 55    hard-timeout at 55s so a stuck tick doesn't overlap the
 #            next cron trigger; 409 from single-flight is preferable
 #            to two concurrent hangers
-#   -w '%{http_code}\n'
+#   -w '\%{http_code}\n'
 #            append the HTTP status so `grep 409 zashiki-cron.log`
 #            surfaces overlap events without needing to parse output
-#
-# The API-key value MUST match `HTTP_API_KEY` in the container's env.
-# When bind_host is loopback inside the container's own namespace,
-# reach it via the published host port (default 8080).
 
-* * * * * curl -fsS -m 55 -w '%{http_code}\n' -X POST http://127.0.0.1:8080/poll -H "X-API-Key: change-me-to-a-strong-secret" >> /var/log/zashiki-cron.log 2>&1
+* * * * * curl -fsS -m 55 -w '\%{http_code}\n' -X POST http://127.0.0.1:8080/poll -H "X-API-Key: change-me-to-a-strong-secret" >> /var/log/zashiki-cron.log 2>&1
