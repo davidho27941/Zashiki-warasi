@@ -1,0 +1,39 @@
+# Zashiki-warasi single-node compose deployment.
+#
+# Provisions ONLY the FastAPI service — Postgres is external (bring
+# your own, referenced via DATABASE_URL). See ./README.md for a
+# 5-minute quickstart including cron setup.
+#
+# Container image: build locally with `docker build -t zashiki-warasi:v1.0.0 .`
+# from the repo root, or pull a pre-built image from your registry.
+
+services:
+  zashiki-warasi:
+    image: zashiki-warasi:v1.0.0
+    # Build from repo root when the tag isn't available in the registry.
+    # Comment this out once you're pulling from a registry.
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    container_name: zashiki-warasi
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "${HTTP_BIND_PORT:-8080}:8080"
+    volumes:
+      # OAuth client secrets: read-only mount from the host so
+      # rotating credentials.json is a `cp` + container restart.
+      - ${GOOGLE_CREDENTIALS_HOST_PATH:-./secrets/credentials.json}:/secrets/credentials.json:ro
+      # Writable data dir for token.json (OAuth web flow writes here
+      # on successful reauth). Persist across container restarts by
+      # using a host bind mount or a named volume.
+      - ${DATA_DIR:-./data}:/data
+    healthcheck:
+      # Mirrors the Dockerfile HEALTHCHECK but included here so
+      # `docker compose ps` shows health regardless of image origin.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3

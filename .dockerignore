@@ -1,42 +1,56 @@
-# --- VCS / dev tooling ---
-.git
+# Version control
+.git/
 .gitignore
-.github
-.vscode
-.idea
+.gitattributes
 
-# --- Python bytecode / caches ---
-__pycache__
-*.pyc
-*.pyo
-*.pyd
-.pytest_cache
-.mypy_cache
-.ruff_cache
+# Virtualenvs / caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
 .coverage
-htmlcov
-*.egg-info
-build
-dist
-.python-version
+.coverage.*
+htmlcov/
+.tox/
 
-# --- Local virtualenvs (the image builds its own with uv) ---
-.venv
-venv
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
 
-# --- Secrets / OAuth state (mounted at runtime, never baked in) ---
+# Tests / docs / scratch — all excluded from the image
+tests/
+docs/
+scripts/
+
+# Local session state / assistant scratch
+.claude/
+openspec/
+
+# Secrets — MUST NOT ship in the image
 .env
 .env.*
-!.env.example
-credential.json
 credentials.json
-credentials/
 token.json
+*.pem
+*.key
 
-# --- Local scratch / docs / tests ---
-scripts/
-docs/lessons/
-tests/
+# Deploy templates — the container ships the app, not the deploy artifacts
+deploy/
 
-# --- Build artefacts from previous local runs ---
-*.log
+# Every markdown file except README.md
+*.md
+!README.md
+
+# Alembic — schemas live in DB; migrations aren't for the container image
+migrations/
+alembic.ini

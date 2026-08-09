@@ -1,0 +1,42 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "zashiki-warasi.fullname" . }}-poll
+  labels:
+    {{- include "zashiki-warasi.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.cronjob.schedule | quote }}
+  successfulJobsHistoryLimit: {{ .Values.cronjob.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.cronjob.failedJobsHistoryLimit }}
+  # concurrencyPolicy: Forbid ensures k8s doesn't spawn a second pod
+  # while the first is still curl-ing. The service-side advisory lock
+  # is the real safety net (any second curl gets 409); this just keeps
+  # the CronJob's own pod count clean.
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      # If a job's pod fails, don't retry — the next cron tick will
+      # try again in <= 60s anyway; retrying wastes pod slots.
+      backoffLimit: 0
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: curl
+              image: "{{ .Values.cronjob.image.repository }}:{{ .Values.cronjob.image.tag }}"
+              resources:
+                {{- toYaml .Values.cronjob.resources | nindent 16 }}
+              env:
+                - name: HTTP_API_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: {{ include "zashiki-warasi.fullname" . }}
+                      key: HTTP_API_KEY
+                      optional: true
+              command:
+                - /bin/sh
+                - -c
+                - >-
+                  curl -fsS -m 55 -w '%{http_code}\n'
+                  -X POST http://{{ include "zashiki-warasi.fullname" . }}:8080/poll
+                  ${HTTP_API_KEY:+-H "X-API-Key: ${HTTP_API_KEY}"}

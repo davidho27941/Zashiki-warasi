@@ -1,0 +1,132 @@
+# Default values for zashiki-warasi.
+# Override on the CLI: `helm install ... -f myvalues.yaml`.
+
+image:
+  repository: zashiki-warasi
+  tag: "1.0.0"           # pin an explicit tag — `latest` bites hard on rollbacks
+  pullPolicy: IfNotPresent
+
+# Deployment shape. The app coordinates across replicas via a Postgres
+# advisory lock (`POST /poll` single-flight) + Postgres-backed OAuth
+# flow store, so `replicaCount > 1` is safe and only means "HA HTTP
+# surface" — tick throughput is unchanged (still one tick in flight
+# system-wide). See design D17 in the migrate-to-fastapi-service
+# openspec change.
+replicaCount: 1
+
+# Rolling updates are safe at any replica count — advisory lock
+# guarantees no double-tick during pod overlap.
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# ---------- Non-secret env (rendered into a ConfigMap) ----------
+env:
+  HTTP_BIND_HOST: "0.0.0.0"
+  HTTP_BIND_PORT: "8080"
+  # OAUTH_REDIRECT_URI must be reachable from the operator's browser
+  # AND registered in the Google Cloud Console. For a Service-only
+  # deploy behind port-forward, use `http://127.0.0.1:8080/auth/callback`
+  # and add that URI to the OAuth client. See docs/oauth-redirect-uri.md.
+  OAUTH_REDIRECT_URI: "http://127.0.0.1:8080/auth/callback"
+  LOG_LEVEL: "INFO"
+  # LOG_LEVEL_ZASHIKI: "DEBUG"
+  # LLM
+  LLM_PROVIDER: "llamacpp"
+  LLM_BASE_URL: "http://llama-server:8080/v1"
+  LLM_API_KEY: "not-needed"
+  LLM_MODEL: "local-model"
+  # LLM_TEMPERATURE: "0.2"
+  # LLM_ANALYZE_MAX_TOKENS: "10922"
+  # Telegram
+  TELEGRAM_API_BASE: "https://api.telegram.org"
+  # TELEGRAM_TIMEOUT_SECONDS: "10"
+  # Notion (leave commented to disable)
+  # NOTION_TIMEOUT_SECONDS: "10"
+  # NOTION_SYNC_INTERVAL_SECONDS: "300"
+  # Gmail scopes / paths / tuning
+  GOOGLE_CREDENTIALS_PATH: "/secrets/credentials.json"
+  GOOGLE_TOKEN_PATH: "/data/token.json"
+  # GMAIL_HTTP_TIMEOUT_SECONDS: "60"
+  # GMAIL_SCOPES: "https://www.googleapis.com/auth/gmail.readonly"
+  # Checkpointer pool tuning (see db-connection-resilience spec).
+  # Defaults are sized for a single-threaded homelab poller; raise
+  # max_size for a chattier deployment.
+  # DATABASE_CHECKPOINTER_POOL_MIN_SIZE: "1"
+  # DATABASE_CHECKPOINTER_POOL_MAX_SIZE: "5"
+  # DATABASE_CHECKPOINTER_POOL_MAX_LIFETIME_SECONDS: "1800"
+  # DATABASE_CHECKPOINTER_POOL_MAX_IDLE_SECONDS: "600"
+
+# ---------- Secrets (rendered into a Secret) ----------
+# Provide values via `--set secrets.databaseUrl=...` or a values file
+# outside version control. Leave `""` to skip that key.
+secrets:
+  databaseUrl: ""                     # postgresql+psycopg://user:pw@host:5432/db — REQUIRED
+  httpApiKey: ""                      # required whenever HTTP_BIND_HOST != 127.0.0.1
+  telegramBotToken: ""
+  telegramChatId: ""
+  notionToken: ""
+  notionExpenseDatabaseId: ""
+
+# OAuth artifacts — inline the JSON contents (single line, escaped
+# properly) OR supply via `--set-file`. Values here render into a
+# Secret mounted read-only at /secrets and read-write at /data.
+oauth:
+  credentialsJson: ""                 # contents of credentials.json — REQUIRED
+  tokenJson: ""                       # contents of token.json — optional (bootstrap via /reauth)
+
+# ---------- Persistent storage for /data (token.json + future state) ----------
+persistence:
+  enabled: true
+  storageClass: ""                    # "" = cluster default
+  accessMode: ReadWriteOnce
+  size: 100Mi
+
+# ---------- Cron (external scheduler) ----------
+cronjob:
+  # Runs curl -X POST /poll against the Service. 60s is the cron
+  # granularity floor; sub-minute would need multiple entries.
+  schedule: "* * * * *"
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  # `curlimages/curl` is ~2 MB, no shell, no leftover state — ideal
+  # for a per-minute one-shot pod.
+  image:
+    repository: curlimages/curl
+    tag: "8.11.1"
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 32Mi
+
+# ---------- Ingress (optional; off by default) ----------
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: zashiki.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# ---------- Pod security ----------
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
