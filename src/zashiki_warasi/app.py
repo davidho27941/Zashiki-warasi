@@ -26,7 +26,7 @@ from zashiki_warasi.core.config import (
     DatabaseSettings,
     GmailSettings,
     NotionSettings,
-    PollerSettings,
+    warn_removed_env_vars,
 )
 from zashiki_warasi.core.db import get_session_factory, reset_database
 from zashiki_warasi.core.logging import configure_logging
@@ -394,24 +394,22 @@ def run() -> None:
                 client=client,
                 notion=notion,
             )
-            poller_settings = PollerSettings()
+            warn_removed_env_vars(logger)
             poller = Poller(
                 client=client,
                 session_factory=session_factory,
                 handler=agent.handle_email,
                 stop_event=stop_event,
                 notifier=notifier,
-                heartbeat_interval_seconds=(
-                    poller_settings.heartbeat_interval_seconds
-                ),
             )
-            try:
-                poller.run()
-            except CredentialRefreshError:
-                # Poller already notified and set stop_event; propagate
-                # as non-zero exit so operators know to run `reauth`.
-                # Falls through to pool close.
-                sys.exit(EXIT_CREDENTIAL_FAILURE)
+            # v1.0 transition: the long-running daemon loop is gone —
+            # this CLI entry point now runs ONE tick and exits. In
+            # production, the FastAPI service (`uvicorn zashiki_warasi.web:app`)
+            # + external cron replaces the loop. See openspec change
+            # `migrate-to-fastapi-service` (Group 11) for the final
+            # CLI subcommand rework that removes this path in favour
+            # of `zashiki-warasi tick` / `serve`.
+            poller.tick_once()
     finally:
         # Symmetric with the open INFO so `grep 'checkpointer pool'`
         # always shows both endpoints.

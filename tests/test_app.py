@@ -504,65 +504,6 @@ class TestCheckpointerPoolLogging:
         )
 
 
-class TestRunWiresPollerHeartbeat:
-    """`run()` reads `PollerSettings.heartbeat_interval_seconds` from
-    env and passes it into `Poller(...)`. Pin this so the env override
-    can't silently be dropped by a future refactor."""
-
-    @pytest.fixture(autouse=True)
-    def _stub_run_deps(self, monkeypatch):
-        # Same run() stubs as TestCheckpointerPoolLogging above —
-        # everything faked so we reach the Poller construction.
-        monkeypatch.setattr(app, "TelegramNotifier", lambda: MagicMock())
-        monkeypatch.setattr(app, "get_session_factory", lambda: MagicMock())
-        monkeypatch.setattr(
-            app, "get_credentials", MagicMock(return_value=MagicMock())
-        )
-        monkeypatch.setattr(app, "GmailClient", MagicMock())
-        monkeypatch.setattr(app, "_build_notion", lambda: None)
-        monkeypatch.setattr(
-            app, "_start_notion_sync_thread", lambda *a, **k: None
-        )
-        monkeypatch.setattr(app, "_install_shutdown_handlers", lambda _e: None)
-
-        fake_pool = MagicMock()
-        fake_pool.__enter__.return_value = fake_pool
-        fake_pool.__exit__.return_value = False
-        monkeypatch.setattr(app, "ConnectionPool", lambda *a, **k: fake_pool)
-        monkeypatch.setattr(app, "PostgresSaver", lambda pool: MagicMock())
-        monkeypatch.setattr(app, "EmailAgent", lambda **kw: MagicMock())
-
-        # Capture whatever kwargs `run()` passes into Poller(...) so we
-        # can assert the heartbeat setting round-tripped.
-        self.captured_kwargs: dict = {}
-
-        def _fake_poller(**kw):
-            self.captured_kwargs.update(kw)
-            fake = MagicMock()
-            fake.run.return_value = None
-            return fake
-
-        monkeypatch.setattr(app, "Poller", _fake_poller)
-
-    def test_default_interval_reaches_poller(self, monkeypatch):
-        monkeypatch.delenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", raising=False)
-        app.run()
-        assert self.captured_kwargs["heartbeat_interval_seconds"] == 1200
-
-    def test_env_override_reaches_poller(self, monkeypatch):
-        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "600")
-        app.run()
-        assert self.captured_kwargs["heartbeat_interval_seconds"] == 600
-
-    def test_zero_reaches_poller_and_disables(self, monkeypatch):
-        """`=0` is a valid config that disables the heartbeat — must
-        propagate as-is to Poller (which knows to no-op on 0), not be
-        rewritten to a "sensible" default along the way."""
-        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "0")
-        app.run()
-        assert self.captured_kwargs["heartbeat_interval_seconds"] == 0
-
-
 class TestBuildCheckpointerPool:
     """`_build_checkpointer_pool` constructs a psycopg-pool `ConnectionPool`
     parameterized from DatabaseSettings with LangGraph-required kwargs

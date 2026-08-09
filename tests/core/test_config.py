@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -10,9 +11,12 @@ from zashiki_warasi.core.config import (
     DEFAULT_SCOPES,
     DatabaseSettings,
     GmailSettings,
+    HttpSettings,
     LLMSettings,
     LoggingSettings,
+    OAuthSettings,
     PollerSettings,
+    warn_removed_env_vars,
 )
 
 
@@ -311,34 +315,142 @@ class TestLoggingSettings:
 
 
 class TestPollerSettings:
-    """Heartbeat cadence config. Default 1200 s = one heartbeat per
-    20 min on a quiet mailbox; 0 disables entirely."""
+    """v1.0 has no poller-scoped settings — cadence is external cron,
+    liveness is /healthz. The class is retained as an empty namespace
+    for future fields; test that instantiation works and that removed
+    env vars are ignored (not fail-fast)."""
+
+    def test_instantiation_is_a_noop(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        # v0.x env vars must not crash v1.0 startup — pydantic-settings
+        # `extra="ignore"` handles this. Regression against a future
+        # change flipping to `extra="forbid"` and breaking upgraders.
+        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "1200")
+        monkeypatch.setenv("POLLER_INTERVAL_SECONDS", "30")
+        PollerSettings()  # no exception
+
+
+# --- HttpSettings ---
+
+
+class TestHttpSettings:
+    """FastAPI listener config. Loopback default is fail-closed; the
+    cross-field validator refuses a non-loopback bind without an API
+    key so unauthed /poll / /reauth aren't silently exposed."""
 
     @pytest.fixture(autouse=True)
     def _isolate_env(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
-        monkeypatch.delenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", raising=False)
+        for var in ("HTTP_BIND_HOST", "HTTP_BIND_PORT", "HTTP_API_KEY"):
+            monkeypatch.delenv(var, raising=False)
 
-    def test_default_is_1200_seconds(self):
-        s = PollerSettings()
-        assert s.heartbeat_interval_seconds == 1200
+    def test_defaults(self):
+        s = HttpSettings()
+        assert s.bind_host == "127.0.0.1"
+        assert s.bind_port == 8080
+        assert s.api_key is None
+
+    def test_bind_host_env_override_loopback(self, monkeypatch):
+        # 127.0.0.1 override is still loopback → no api_key required.
+        monkeypatch.setenv("HTTP_BIND_HOST", "127.0.0.1")
+        s = HttpSettings()
+        assert s.bind_host == "127.0.0.1"
+
+    def test_bind_port_env_override(self, monkeypatch):
+        monkeypatch.setenv("HTTP_BIND_PORT", "9000")
+        s = HttpSettings()
+        assert s.bind_port == 9000
+
+    def test_api_key_env_override(self, monkeypatch):
+        monkeypatch.setenv("HTTP_API_KEY", "shhh")
+        s = HttpSettings()
+        assert s.api_key == "shhh"
+
+    @pytest.mark.parametrize("port", ["0", "65536", "-1"])
+    def test_port_out_of_range_rejected(self, monkeypatch, port):
+        monkeypatch.setenv("HTTP_BIND_PORT", port)
+        with pytest.raises(Exception):
+            HttpSettings()
+
+    def test_public_bind_without_api_key_rejected(self, monkeypatch):
+        """Fail-fast guard: opening bind beyond loopback without an
+        API key would expose unauthenticated /poll + /reauth. Refuse
+        to load rather than silently boot into that state."""
+        monkeypatch.setenv("HTTP_BIND_HOST", "0.0.0.0")
+        with pytest.raises(Exception, match="HTTP_API_KEY"):
+            HttpSettings()
+
+    def test_public_bind_with_api_key_accepted(self, monkeypatch):
+        monkeypatch.setenv("HTTP_BIND_HOST", "0.0.0.0")
+        monkeypatch.setenv("HTTP_API_KEY", "shhh")
+        s = HttpSettings()
+        assert s.bind_host == "0.0.0.0"
+        assert s.api_key == "shhh"
+
+    def test_public_bind_with_empty_api_key_rejected(self, monkeypatch):
+        # Empty string is truthy-string but semantically unset — the
+        # validator treats "" as absent (same as None).
+        monkeypatch.setenv("HTTP_BIND_HOST", "0.0.0.0")
+        monkeypatch.setenv("HTTP_API_KEY", "")
+        with pytest.raises(Exception, match="HTTP_API_KEY"):
+            HttpSettings()
+
+
+# --- OAuthSettings ---
+
+
+class TestOAuthSettings:
+    """redirect_uri is optional at settings load — CLI reauth and
+    /healthz don't need it. Endpoints that do (POST /reauth,
+    GET /auth/start) enforce it at call time with a clear 500 error."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate_env(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("OAUTH_REDIRECT_URI", raising=False)
+
+    def test_default_is_none(self):
+        s = OAuthSettings()
+        assert s.redirect_uri is None
 
     def test_env_override(self, monkeypatch):
-        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "600")
-        s = PollerSettings()
-        assert s.heartbeat_interval_seconds == 600
+        monkeypatch.setenv(
+            "OAUTH_REDIRECT_URI", "http://127.0.0.1:8080/auth/callback"
+        )
+        s = OAuthSettings()
+        assert s.redirect_uri == "http://127.0.0.1:8080/auth/callback"
 
-    def test_zero_accepted_as_disable(self, monkeypatch):
-        """0 = "no heartbeat ever" — explicit disable path, must not
-        be rejected as "invalid" (that's what negative is for)."""
-        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "0")
-        s = PollerSettings()
-        assert s.heartbeat_interval_seconds == 0
 
-    def test_negative_rejected(self, monkeypatch):
-        """Fail-fast on typos / bad config. Silently falling back to
-        default would let the operator think heartbeat was on when it
-        wasn't (or vice versa)."""
-        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "-5")
-        with pytest.raises(Exception):
-            PollerSettings()
+# --- removed env var soft-migration ---
+
+
+class TestWarnRemovedEnvVars:
+    """v0.x env vars that are gone in v1.0 must not silently vanish
+    from the operator's view — a single INFO per set-but-ignored var
+    at startup is the entire deprecation contract."""
+
+    def test_no_removed_vars_present_is_silent(self, monkeypatch, caplog):
+        monkeypatch.delenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", raising=False)
+        monkeypatch.delenv("POLLER_INTERVAL_SECONDS", raising=False)
+        with caplog.at_level(logging.INFO):
+            warn_removed_env_vars()
+        assert not any(
+            "set but ignored" in r.message for r in caplog.records
+        )
+
+    def test_present_var_logs_info_with_reason(self, monkeypatch, caplog):
+        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "1200")
+        with caplog.at_level(logging.INFO):
+            warn_removed_env_vars()
+        matches = [r for r in caplog.records if "set but ignored" in r.message]
+        assert len(matches) == 1
+        assert "POLLER_HEARTBEAT_INTERVAL_SECONDS" in matches[0].message
+        assert "heartbeat" in matches[0].message.lower()
+
+    def test_both_vars_present_logs_both(self, monkeypatch, caplog):
+        monkeypatch.setenv("POLLER_HEARTBEAT_INTERVAL_SECONDS", "1200")
+        monkeypatch.setenv("POLLER_INTERVAL_SECONDS", "30")
+        with caplog.at_level(logging.INFO):
+            warn_removed_env_vars()
+        matches = [r for r in caplog.records if "set but ignored" in r.message]
+        assert len(matches) == 2
