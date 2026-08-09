@@ -509,17 +509,34 @@ tests/                  # Pytest scaffolding (357 tests as of this branch)
 
 ## How LLM analyze failures are handled
 
-The analyze node can hit a hard ceiling if the email + system prompt
-overflows the LLM's context window. `openai` surfaces this as
-`LengthFinishReasonError` after `finish_reason=length`. Left uncaught
-it escapes the LangGraph invoke, the poller logs
-`Unhandled error during tick; will retry`, and the same doomed call
-re-fires every 30 s until Gmail's history retention rolls the message
-off — meanwhile no other emails get processed.
+The analyze node can hit two distinct hard failures around context
+size — same underlying "mail too big" family, but the LLM surfaces
+them as different exception classes and each needs its own catch:
 
-`_analyze` catches the error, logs the prompt / completion token counts,
-and returns an `AnalysisFailed` side-effect. The graph completes
-normally, `notify` sends a distinct Telegram message
+**Output truncation** (`openai.LengthFinishReasonError`, `finish_reason=length`).
+Server returns HTTP 200 with a partial JSON that never closed. Often
+a symptom of degenerate generation on a local model rather than the
+mail itself being enormous — see the `LLM_ANALYZE_MAX_TOKENS` cap.
+
+**Input overflow** (`openai.BadRequestError`, HTTP 400 with an
+`exceed_context_size_error` / `context_length_exceeded` signature).
+Server rejects the request before generating a single token because
+the prompt (system prompt + email body) alone exceeds the model's
+context window. Typical trigger: a giant HTML newsletter with inline
+base64 images that `html_to_text` didn't strip, a long forum thread
+with quote piles, or an auto-generated content dump.
+
+Both cases were previously uncaught — the exception escaped the
+LangGraph invoke, the poller logged `Unhandled error during tick;
+will retry`, and the same doomed call re-fired every 30 s until
+Gmail's history retention rolled the message off. Meanwhile no other
+emails got processed.
+
+`_analyze` now catches both and returns an `AnalysisFailed`
+side-effect with a distinct `reason` variant (`content_too_long` for
+the output case, `prompt_too_long` for the input case). The graph
+completes normally, `notify` sends a Telegram message that names the
+failure mode so the operator's remediation is unambiguous:
 
 ```
 ⚠️ LLM 分析失敗
@@ -527,14 +544,25 @@ normally, `notify` sends a distinct Telegram message
 標題: <the offending mail's subject>
 寄件者: <sender>
 
-原因: 郵件內容超過 LLM token 上限,無法完成結構化分析。
-用量: prompt=31059 completion=1709
+原因: 郵件內容超出 LLM 上下文視窗 (HTTP 400),無法送出分析請求。
+用量: prompt=58245 n_ctx=32768
 
 → 請打開原信手動處理。
 ```
 
-and no placeholder row lands in `email_analyses` — analyze failures
-don't pollute the analytics table.
+No placeholder row lands in `email_analyses` — analyze failures
+don't pollute the analytics table. The message id is still recorded
+in `processed_messages`, so the poller does NOT re-fire the same
+doomed request on the next tick.
+
+Non-context-length 400s (bad auth, invalid tool spec, schema
+violations) are **NOT** swallowed as `AnalysisFailed` — those are
+real bugs that must surface, so they propagate to the poller's outer
+`except Exception` where they show up as `Unhandled error during
+tick`. The catch's heuristic is narrow: matches only on
+`error.type == "exceed_context_size_error"` (llama-cpp-server),
+`error.code == "context_length_exceeded"` (OpenAI), or a message
+text containing both `"context"` and a length/size/window word.
 
 ## How the analyze prompt separates real transactions from boilerplate
 

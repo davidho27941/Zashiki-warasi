@@ -281,9 +281,16 @@ class AnalysisFailed(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     kind: Literal["analysis_failed"] = "analysis_failed"
-    reason: Literal["content_too_long"]
-    # Free-form context (e.g. token counts from LengthFinishReasonError)
-    # so the Telegram message shows something actionable.
+    # Distinct failure modes with different operator remediation:
+    # - content_too_long: server returned 200 with finish_reason=length
+    #   (output was truncated mid-JSON — often local-model degeneracy)
+    # - prompt_too_long: server rejected the request with HTTP 400
+    #   because the input alone exceeded the context window — this is
+    #   a mail-size problem, not a model-tuning problem
+    reason: Literal["content_too_long", "prompt_too_long"]
+    # Free-form context (e.g. token counts from LengthFinishReasonError
+    # or from the 400 body's n_prompt_tokens / n_ctx fields) so the
+    # Telegram message shows something actionable.
     detail: str | None = None
 
 
