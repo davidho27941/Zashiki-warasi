@@ -13,7 +13,10 @@ which is roughly what an email agent that watches your inbox is supposed to do.
 
 ## What it does
 
-1. Polls your Gmail account using the `historyId` cursor (incremental, no
+1. Runs as a FastAPI service (`uvicorn zashiki_warasi.web:app`); an
+   external scheduler (host `crontab` or k8s `CronJob`) triggers one
+   poll cycle per invocation by hitting `POST /poll`. Each cycle
+   advances the Gmail `historyId` cursor (incremental, no
    re-fetching).
 2. For each new message, asks an LLM to produce a structured
    `{ category, importance, urgency, summary, keywords }` analysis.
@@ -224,19 +227,27 @@ remains the source of truth.
 
 ### 6. Run
 
+Local dev / smoke:
+
 ```bash
-uv run zashiki-warasi
+uv run zashiki-warasi serve          # start FastAPI on 127.0.0.1:8080
+uv run zashiki-warasi tick           # one-off poll cycle, prints TickResult JSON
+uv run zashiki-warasi reauth         # bootstrap OAuth (opens a browser)
+uv run zashiki-warasi sync-notion    # one-shot Notion→DB pull
 ```
 
-On startup the poller fetches the current `historyId` as a baseline —
-backlog is **not** processed; only messages arriving from that point
-onwards are picked up. Polling runs at 30-second intervals by default.
+Production is the containerized service driven by external cron —
+see [Deploy](#deploy).
+
+On the first `tick` (whether via CLI, HTTP, or cron) the poller
+fetches the current `historyId` as a baseline — backlog is **not**
+processed; only messages arriving from that point onwards are picked
+up.
 
 #### Starting from a clean slate
 
 ```bash
-uv run zashiki-warasi --reset       # asks [y/N] first
-uv run zashiki-warasi --reset -y    # skip the prompt
+uv run zashiki-warasi run-legacy --reset -y   # hidden subcommand: TRUNCATE + one tick
 ```
 
 `--reset` `TRUNCATE`s every domain table (`gmail_sync_state`,
@@ -273,47 +284,75 @@ One-shot manual sync (e.g. for debugging or after `NOTION_SYNC_INTERVAL_SECONDS=
 uv run zashiki-warasi sync-notion
 ```
 
-## Docker
+## Deploy
 
-A self-contained stack (app + Postgres) is provided for users without
-an existing Postgres. Migrations are run automatically by the
-entrypoint before the poller boots.
+v1.0 ships two deploy modes on top of the same container image, both
+assuming an **external** Postgres reachable via `DATABASE_URL`. The
+built-in daemon loop is gone — cadence is owned by an external cron
+(host `crontab`) or a k8s `CronJob` calling `POST /poll` on the
+service.
 
-```bash
-cp .env.example .env                                # fill in LLM / Telegram / Notion
-mkdir credentials && cp /path/to/credentials.json credentials/   # OAuth client
-docker compose up --build
-```
+Upgrading from v0.6.x: see [`MIGRATION-v1.md`](MIGRATION-v1.md).
 
-First boot: the container needs to complete OAuth interactively.
-Until `credentials/token.json` exists on the host, run the flow once
-with stdin attached:
+### Docker Compose (single-node homelab)
 
 ```bash
-docker compose run --rm app
-# follow the OAuth URL, paste the code; token.json gets cached in the
-# named volume so subsequent runs are non-interactive.
+cd deploy/compose
+cp .env.example .env                                 # fill DATABASE_URL, HTTP_API_KEY, OAUTH_REDIRECT_URI, …
+mkdir -p secrets data
+cp /path/to/credentials.json secrets/credentials.json
+docker compose up -d --build
+curl http://127.0.0.1:8080/healthz                   # expect 200
+crontab -e                                           # paste from crontab.example
 ```
 
-CLI flags pass through `docker compose run`:
+Full quickstart: [`deploy/compose/README.md`](deploy/compose/README.md).
+
+### Helm (k8s)
 
 ```bash
-docker compose run --rm app --reset -y
-docker compose run --rm app sync-notion
+helm install zashiki ./deploy/helm/zashiki-warasi -f values.local.yaml
+kubectl port-forward svc/zashiki-zashiki-warasi 8080:8080
+curl http://127.0.0.1:8080/healthz
 ```
 
-**Using your own Postgres** — don't `docker compose up`. Build the
-image and `docker run` it directly with `DATABASE_URL` pointing at
-your existing instance:
+Values shape is in [`deploy/helm/zashiki-warasi/values.yaml`](deploy/helm/zashiki-warasi/values.yaml).
+`replicaCount` defaults to `1` but the app's Postgres-backed
+coordination (advisory-lock tick single-flight + shared OAuth flow
+store) makes any positive value safe — bump it when the WebUI epic
+lands and read traffic wants HA. The cron cadence is a `CronJob`
+spawning a `curlimages/curl` pod every minute (`* * * * *` by
+default, `concurrencyPolicy: Forbid`).
 
-```bash
-docker build -t zashiki-warasi .
-docker run --rm -it \
-  --env-file .env \
-  -v "$PWD/credentials:/app/credentials:ro" \
-  -v zashiki_token:/root/.config/zashiki-warasi \
-  zashiki-warasi
+## Reauth (headless)
+
+OAuth token refresh in a container without an interactive terminal
+on the host, via the FastAPI-brokered web flow:
+
 ```
+# 1. From your workstation:
+ssh -L 8080:localhost:8080 you@container-host      # loopback tunnel
+
+# 2. Trigger the flow:
+curl -X POST http://127.0.0.1:8080/reauth -H "X-API-Key: $HTTP_API_KEY"
+# Response:
+#   {"auth_url": "http://127.0.0.1:8080/auth/start?csrf=…", "expires_in": 600, "state": "…"}
+
+# 3. Open the auth_url in your workstation's browser.
+#    Google consent → redirect to /auth/callback → token.json updated
+#    → the running Gmail client reloads its credentials → 200 OK.
+```
+
+The CLI `zashiki-warasi reauth` (`InstalledAppFlow.run_local_server()`)
+also still works for local dev.
+
+Redirect URI setup (which URI to register in the Google Cloud
+Console, and how to pick between loopback / Cloudflare Tunnel /
+public domain) is in [`docs/oauth-redirect-uri.md`](docs/oauth-redirect-uri.md).
+
+With `replicaCount > 1`, the callback may land on a different replica
+than the one that served `/reauth` — the Postgres-backed flow store
+makes this transparent.
 
 ## Configuration
 
@@ -342,7 +381,15 @@ project root is supported via `pydantic-settings`).
 | `NOTION_SYNC_INTERVAL_SECONDS` | `300` | Background Notion→DB sync cadence; `0` disables the puller thread |
 | `LOG_LEVEL` | `INFO` | Root logger level. One of `DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive) |
 | `LOG_LEVEL_ZASHIKI` | _(inherit)_ | Level for our `zashiki_warasi.*` tree only — flip DEBUG on our code without unmuting httpx / google.auth / openai chatter |
-| `POLLER_HEARTBEAT_INTERVAL_SECONDS` | `1200` | Periodic INFO `poller alive, cursor=<id>` when no tick emits INFO. Enough that a multi-hour silence in the log is a clear "poller stopped" signal. Set to `0` to disable |
+| `HTTP_BIND_HOST` | `127.0.0.1` | FastAPI listener bind address. Container defaults to `0.0.0.0` |
+| `HTTP_BIND_PORT` | `8080` | FastAPI listener port |
+| `HTTP_API_KEY` | _(empty)_ | Optional shared secret. When set, `POST /poll` and `POST /reauth` require `X-API-Key`. **Required** whenever `HTTP_BIND_HOST != 127.0.0.1` — the app refuses to start if the combination is unauthenticated-non-loopback |
+| `OAUTH_REDIRECT_URI` | _(unset)_ | Absolute URL Google redirects to after consent. Required for the headless `POST /reauth` flow; unused by CLI `reauth`. See [`docs/oauth-redirect-uri.md`](docs/oauth-redirect-uri.md) |
+
+**Removed in v1.0** (silently ignored on startup with a one-time INFO
+log): `POLLER_INTERVAL_SECONDS`, `POLLER_HEARTBEAT_INTERVAL_SECONDS`.
+Cadence is owned by the external scheduler; liveness is `/healthz` +
+the scheduler's own logs.
 
 Switching to `anthropic` additionally requires `uv add langchain-anthropic`.
 
@@ -366,7 +413,7 @@ $ zashiki-warasi 2>&1 | grep 'message_id=17c8f1a9b3d4e5f6'
 | Level | What you'll see | When to use |
 | --- | --- | --- |
 | `DEBUG` | Per-node entry/exit + `elapsed_ms`, decision inputs, tick heartbeats (`tick: 0 new`) | Interactive debugging session, incident triage. Do NOT leave on in production — DEBUG on `zashiki_warasi.*` is chatty (dozens of lines per message) |
-| `INFO` | State transitions worth knowing about after the fact: classified, routed, extracted, persisted, notified, tick advanced, credentials refreshed, checkpointer pool opened/closed, and a periodic `poller alive, cursor=<id>` heartbeat (once per `POLLER_HEARTBEAT_INTERVAL_SECONDS`) so absence of the line is itself a "loop stopped" signal | Default steady-state cadence |
+| `INFO` | State transitions worth knowing about after the fact: classified, routed, extracted, persisted, notified, tick advanced, credentials refreshed, checkpointer pool opened/closed, OAuth reauth initiated / completed, HTTP request-id stamped on every record inside a `POST /poll` / `POST /reauth` handler. Liveness signal is external in v1.0 (cron log + `/healthz`) — no in-process heartbeat | Default steady-state cadence |
 | `WARNING` | Recoverable anomalies: HistoryExpiredError rebaseline, Notion write failure marked on the row, LLM token limit hit (falls back to `AnalysisFailed`), checkpointer pool discards a stale connection | Should surface even in quiet operation — worth glancing at daily |
 | `ERROR` | A specific unit of work failed and was abandoned; poller keeps running | Always visible; typically indicates a bug or bad data |
 | `CRITICAL` | Process cannot continue without operator action: `CredentialRefreshError` (exit `78`), checkpointer pool exhausted its reconnect budget (exit `71`) | Always visible |
@@ -400,11 +447,16 @@ $ zashiki-warasi 2>&1 | grep 'message_id=17c8f1a9b3d4e5f6'
   hiccups on an incident timeline.
 - `grep 'node=' | grep 'exit '` — per-node timing across the graph
   (requires DEBUG on `zashiki_warasi.*`).
-- `grep 'poller alive'` — quick liveness check on a running instance.
-  Should appear at the configured `POLLER_HEARTBEAT_INTERVAL_SECONDS`
-  cadence; a gap much wider than that is a "loop stopped" signal
-  (past incident: 10 h silence overnight → mails piling up
-  in-mailbox unnoticed until manual restart).
+- `grep 'request_id=<value>'` — full lifecycle of one FastAPI request
+  across the HTTP handler, tick body, LLM/Gmail/DB calls. The value
+  comes from either the client-supplied `X-Request-ID` header or a
+  fresh `uuid.hex[:12]` the middleware generates; it's also echoed
+  back on the response header.
+- Liveness check: no `poller alive` heartbeat in v1.0 — instead
+  probe `/healthz` (200 iff DB reachable AND OAuth token
+  refreshable) or grep the cron log for `200` responses at expected
+  cadence. `grep -v ' 200$' /var/log/zashiki-cron.log` surfaces every
+  non-success including single-flight `409`s.
 
 An unknown level (`LOG_LEVEL=verbose`) fails the process at startup
 with a clear error — silent fallback to `INFO` would let you believe
@@ -494,18 +546,26 @@ tests/                  # Pytest scaffolding (357 tests as of this branch)
   keep restarting the process, but each restart will land on the same
   bad token and exit immediately — the alert is the actionable signal,
   not the log spam.
-- **Poller loop silently stops (process throttled, macOS sleep,
-  App Nap, deep pause).** The poller emits a periodic INFO
-  `poller alive, cursor=<id>` at `POLLER_HEARTBEAT_INTERVAL_SECONDS`
-  cadence (default 20 min). The heartbeat timer uses
-  `time.monotonic()`, so if the process is truly frozen it freezes
-  with it — the log stops advancing, and the *absence* of the
-  expected line is the signal that the loop is not running. On
-  resume, exactly one heartbeat fires from the next tick (not a
-  burst catching up), so recovery reads cleanly in the log. Detection
-  is operator-side (grep, `journalctl` scroll, or an external
-  watchdog on the log stream); the app does not auto-recover from
-  this state.
+- **Service unreachable / cron stopped firing** (was: "poller loop
+  silently stops" in v0.6.x). v1.0 removes the in-process daemon
+  loop, so this failure mode is now covered by three independent
+  external signals — no in-process heartbeat needed:
+  - The container-orchestrator status (`docker compose ps` /
+    `kubectl get pod`) reflects `restarting` / `CrashLoopBackOff`
+    for a crashed process.
+  - `/healthz` returns 503 with per-check booleans (`db` / `oauth`).
+    Wire it into the compose `healthcheck:` block, the k8s
+    `livenessProbe`, and any external monitor (Uptime Kuma etc.).
+  - The external scheduler's own log. Cron logs a `200` per
+    successful `POST /poll`; missing lines OR non-2xx codes are
+    the "loop stopped" signal. `grep -v ' 200$'
+    /var/log/zashiki-cron.log` surfaces every anomaly including
+    single-flight `409`s.
+
+  Host suspension that stopped v0.6.x for hours (macOS App Nap,
+  unattended sleep) can't hide from these signals — the scheduler
+  and the probe run on infrastructure independent of the Python
+  process.
 
 ## How LLM analyze failures are handled
 
@@ -531,6 +591,12 @@ LangGraph invoke, the poller logged `Unhandled error during tick;
 will retry`, and the same doomed call re-fired every 30 s until
 Gmail's history retention rolled the message off. Meanwhile no other
 emails got processed.
+
+The related `/healthz` endpoint is orthogonal to these LLM failures:
+it reflects **DB + OAuth token readiness**, not LLM reachability. A
+Telegram `⚠️ LLM 分析失敗` message means the LLM is broken or the
+mail is oversized; `/healthz` will still return 200 in that case
+(unless the DB or OAuth token is also unhealthy).
 
 `_analyze` now catches both and returns an `AnalysisFailed`
 side-effect with a distinct `reason` variant (`content_too_long` for
