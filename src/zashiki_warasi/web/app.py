@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from zashiki_warasi.core.config import warn_removed_env_vars
 from zashiki_warasi.core.logging import configure_logging
 from zashiki_warasi.core.services import build_services, close_services
+from zashiki_warasi.web.middleware.request_id import RequestIdMiddleware
 from zashiki_warasi.web.routers import auth, health, poll, reauth
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,9 @@ def create_app() -> FastAPI:
         ),
         lifespan=lifespan,
     )
+    # Request-id middleware runs first so its ContextVar is set before
+    # any handler / dependency / log line executes for the request.
+    application.add_middleware(RequestIdMiddleware)
     application.include_router(health.router)
     application.include_router(poll.router)
     application.include_router(auth.router)

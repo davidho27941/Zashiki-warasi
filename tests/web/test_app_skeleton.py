@@ -46,25 +46,27 @@ class TestEndpointRegistration:
     responds with something (not 404). Real bodies land in later
     groups; here we're pinning the URL contract only."""
 
-    def test_healthz_registered(self, client):
+    def test_healthz_registered(self, client, mock_services):
+        # Configure the mock so /healthz's real checks (from Group 5)
+        # can run: db pool.connection() as CM + credentials attrs.
+        cursor = MagicMock()
+        cursor.fetchone.return_value = (1,)
+        cursor_cm = MagicMock()
+        cursor_cm.__enter__.return_value = cursor
+        conn = MagicMock()
+        conn.cursor.return_value = cursor_cm
+        conn_cm = MagicMock()
+        conn_cm.__enter__.return_value = conn
+        mock_services.checkpointer_pool.connection.return_value = conn_cm
+        mock_services.credentials.expired = False
+        mock_services.credentials.refresh_token = "r"
+
         r = client.get("/healthz")
         assert r.status_code == 200
-        # Session-1 stub shape; the full check dict lands in Group 5.
-        body = r.json()
-        assert body["status"] == "healthy"
-        assert "checks" in body
-
-    def test_poll_registered_but_not_implemented(self, client):
-        r = client.post("/poll")
-        assert r.status_code == 501
-        assert "not_implemented" in r.json()["detail"]
-
-    def test_reauth_registered_but_not_implemented(self, client):
-        r = client.post("/reauth")
-        assert r.status_code == 501
-        assert "not_implemented" in r.json()["detail"]
+        assert r.json()["status"] == "healthy"
 
     def test_auth_start_registered_but_not_implemented(self, client):
+        # /auth/* stays a stub until Group 9.
         r = client.get("/auth/start?csrf=abc")
         assert r.status_code == 501
         assert "not_implemented" in r.json()["detail"]
@@ -77,6 +79,10 @@ class TestEndpointRegistration:
     def test_undocumented_path_is_404(self, client):
         r = client.get("/does-not-exist")
         assert r.status_code == 404
+
+    # Note: /poll (Group 6) and /reauth (still a stub until Group 10,
+    # but already protected by require_api_key) have dedicated test
+    # modules (tests/web/test_poll.py, tests/web/test_auth.py).
 
 
 class TestServicesDependency:

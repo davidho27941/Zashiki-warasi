@@ -1,9 +1,4 @@
-"""Shared FastAPI dependency providers.
-
-`get_services()` is the canonical way handlers access long-lived
-collaborators (DB pool, Gmail client, agent, notifier, ...). Tests
-override it via `app.dependency_overrides[get_services] = ...`.
-"""
+"""`get_services` FastAPI dependency provider."""
 
 from __future__ import annotations
 

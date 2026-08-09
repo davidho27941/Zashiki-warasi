@@ -7,12 +7,14 @@ put + auth_url response.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
+
+from zashiki_warasi.web.dependencies import require_api_key
 
 router = APIRouter(tags=["reauth"])
 
 
-@router.post("/reauth")
+@router.post("/reauth", dependencies=[Depends(require_api_key)])
 async def reauth() -> dict:
     raise HTTPException(
         status_code=501,
