@@ -27,6 +27,13 @@ imagePullSecrets: []
 # surface" — tick throughput is unchanged (still one tick in flight
 # system-wide). See design D17 in the migrate-to-fastapi-service
 # openspec change.
+#
+# BEFORE raising this above 1: check `persistence.accessMode` below.
+# The default ReadWriteOnce PVC only attaches to one node — a second
+# pod scheduled to a different node will hit `MultiAttach error`.
+# For multi-node HA you need `persistence.accessMode: ReadWriteMany`
+# AND a storage class that supports it (Longhorn share-manager, NFS,
+# CephFS, EFS, ...).
 replicaCount: 1
 
 # Rolling updates are safe at any replica count — advisory lock
@@ -101,6 +108,13 @@ oauth:
   tokenJson: ""                       # contents of token.json — optional (bootstrap via /reauth)
 
 # ---------- Persistent storage for /data (token.json + future state) ----------
+# accessMode note:
+#   - ReadWriteOnce (RWO): default. Universally supported. Multi-node
+#     `replicaCount > 1` is BLOCKED because a RWO PVC can only be
+#     attached to one node at a time (MultiAttach error).
+#   - ReadWriteMany (RWX): required for `replicaCount > 1` when pods
+#     may land on different nodes. Requires an RWX-capable storage
+#     class (Longhorn share-manager, NFS, CephFS, EFS, ...).
 persistence:
   enabled: true
   storageClass: ""                    # "" = cluster default
