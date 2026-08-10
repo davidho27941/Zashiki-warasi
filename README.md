@@ -99,10 +99,18 @@ Gmail API ◀──────▶│ GmailClient (auth, fetch, history)   │
 
 - Python 3.13+
 - [uv](https://github.com/astral-sh/uv)
-- PostgreSQL (local or remote)
+- PostgreSQL (local or remote). Create the database with
+  `WITH ENCODING 'UTF8' TEMPLATE template0` — the analyze node writes
+  Chinese JSON to `email_analyses.keywords`; a `SQL_ASCII`-encoded DB
+  will crash on `_persist` (see `docs/v1.0-smoke-lessons.md` issue #14).
 - An LLM endpoint. Defaults assume [llama.cpp](https://github.com/ggerganov/llama.cpp)
   running locally with `llama-server` on port 8080.
-- A Google Cloud OAuth 2.0 Client ID (Desktop type) for Gmail access.
+- A Google Cloud OAuth 2.0 Client ID for Gmail access. **Desktop app**
+  type is the simplest — Google auto-allows loopback redirect URIs
+  (`http://127.0.0.1:*`) without any manual URI registration, which is
+  what both the CLI `reauth` and the container's headless flow rely
+  on. **Web application** type works too but requires you to register
+  the redirect URI in the console. See [`docs/oauth-redirect-uri.md`](docs/oauth-redirect-uri.md).
 
 ## Setup
 
@@ -320,9 +328,22 @@ Values shape is in [`deploy/helm/zashiki-warasi/values.yaml`](deploy/helm/zashik
 `replicaCount` defaults to `1` but the app's Postgres-backed
 coordination (advisory-lock tick single-flight + shared OAuth flow
 store) makes any positive value safe — bump it when the WebUI epic
-lands and read traffic wants HA. The cron cadence is a `CronJob`
+lands and read traffic wants HA. For `replicaCount > 1` on a
+multi-node cluster you must also set `persistence.accessMode:
+ReadWriteMany` AND have an RWX-capable storage class (Longhorn
+share-manager, NFS, CephFS, ...). The cron cadence is a `CronJob`
 spawning a `curlimages/curl` pod every minute (`* * * * *` by
 default, `concurrencyPolicy: Forbid`).
+
+### Smoke-test lessons
+
+Everything caught during v1.0 Proxmox docker + k3s Helm smoke
+(14 issues, categorised by symptom → root cause → fix → prevention)
+is in [`docs/v1.0-smoke-lessons.md`](docs/v1.0-smoke-lessons.md)
+(中文版 [`v1.0-smoke-lessons.zh.md`](docs/v1.0-smoke-lessons.zh.md)).
+Read this before rolling a similar-scope migration yourself — the
+things that break at deploy time are rarely the things unit tests
+catch.
 
 ## Reauth (headless)
 
@@ -466,40 +487,69 @@ DEBUG was on when it wasn't.
 
 ```
 src/zashiki_warasi/
-├── app.py              # entry point (uv run zashiki-warasi) — click group,
-│                       # boots poller + Notion puller thread, shared stop_event
+├── app.py                       # CLI entry (uv run zashiki-warasi) — click group.
+│                                # Subcommands: serve (uvicorn), tick (one-off
+│                                # tick_once + JSON), reauth, sync-notion.
+├── web/                         # FastAPI service — `uvicorn zashiki_warasi.web:app`
+│   ├── app.py                   # application factory + lifespan (build_services)
+│   ├── dependencies/            # get_services + require_api_key
+│   ├── middleware/              # request-id (honors X-Request-ID header)
+│   └── routers/                 # health.py, poll.py, auth.py, reauth.py
+├── coordination/                # Cross-replica primitives (Postgres-backed)
+│   ├── advisory_lock.py         # pg_try_advisory_lock context manager for
+│   │                            # POST /poll single-flight (session-scoped)
+│   └── oauth_flow_store.py      # oauth_flows table wrapper for OAuth
+│                                # web-flow state (survives cross-replica callback)
 ├── core/
-│   ├── config.py       # GmailSettings / DatabaseSettings / LLMSettings /
-│   │                   # TelegramSettings / NotionSettings
-│   ├── db.py           # SQLAlchemy engine (pool_pre_ping + recycle),
-│   │                   # session factory, reset_database()
-│   ├── models.py       # ORM: GmailSyncState, ProcessedMessage,
-│   │                   # EmailAnalysis, ExpenseRecord, NotionSyncState
-│   └── schemas.py      # Pydantic: EmailMessage, AttachmentMeta,
-│                       # EmailAnalysis, ExpenseDraft / Logged / NeedsReview,
-│                       # AnalysisFailed, SideEffect discriminated union
+│   ├── config.py                # BaseSettings: Http / OAuth / Gmail / Database /
+│   │                            # LLM / Telegram / Notion / Logging / Poller
+│   ├── services.py              # Services dataclass + build_services() —
+│   │                            # single-shot bootstrap for CLI + FastAPI lifespan
+│   ├── db.py                    # SQLAlchemy engine + session factory
+│   ├── logging.py               # ContextFormatter + LoggerAdapter helpers;
+│   │                            # request_id + message_id contextvars
+│   ├── models.py                # ORM: GmailSyncState, ProcessedMessage,
+│   │                            # EmailAnalysis, ExpenseRecord, NotionSyncState
+│   └── schemas.py               # Pydantic: EmailMessage, TickResult,
+│                                # EmailAnalysis, ExpenseDraft/Logged/NeedsReview,
+│                                # AnalysisFailed, SideEffect discriminated union
 ├── gmail/
-│   ├── auth.py         # OAuth Installed App flow
-│   ├── client.py       # Gmail API wrapper (with HTTP timeout, tool-friendly)
-│   ├── exceptions.py   # GmailError hierarchy
-│   └── poller.py       # historyId-based polling loop
+│   ├── auth.py                  # OAuth Installed App flow (CLI reauth path)
+│   ├── client.py                # Gmail API wrapper + reload_credentials()
+│   ├── exceptions.py            # GmailError hierarchy
+│   └── poller.py                # tick_once(services.poller) + Poller helpers
 ├── agents/
-│   ├── llm.py          # Chat model factory (provider-agnostic)
-│   ├── email_agent.py  # Analyze node + router; catches
-│   │                   # LengthFinishReasonError → AnalysisFailed
+│   ├── llm.py                   # Chat model factory (provider-agnostic)
+│   ├── email_agent.py           # Analyze + router; catches
+│   │                            # LengthFinishReasonError / BadRequestError
+│   │                            # → AnalysisFailed
 │   └── verticals/
-│       ├── expense.py  # ExpenseSubgraph: extract → persist → Notion sync
-│       ├── pdf.py      # pdfplumber wrapper + collect_text(body + PDFs)
-│       └── html_text.py# html2text wrapper for HTML-only mails
+│       ├── expense.py           # ExpenseSubgraph: extract → persist → Notion
+│       ├── pdf.py               # pdfplumber wrapper + collect_text(body + PDFs)
+│       └── html_text.py         # html2text wrapper for HTML-only mails
 └── notifications/
-    ├── telegram.py     # TelegramNotifier
-    ├── notion.py       # NotionExpenseRecorder (write side)
-    └── notion_puller.py# NotionExpensePuller (background reverse-sync)
-alembic/versions/       # 0001–0007 domain migrations (LangGraph tables self-init)
-docker/                 # entrypoint.sh (alembic upgrade head → exec CLI)
-Dockerfile              # multi-stage uv build
-docker-compose.yml      # bundled Postgres 16 + app (for new users)
-tests/                  # Pytest scaffolding (357 tests as of this branch)
+    ├── telegram.py              # TelegramNotifier
+    ├── notion.py                # NotionExpenseRecorder (write side)
+    └── notion_puller.py         # NotionExpensePuller (background reverse-sync)
+
+alembic/versions/                # domain migrations (LangGraph tables self-init;
+                                 # oauth_flows table also idempotently created
+                                 # by build_services())
+Dockerfile                       # multi-stage uv build (python:3.13-slim-bookworm,
+                                 # non-root uid 10001)
+docker-entrypoint.sh             # `alembic upgrade head` → exec CMD (uvicorn)
+.gitlab-ci.yml                   # build + push to gitlab.davidho.dev:5050
+deploy/
+  compose/                       # docker-compose.yml + .env.example + crontab.example
+  helm/zashiki-warasi/           # Helm chart (Deployment / Service / ConfigMap /
+                                 # Secret / PVC / CronJob / Ingress), init container
+                                 # for token seeding
+docs/
+  oauth-redirect-uri.md          # OAuth strategies (SSH tunnel / tunnel / domain)
+  v1.0-smoke-lessons.md          # 14 issues caught during v1.0 smoke (+.zh.md)
+scripts/check_env_parity.py      # CI-runnable compose ↔ Helm env drift check
+MIGRATION-v1.md                  # v0.6.x → v1.0.0 upgrade path
+tests/                           # Pytest scaffolding — 559 tests as of v1.0
 ```
 
 ## How crash recovery works
