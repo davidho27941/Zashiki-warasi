@@ -35,6 +35,36 @@ spec:
       {{- end }}
       securityContext:
         {{- toYaml .Values.securityContext | nindent 8 }}
+      # Init container seeds /data/token.json from the OAuth Secret on
+      # first deploy. Skipped if /data already has a token (e.g. from
+      # a prior /reauth that wrote to the PVC), preventing operator's
+      # in-cluster reauth from being overwritten by a stale seed on
+      # pod restart. If `oauth.tokenJson` is empty in values (fresh
+      # deploy with no seed), the init container no-ops and the
+      # operator bootstraps via POST /reauth after startup.
+      initContainers:
+        - name: seed-token
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              if [ -f /oauth-seed/token.json ] && [ ! -f /data/token.json ]; then
+                cp /oauth-seed/token.json /data/token.json
+                chmod 600 /data/token.json
+                echo "[init] seeded /data/token.json from Secret"
+              elif [ -f /data/token.json ]; then
+                echo "[init] /data/token.json already present; not overwriting"
+              else
+                echo "[init] no seed in Secret; POST /reauth to bootstrap"
+              fi
+          volumeMounts:
+            - name: oauth-seed
+              mountPath: /oauth-seed
+              readOnly: true
+            - name: data
+              mountPath: /data
       containers:
         - name: zashiki-warasi
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -84,9 +114,14 @@ spec:
             items:
               - key: credentials.json
                 path: credentials.json
-              # token.json is here as a *seed* for the emptyDir/PVC
-              # only if the operator supplied it; the running service
-              # writes updated tokens to /data (the writable mount).
+        # Full OAuth Secret exposed to the seed-token init container
+        # only. Includes token.json when values.oauth.tokenJson is set;
+        # otherwise the secret has no `token.json` key and the init
+        # container's `[ -f /oauth-seed/token.json ]` check is false.
+        - name: oauth-seed
+          secret:
+            secretName: {{ include "zashiki-warasi.fullname" . }}-oauth
+            optional: true
         {{- if .Values.persistence.enabled }}
         - name: data
           persistentVolumeClaim:
