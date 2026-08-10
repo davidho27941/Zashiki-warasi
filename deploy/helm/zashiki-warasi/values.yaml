@@ -6,6 +6,21 @@ image:
   tag: "1.0.0"           # pin an explicit tag — `latest` bites hard on rollbacks
   pullPolicy: IfNotPresent
 
+# k8s imagePullSecrets, needed when the image lives in a private
+# registry (GitLab / Harbor / GHCR-private / ECR). Supply an existing
+# Secret name; the chart doesn't create the Secret itself so it can be
+# rotated + shared across releases.
+#
+# Create with:
+#   kubectl create secret docker-registry regcred \
+#       --docker-server=registry.gitlab.example.com \
+#       --docker-username=<user> \
+#       --docker-password=<token> \
+#       --namespace=<ns>
+imagePullSecrets: []
+# imagePullSecrets:
+#   - name: regcred
+
 # Deployment shape. The app coordinates across replicas via a Postgres
 # advisory lock (`POST /poll` single-flight) + Postgres-backed OAuth
 # flow store, so `replicaCount > 1` is safe and only means "HA HTTP

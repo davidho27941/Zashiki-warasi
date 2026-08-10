@@ -20,6 +20,10 @@ spec:
       backoffLimit: 0
       template:
         spec:
+          {{- with .Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           restartPolicy: Never
           containers:
             - name: curl
