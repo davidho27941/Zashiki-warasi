@@ -342,7 +342,8 @@ Everything caught during v1.0 Proxmox docker + k3s Helm smoke
 is in [`docs/v1.0-smoke-lessons.md`](docs/v1.0-smoke-lessons.md)
 (中文版 [`v1.0-smoke-lessons.zh.md`](docs/v1.0-smoke-lessons.zh.md)).
 Where the shipped v1.0 deviates from what the original design
-specified is in [`docs/v1.0-implementation-notes.md`](docs/v1.0-implementation-notes.md).
+specified is in [`docs/v1.0-implementation-notes.md`](docs/v1.0-implementation-notes.md)
+(中文版 [`v1.0-implementation-notes.zh.md`](docs/v1.0-implementation-notes.zh.md)).
 Read both before rolling a similar-scope migration yourself — the
 things that break at deploy time, and the things whose implementation
 drifts from paper design, are rarely the things unit tests catch.
