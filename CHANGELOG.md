@@ -5,6 +5,104 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0]
+
+Replaces the long-running Python daemon with a FastAPI service driven
+by an external scheduler (host cron / k8s CronJob). Same LangGraph
+agent internals, same Postgres schema, same Telegram interface — new
+transport + deployment shape that escapes host-suspension failure
+modes (macOS App Nap) and unblocks multi-replica HA for the WebUI
+epic. Full write-up in the `migrate-to-fastapi-service` OpenSpec
+archive; migration guide in `MIGRATION-v1.md`.
+
+### Added
+
+- **`http-service` capability** — FastAPI application (`uvicorn
+  zashiki_warasi.web:app`) with `/healthz`, `POST /poll`,
+  `POST /reauth`, `GET /auth/start`, `GET /auth/callback`. Request-id
+  middleware honors `X-Request-ID` header; optional `X-API-Key` auth
+  on the two POSTs; fail-fast bootstrap if bind is non-loopback
+  without a key.
+- **`container-deployment` capability** — Dockerfile (multi-stage,
+  `python:3.13-slim-bookworm`, non-root uid 10001, entrypoint runs
+  `alembic upgrade head`), `deploy/compose/` template with
+  crontab.example, `deploy/helm/zashiki-warasi/` chart (9 templates
+  incl. init container that seeds `token.json` from the OAuth Secret,
+  `imagePullSecrets` support, `replicaCount`-scalable).
+- **`headless-authentication` capability** — OAuth web flow via
+  `POST /reauth` → browser → `GET /auth/callback`; PKCE
+  `code_verifier` persisted in Postgres `oauth_flows` table so the
+  callback can land on any replica.
+- **Cross-replica coordination** (design D17) — `pg_try_advisory_lock`
+  replaces `asyncio.Lock` for `POST /poll` single-flight; Postgres
+  `oauth_flows` table replaces the in-process OAuth flow dict.
+  Validated with two pods on two different k3s nodes racing on
+  `POST /poll` → exactly 1×200 + 9×409.
+- **New CLI subcommands** — `serve` (uvicorn wrapper for dev), `tick`
+  (one-off `tick_once` + JSON output). Hidden `run-legacy` retains
+  v0.6.x one-shot semantics for wrapper compat.
+- **GitLab CI pipeline** (`.gitlab-ci.yml`) — build + push to
+  `gitlab.davidho.dev:5050/homelab/zashiki-warasi` on every push.
+- **`docs/oauth-redirect-uri.md`** — three OAuth redirect URI
+  strategies (SSH tunnel + loopback / Cloudflare Tunnel / public
+  domain + Let's Encrypt) with troubleshooting appendix.
+- **`docs/v1.0-smoke-lessons.md`** (+ `.zh.md`) — 14 issues caught
+  during Proxmox + k3s smoke testing, each with symptom → root cause →
+  fix → prevention. Operator checklist for future migrations of
+  similar scope.
+- **`MIGRATION-v1.md`** — end-to-end v0.6.x → v1.0.0 upgrade path.
+- **`scripts/check_env_parity.py`** — CI-runnable diff between
+  compose `.env.example` and Helm `values.yaml`.
+- **`OAUTHLIB_RELAX_TOKEN_SCOPE=1`** set in Dockerfile ENV + Python
+  `os.environ.setdefault` — Google's token endpoint returns every
+  scope previously granted to the user/client pair; strict oauthlib
+  scope check rejects the superset.
+- **`gmail_client.reload_credentials()`** — swap the Gmail service's
+  credentials without a process restart, called by `/auth/callback`
+  after writing a fresh `token.json`.
+
+### Changed (BREAKING)
+
+- **Entry point removed**: bare `python -m zashiki_warasi` daemon
+  mode is gone; the CLI requires a subcommand. Run `serve` for the
+  FastAPI service, `tick` for a one-off poll, `reauth` for the
+  interactive OAuth flow.
+- **Process model**: the in-process polling loop is deleted;
+  `tick_once` is a pure function invoked per-request by
+  `POST /poll`. Cadence + liveness are owned by an external
+  scheduler (cron / CronJob) + `/healthz` probe.
+- **Deploy shape**: `docker-compose.yml` at the repo root and the
+  `docker/` entrypoint directory are removed. Use
+  `deploy/compose/docker-compose.yml` (external Postgres only, no
+  bundled DB) or `deploy/helm/zashiki-warasi/` (k8s).
+- **Env vars removed** (silently ignored with one-time INFO on
+  startup): `POLLER_INTERVAL_SECONDS`, `POLLER_HEARTBEAT_INTERVAL_SECONDS`.
+- **Env vars added**: `HTTP_BIND_HOST`, `HTTP_BIND_PORT`,
+  `HTTP_API_KEY`, `OAUTH_REDIRECT_URI`, `OAUTHLIB_RELAX_TOKEN_SCOPE`.
+- **DB tables added**: `oauth_flows` (idempotently created at
+  startup). No existing table modified.
+
+### Fixed (during v1.0 smoke)
+
+- Deploy templates now use `GMAIL_*` env prefix matching the code
+  (was `GOOGLE_*` in docs, which the app never read).
+- `.dockerignore` no longer excludes `alembic.ini` + `alembic/` —
+  fresh DBs auto-provision on container start.
+- OAuth flow store persists PKCE `code_verifier` across put/pop —
+  prevents `invalid_grant: Missing code verifier` on
+  `/auth/callback`.
+- `crontab.example` escapes `%` (cron's end-of-command marker) and
+  documents that cron doesn't inherit shell env.
+- Helm chart supports private registries via `imagePullSecrets`;
+  init container seeds `/data/token.json` from OAuth Secret on
+  first boot.
+- Full retrospective in `docs/v1.0-smoke-lessons.md`.
+
+### Migration
+
+See [`MIGRATION-v1.md`](MIGRATION-v1.md). Rollback is a container
+swap — no DB schema incompatibility with v0.6.x.
+
 ## [Unreleased]
 
 ### Fixed
