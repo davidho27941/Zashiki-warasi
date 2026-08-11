@@ -3,17 +3,17 @@
 Mocks `GmailClient` and the handler; uses in-memory SQLite for the
 session factory. Each test exercises one of the documented branches
 (A first-run baseline, B resume, C rebaseline, D1 dedup, D2 deleted,
-D3 normal) or the per-tick cursor advance contract.
+D3 normal), the per-tick cursor advance contract, or the v1.0
+`tick_once` return shape / credential-failure handling.
 """
 
 from __future__ import annotations
 
-import logging
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from google.auth.exceptions import RefreshError
@@ -23,14 +23,13 @@ from zashiki_warasi.core.models import (
     GmailSyncState,
     ProcessedMessage,
 )
-from zashiki_warasi.core.schemas import EmailMessage, ProfileInfo
+from zashiki_warasi.core.schemas import EmailMessage, ProfileInfo, TickResult
 from zashiki_warasi.gmail.client import GmailClient
 from zashiki_warasi.gmail.exceptions import (
-    CredentialRefreshError,
     HistoryExpiredError,
     MessageNotFoundError,
 )
-from zashiki_warasi.gmail.poller import Poller
+from zashiki_warasi.gmail.poller import Poller, tick_once
 from zashiki_warasi.notifications.telegram import TelegramError
 
 
@@ -68,7 +67,6 @@ def poller(mock_client, session_factory, mock_handler) -> Poller:
         client=mock_client,
         session_factory=session_factory,
         handler=mock_handler,
-        interval_seconds=1,
     )
 
 
@@ -98,13 +96,22 @@ def _processed_ids(session_factory) -> set[str]:
         return set(rows)
 
 
+def _prime_state(session_factory, history_id: int) -> None:
+    with session_factory() as session:
+        session.add(
+            GmailSyncState(email_address=EMAIL, history_id=history_id)
+        )
+        session.commit()
+
+
 # ---------- Branch A: first-run baseline ----------
 
 
 class TestBranchABaseline:
     def test_inserts_sync_state_when_missing(self, poller, session_factory):
-        poller._baseline_if_needed(EMAIL, current_history_id=1500)
+        created = poller._baseline_if_needed(EMAIL, current_history_id=1500)
 
+        assert created is True
         state = _read_state(session_factory)
         assert state is not None
         assert state.email_address == EMAIL
@@ -116,6 +123,13 @@ class TestBranchABaseline:
         poller._baseline_if_needed(EMAIL, current_history_id=1500)
         mock_handler.assert_not_called()
 
+    def test_returns_false_when_state_already_exists(
+        self, poller, session_factory
+    ):
+        _prime_state(session_factory, 500)
+        created = poller._baseline_if_needed(EMAIL, current_history_id=9999)
+        assert created is False
+
 
 # ---------- Branch B: resume from existing state ----------
 
@@ -124,11 +138,7 @@ class TestBranchBResume:
     def test_does_not_overwrite_existing_state(
         self, poller, session_factory
     ):
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
 
         poller._baseline_if_needed(EMAIL, current_history_id=9999)
 
@@ -143,32 +153,45 @@ class TestBranchCRebaseline:
     def test_rebaseline_updates_history_id_to_current_profile(
         self, poller, session_factory, mock_client
     ):
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
         mock_client.get_profile.return_value = ProfileInfo(
             email=EMAIL, history_id=2000
         )
 
-        poller._rebaseline(EMAIL)
+        new_cursor = poller._rebaseline(EMAIL)
 
-        state = _read_state(session_factory)
-        assert state.history_id == 2000
+        assert new_cursor == 2000
+        assert _read_state(session_factory).history_id == 2000
 
-    def test_tick_propagates_history_expired(
+    def test_history_expired_bubbles_up_from_run_tick(
         self, poller, session_factory, mock_client
     ):
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
         mock_client.list_history.side_effect = HistoryExpiredError(500)
 
         with pytest.raises(HistoryExpiredError):
-            poller._tick(EMAIL)
+            poller._run_tick(EMAIL)
+
+    def test_tick_once_catches_history_expired_and_rebaselines(
+        self, poller, session_factory, mock_client
+    ):
+        """tick_once() should NEVER let HistoryExpiredError escape;
+        it rebaselines and returns TickResult(rebaselined=True)."""
+        _prime_state(session_factory, 500)
+        # get_profile is called twice: baseline check + rebaseline.
+        # First returns the profile as expected; second is used for
+        # rebaselining after the expired error.
+        mock_client.get_profile.return_value = ProfileInfo(
+            email=EMAIL, history_id=2500
+        )
+        mock_client.list_history.side_effect = HistoryExpiredError(500)
+
+        result = poller.tick_once()
+
+        assert result.rebaselined is True
+        assert result.error is None
+        assert result.cursor_after == 2500
+        assert _read_state(session_factory).history_id == 2500
 
 
 # ---------- Branch D1: already processed (dedup skip) ----------
@@ -178,19 +201,16 @@ class TestBranchD1AlreadyProcessed:
     def test_skips_message_already_in_processed_messages(
         self, poller, session_factory, mock_client, mock_handler
     ):
+        _prime_state(session_factory, 500)
         with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
             session.add(ProcessedMessage(message_id="msg-1"))
             session.commit()
         mock_client.list_history.return_value = iter(["msg-1"])
 
-        poller._tick(EMAIL)
+        poller._run_tick(EMAIL)
 
         mock_client.get_message.assert_not_called()
         mock_handler.assert_not_called()
-        # cursor unchanged
         assert _read_state(session_factory).history_id == 500
 
 
@@ -201,17 +221,13 @@ class TestBranchD2MessageNotFound:
     def test_marks_deleted_message_as_processed(
         self, poller, session_factory, mock_client, mock_handler
     ):
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
         mock_client.list_history.return_value = iter(["msg-deleted"])
         mock_client.get_message.side_effect = MessageNotFoundError(
             "msg-deleted"
         )
 
-        poller._tick(EMAIL)
+        poller._run_tick(EMAIL)
 
         mock_handler.assert_not_called()
         assert "msg-deleted" in _processed_ids(session_factory)
@@ -219,17 +235,13 @@ class TestBranchD2MessageNotFound:
     def test_cursor_not_advanced_for_deleted_only_tick(
         self, poller, session_factory, mock_client
     ):
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
         mock_client.list_history.return_value = iter(["msg-deleted"])
         mock_client.get_message.side_effect = MessageNotFoundError(
             "msg-deleted"
         )
 
-        poller._tick(EMAIL)
+        poller._run_tick(EMAIL)
 
         assert _read_state(session_factory).history_id == 500
 
@@ -241,46 +253,34 @@ class TestBranchD3Normal:
     def test_handler_called_with_parsed_email(
         self, poller, session_factory, mock_client, mock_handler
     ):
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
         email = _make_email("msg-1", history_id=600)
         mock_client.list_history.return_value = iter(["msg-1"])
         mock_client.get_message.return_value = email
 
-        poller._tick(EMAIL)
+        poller._run_tick(EMAIL)
 
         mock_handler.assert_called_once_with(email)
 
     def test_message_recorded_in_processed_messages(
         self, poller, session_factory, mock_client
     ):
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
         mock_client.list_history.return_value = iter(["msg-1"])
         mock_client.get_message.return_value = _make_email("msg-1", 600)
 
-        poller._tick(EMAIL)
+        poller._run_tick(EMAIL)
 
         assert "msg-1" in _processed_ids(session_factory)
 
     def test_cursor_advances_to_message_history_id(
         self, poller, session_factory, mock_client
     ):
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
         mock_client.list_history.return_value = iter(["msg-1"])
         mock_client.get_message.return_value = _make_email("msg-1", 600)
 
-        poller._tick(EMAIL)
+        poller._run_tick(EMAIL)
 
         assert _read_state(session_factory).history_id == 600
 
@@ -292,11 +292,7 @@ class TestCursorAdvance:
     def test_advances_to_max_history_id_in_batch(
         self, poller, session_factory, mock_client
     ):
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
         mock_client.list_history.return_value = iter(
             ["msg-1", "msg-2", "msg-3"]
         )
@@ -306,21 +302,17 @@ class TestCursorAdvance:
             _make_email("msg-3", 650),
         ]
 
-        poller._tick(EMAIL)
+        poller._run_tick(EMAIL)
 
         assert _read_state(session_factory).history_id == 700
 
     def test_no_advance_when_no_new_messages(
         self, poller, session_factory, mock_client
     ):
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
         mock_client.list_history.return_value = iter([])
 
-        poller._tick(EMAIL)
+        poller._run_tick(EMAIL)
 
         assert _read_state(session_factory).history_id == 500
 
@@ -333,12 +325,9 @@ class TestCursorAdvance:
           - first message was processed before the failure
           - second message did NOT get marked processed
           - cursor stayed put (so the batch retries next tick)
+          - RuntimeError propagates (v1.0 FastAPI turns it into HTTP 500)
         """
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
         mock_client.list_history.return_value = iter(["msg-1", "msg-2"])
         mock_client.get_message.side_effect = [
             _make_email("msg-1", 600),
@@ -347,7 +336,7 @@ class TestCursorAdvance:
         mock_handler.side_effect = [None, RuntimeError("LLM broke")]
 
         with pytest.raises(RuntimeError, match="LLM broke"):
-            poller._tick(EMAIL)
+            poller._run_tick(EMAIL)
 
         processed = _processed_ids(session_factory)
         assert "msg-1" in processed
@@ -362,11 +351,7 @@ class TestProcessMessage:
     def test_returns_email_on_success(
         self, poller, session_factory, mock_client
     ):
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
+        _prime_state(session_factory, 500)
         email = _make_email("msg-1", 600)
         mock_client.get_message.return_value = email
 
@@ -395,10 +380,14 @@ class TestProcessMessage:
         assert poller._process_message("msg-x") is None
 
 
-# ---------- graceful shutdown ----------
+# ---------- graceful shutdown (stop_event) ----------
 
 
 class TestGracefulShutdown:
+    """v1.0 no longer has a loop, but stop_event is retained so a
+    long-running tick can be interrupted between messages if the
+    caller sets it (e.g. a future SIGTERM in the FastAPI lifespan)."""
+
     def test_default_stop_event_created_when_none_passed(
         self, mock_client, session_factory, mock_handler
     ):
@@ -426,38 +415,10 @@ class TestGracefulShutdown:
         )
         assert poller.stop_event is event
 
-    def test_run_exits_immediately_when_stop_event_preset(
-        self, mock_client, session_factory, mock_handler
-    ):
-        import threading
-
-        event = threading.Event()
-        event.set()  # request shutdown before run starts
-        poller = Poller(
-            client=mock_client,
-            session_factory=session_factory,
-            handler=mock_handler,
-            interval_seconds=999,  # would hang for ages if not for event
-            stop_event=event,
-        )
-
-        # Baseline still happens (it precedes the loop check), but the
-        # loop body must not execute and run() must return.
-        poller.run()
-
-        mock_client.get_profile.assert_called()  # baseline
-        mock_client.list_history.assert_not_called()  # no tick
-
     def test_tick_stops_between_messages_when_event_set(
         self, mock_client, session_factory, mock_handler
     ):
-        # Baseline so _tick has a cursor to read.
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
-
+        _prime_state(session_factory, 500)
         mock_client.list_history.return_value = iter(
             ["msg-1", "msg-2", "msg-3"]
         )
@@ -479,47 +440,27 @@ class TestGracefulShutdown:
         # Set stop after the handler processes msg-1.
         mock_handler.side_effect = lambda _email: event.set()
 
-        poller._tick(EMAIL)
+        poller._run_tick(EMAIL)
 
-        # msg-1 fully processed (handler called, processed_messages row).
-        # msg-2 and msg-3 skipped — handler called exactly once.
+        # msg-1 fully processed; msg-2 and msg-3 skipped.
         assert mock_handler.call_count == 1
         assert "msg-1" in _processed_ids(session_factory)
         assert "msg-2" not in _processed_ids(session_factory)
 
-    def test_run_loop_does_not_start_new_tick_after_stop(
+
+# ---------- credential failure handling ----------
+
+
+class TestCredentialFailure:
+    """v1.0 catches RefreshError inside tick_once and surfaces it via
+    TickResult.error (with notify + CRITICAL log side-effects), rather
+    than raising CredentialRefreshError like v0.6.x did. The FastAPI
+    handler then returns HTTP 200 with the error field populated —
+    operators still see the failure via Telegram + response body."""
+
+    def test_startup_refresh_error_produces_tickresult_error(
         self, mock_client, session_factory, mock_handler
     ):
-        import threading
-
-        event = threading.Event()
-        poller = Poller(
-            client=mock_client,
-            session_factory=session_factory,
-            handler=mock_handler,
-            interval_seconds=999,
-            stop_event=event,
-        )
-
-        tick_count = {"n": 0}
-        real_tick = poller._tick
-
-        def counting_tick(email):
-            tick_count["n"] += 1
-            event.set()  # ask to stop after this tick
-            return real_tick(email)
-
-        poller._tick = counting_tick  # type: ignore[assignment]
-        poller.run()
-
-        assert tick_count["n"] == 1  # exactly one tick, then exit
-
-    def test_credential_refresh_failure_at_startup_raises_and_stops(
-        self, mock_client, session_factory, mock_handler
-    ):
-        """RefreshError from the first get_profile() must not be
-        swallowed by the tick loop — it needs to surface so the app
-        can exit non-zero and the user can reauth."""
         mock_client.get_profile.side_effect = RefreshError(
             "invalid_grant: revoked"
         )
@@ -531,52 +472,40 @@ class TestGracefulShutdown:
             notifier=notifier,
         )
 
-        with pytest.raises(CredentialRefreshError) as exc_info:
-            poller.run()
+        result = poller.tick_once()
 
-        assert "reauth" in str(exc_info.value)
-        assert poller.stop_event.is_set()
+        assert isinstance(result, TickResult)
+        assert result.error is not None
+        assert "credential_refresh_failed" in result.error
         notifier.send_message.assert_called_once()
 
-    def test_credential_refresh_failure_mid_loop_raises_and_stops(
+    def test_mid_tick_refresh_error_produces_tickresult_error(
         self, mock_client, session_factory, mock_handler
     ):
-        """RefreshError from a mid-loop client call — the tick's
-        `except Exception` must NOT swallow it; the outer handler
-        notifies + stops + re-raises."""
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=500)
-            )
-            session.commit()
-        # First call succeeds (get_profile at startup); second call in
-        # _tick raises RefreshError.
+        _prime_state(session_factory, 500)
         mock_client.list_history.side_effect = RefreshError(
-            "invalid_grant: token revoked mid-loop"
+            "invalid_grant: token revoked mid-tick"
         )
         notifier = MagicMock()
         poller = Poller(
             client=mock_client,
             session_factory=session_factory,
             handler=mock_handler,
-            interval_seconds=999,
             notifier=notifier,
         )
 
-        with pytest.raises(CredentialRefreshError):
-            poller.run()
+        result = poller.tick_once()
 
-        assert poller.stop_event.is_set()
+        assert result.error is not None
+        assert "credential_refresh_failed" in result.error
         notifier.send_message.assert_called_once()
-        args, kwargs = notifier.send_message.call_args
-        alert_body = args[0] if args else kwargs.get("text", "")
-        assert "reauth" in alert_body
-        assert "Gmail" in alert_body
+        alert = notifier.send_message.call_args[0][0]
+        assert "reauth" in alert
+        assert "Gmail" in alert
 
-    def test_credential_refresh_failure_without_notifier_still_raises(
+    def test_refresh_error_without_notifier_is_silent_but_surfaced(
         self, mock_client, session_factory, mock_handler
     ):
-        """No notifier configured -> we still stop + raise, just no alert."""
         mock_client.get_profile.side_effect = RefreshError("invalid_grant")
         poller = Poller(
             client=mock_client,
@@ -584,17 +513,17 @@ class TestGracefulShutdown:
             handler=mock_handler,
         )
 
-        with pytest.raises(CredentialRefreshError):
-            poller.run()
+        result = poller.tick_once()
 
-        assert poller.stop_event.is_set()
+        assert result.error is not None
+        assert "credential_refresh_failed" in result.error
 
-    def test_credential_refresh_failure_survives_telegram_error(
+    def test_refresh_error_survives_telegram_error(
         self, mock_client, session_factory, mock_handler
     ):
-        """If Telegram is down, we must still stop and raise the auth
-        error — losing the alert is bad, silently ignoring a dead token
-        is worse."""
+        """If Telegram is down, tick_once still returns a TickResult
+        with the error field populated — losing the alert is bad, but
+        the operator still sees the failure in the /poll response."""
         mock_client.get_profile.side_effect = RefreshError("invalid_grant")
         notifier = MagicMock()
         notifier.send_message.side_effect = TelegramError("api down")
@@ -605,196 +534,86 @@ class TestGracefulShutdown:
             notifier=notifier,
         )
 
-        with pytest.raises(CredentialRefreshError):
-            poller.run()
+        result = poller.tick_once()
 
-        assert poller.stop_event.is_set()
+        assert result.error is not None
 
-    def test_stop_event_wakes_inter_tick_sleep(
-        self, mock_client, session_factory, mock_handler
+
+# ---------- tick_once return shape ----------
+
+
+class TestTickOnce:
+    """The v1.0 tick_once contract: always returns a TickResult, never
+    raises for handled failures, populates duration_ms + counts +
+    cursor deltas so cron / operator can debug without tailing logs."""
+
+    def test_empty_inbox_returns_zero_processed(
+        self, poller, session_factory, mock_client
     ):
-        """If the loop is sleeping between ticks, setting the event must
-        wake Event.wait() instead of waiting out the full interval."""
-        import threading
-        import time
-
-        event = threading.Event()
-        poller = Poller(
-            client=mock_client,
-            session_factory=session_factory,
-            handler=mock_handler,
-            interval_seconds=30,  # huge — should NOT wait this long
-            stop_event=event,
-        )
-
-        # Set the event from a background thread shortly after run starts.
-        threading.Timer(0.1, event.set).start()
-
-        start = time.monotonic()
-        poller.run()
-        elapsed = time.monotonic() - start
-
-        assert elapsed < 2.0, (
-            f"run() took {elapsed:.2f}s — sleep was not interrupted by the "
-            "stop event"
-        )
-
-
-# ---------- heartbeat ----------
-
-
-class TestHeartbeat:
-    """Periodic 'poller alive, cursor=X' INFO so absence of the line
-    is itself a signal that the loop stopped. Timer uses
-    time.monotonic() so freeze/resume produces exactly one heartbeat,
-    not a burst catching up."""
-
-    def _make_poller(
-        self, mock_client, session_factory, mock_handler,
-        *, heartbeat_interval_seconds: int
-    ) -> Poller:
-        return Poller(
-            client=mock_client,
-            session_factory=session_factory,
-            handler=mock_handler,
-            interval_seconds=1,
-            heartbeat_interval_seconds=heartbeat_interval_seconds,
-        )
-
-    def _prime_state(self, session_factory, history_id: int) -> None:
-        with session_factory() as session:
-            session.add(
-                GmailSyncState(email_address=EMAIL, history_id=history_id)
-            )
-            session.commit()
-
-    def test_fires_after_interval_of_noop_ticks(
-        self, mock_client, session_factory, mock_handler, caplog
-    ):
-        import time as _time
-
-        self._prime_state(session_factory, 500)
-        poller = self._make_poller(
-            mock_client, session_factory, mock_handler,
-            heartbeat_interval_seconds=0,  # will override after init
-        )
-        # Force the interval AFTER __init__ so _last_info_at reflects a
-        # real construction moment (not artificially older).
-        poller._heartbeat_interval_seconds = 0.05
-        # Also rewind the timer past the threshold so the very next
-        # tick will emit — the test shouldn't require a real sleep.
-        poller._last_info_at = _time.monotonic() - 1.0
-
-        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
-            poller._tick(EMAIL)
-
-        alive_records = [
-            r for r in caplog.records if "poller alive" in r.getMessage()
-        ]
-        assert len(alive_records) == 1
-        assert "cursor=500" in alive_records[0].getMessage()
-
-    def test_does_not_fire_within_interval(
-        self, mock_client, session_factory, mock_handler, caplog
-    ):
-        self._prime_state(session_factory, 500)
-        poller = self._make_poller(
-            mock_client, session_factory, mock_handler,
-            heartbeat_interval_seconds=100,  # much longer than test wall-clock
-        )
-        # _last_info_at freshly initialized in __init__ — well under 100s.
-        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
-            for _ in range(5):
-                poller._tick(EMAIL)
-        alive_records = [
-            r for r in caplog.records if "poller alive" in r.getMessage()
-        ]
-        assert alive_records == []
-
-    def test_advance_tick_resets_heartbeat_timer(
-        self, mock_client, session_factory, mock_handler, caplog
-    ):
-        """Any tick that already emits INFO (advance line) is
-        heartbeat-equivalent — the following no-op tick within the
-        interval must NOT double-log."""
-        import time as _time
-
-        self._prime_state(session_factory, 500)
-        poller = self._make_poller(
-            mock_client, session_factory, mock_handler,
-            heartbeat_interval_seconds=0,
-        )
-        # Set a tiny interval that would normally fire.
-        poller._heartbeat_interval_seconds = 0.05
-        poller._last_info_at = _time.monotonic() - 1.0
-
-        # First tick: process a real message → advance INFO fires and
-        # resets the timer.
-        mock_client.list_history.return_value = iter(["msg-1"])
-        mock_client.get_message.return_value = _make_email("msg-1", 600)
-
-        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
-            poller._tick(EMAIL)
-
-        first_records = [r.getMessage() for r in caplog.records]
-        assert any("tick: 1 new messages" in m for m in first_records)
-        assert not any("poller alive" in m for m in first_records), (
-            "advance tick must not double-emit heartbeat"
-        )
-
-        # Second tick immediately after: no-op, interval has NOT
-        # elapsed since the advance INFO reset the timer.
-        caplog.clear()
+        _prime_state(session_factory, 500)
         mock_client.list_history.return_value = iter([])
-        mock_client.get_message.reset_mock()
 
-        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
-            poller._tick(EMAIL)
+        result = poller.tick_once()
 
-        second_records = [r.getMessage() for r in caplog.records]
-        assert not any("poller alive" in m for m in second_records)
+        assert isinstance(result, TickResult)
+        assert result.messages_processed == 0
+        assert result.cursor_before == 500
+        assert result.cursor_after == 500
+        assert result.rebaselined is False
+        assert result.error is None
+        assert result.duration_ms >= 0
 
-    def test_interval_zero_disables_heartbeat(
-        self, mock_client, session_factory, mock_handler, caplog
+    def test_processes_batch_and_advances_cursor(
+        self, poller, session_factory, mock_client
     ):
-        import time as _time
-
-        self._prime_state(session_factory, 500)
-        poller = self._make_poller(
-            mock_client, session_factory, mock_handler,
-            heartbeat_interval_seconds=0,
+        _prime_state(session_factory, 500)
+        mock_client.list_history.return_value = iter(
+            ["msg-1", "msg-2", "msg-3"]
         )
-        # Even if _last_info_at is ancient, interval=0 skips the emit.
-        poller._last_info_at = _time.monotonic() - 10_000.0
-
-        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
-            for _ in range(5):
-                poller._tick(EMAIL)
-
-        assert not [
-            r for r in caplog.records if "poller alive" in r.getMessage()
+        mock_client.get_message.side_effect = [
+            _make_email("msg-1", 600),
+            _make_email("msg-2", 700),
+            _make_email("msg-3", 650),
         ]
 
-    def test_heartbeat_message_names_current_cursor(
-        self, mock_client, session_factory, mock_handler, caplog
+        result = poller.tick_once()
+
+        assert result.messages_processed == 3
+        assert result.cursor_before == 500
+        assert result.cursor_after == 700
+        assert result.rebaselined is False
+        assert result.error is None
+
+    def test_first_run_baseline_returns_clean_result(
+        self, poller, session_factory, mock_client
     ):
-        """Heartbeat cursor value reflects the CURRENT state (after
-        any advance this tick), not a stale start-of-tick snapshot."""
-        import time as _time
-
-        self._prime_state(session_factory, 999)
-        poller = self._make_poller(
-            mock_client, session_factory, mock_handler,
-            heartbeat_interval_seconds=0,
+        """No existing sync_state row → baseline gets created + tick
+        returns immediately without walking history."""
+        mock_client.get_profile.return_value = ProfileInfo(
+            email=EMAIL, history_id=1234
         )
-        poller._heartbeat_interval_seconds = 0.05
-        poller._last_info_at = _time.monotonic() - 1.0
 
-        with caplog.at_level(logging.INFO, logger="zashiki_warasi.gmail.poller"):
-            poller._tick(EMAIL)
+        result = poller.tick_once()
 
-        alive = [
-            r.getMessage() for r in caplog.records
-            if "poller alive" in r.getMessage()
-        ]
-        assert alive == ["poller alive, cursor=999"]
+        assert result.messages_processed == 0
+        assert result.cursor_before is None
+        assert result.cursor_after == 1234
+        assert result.rebaselined is False
+        assert result.error is None
+        # list_history NOT called on baseline turn — the row we just
+        # wrote IS the cursor, there's no history to consume yet.
+        mock_client.list_history.assert_not_called()
+        assert _read_state(session_factory).history_id == 1234
+
+    def test_module_level_tick_once_delegates_to_poller(
+        self, poller, session_factory, mock_client
+    ):
+        """tick_once(poller) is the entry point FastAPI /poll uses —
+        a thin delegate so callers don't need to import the class."""
+        _prime_state(session_factory, 500)
+        mock_client.list_history.return_value = iter([])
+
+        result = tick_once(poller)
+
+        assert isinstance(result, TickResult)
+        assert result.messages_processed == 0

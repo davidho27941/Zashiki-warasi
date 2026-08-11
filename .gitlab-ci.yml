@@ -1,0 +1,52 @@
+# GitLab CI — build + push the runtime container image on every push.
+#
+# Runner requirements (matches homelab template):
+#   - Runner tagged `build` (shell / docker executor with dockerd access).
+#   - CI/CD variables `GITLAB_USER` + `GITLAB_PAT` set at project or
+#     group level, marked "Protected" + "Masked". PAT needs
+#     `write_registry` scope.
+#
+# Tagging strategy:
+#   - Every push builds and tags with the short commit SHA — smoke
+#     runs (`helm install ... --set image.tag=<sha>`) always reference
+#     an immutable ref.
+#   - `main` branch pushes also update the `latest` tag for convenience
+#     — never use `latest` in production values files (see chart's
+#     values.yaml comment).
+#   - Pushing a git tag (e.g. `v1.0.0`) additionally tags the image
+#     with the tag name — this is the release path.
+
+stages:
+  - build
+
+variables:
+  IMAGE: gitlab.davidho.dev:5050/homelab/$CI_PROJECT_NAME
+  # $CI_COMMIT_SHORT_SHA = 8-char stable ref, always populated.
+  IMAGE_SHA: $IMAGE:$CI_COMMIT_SHORT_SHA
+
+Build_Image:
+  tags:
+    - build
+  stage: build
+  image: docker:27.0.3
+  script:
+    - echo "Building $IMAGE_SHA (branch=$CI_COMMIT_REF_NAME)"
+    - docker build -t "$IMAGE_SHA" .
+    - echo "$GITLAB_PAT" | docker login gitlab.davidho.dev:5050 -u "$GITLAB_USER" --password-stdin
+    - docker push "$IMAGE_SHA"
+    # Convenience `latest` on main only. Never rely on it in prod values.
+    - |
+      if [ "$CI_COMMIT_REF_NAME" = "main" ]; then
+        docker tag "$IMAGE_SHA" "$IMAGE:latest"
+        docker push "$IMAGE:latest"
+      fi
+    # Release tag: pushing `git tag v1.0.0 && git push --tags` triggers
+    # this and stamps the image with the exact tag name.
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker tag "$IMAGE_SHA" "$IMAGE:$CI_COMMIT_TAG"
+        docker push "$IMAGE:$CI_COMMIT_TAG"
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "push"
+    - if: $CI_PIPELINE_SOURCE == "web"

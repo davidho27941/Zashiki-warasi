@@ -1,0 +1,132 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "zashiki-warasi.fullname" . }}
+  labels:
+    {{- include "zashiki-warasi.labels" . | nindent 4 }}
+spec:
+  # replicaCount comes from values — DO NOT hardcode. The app's
+  # coordination (advisory lock + Postgres FlowStore) makes any
+  # positive value safe. Default is 1.
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: {{ .Values.strategy.type }}
+    {{- if eq .Values.strategy.type "RollingUpdate" }}
+    rollingUpdate:
+      maxSurge: {{ .Values.strategy.rollingUpdate.maxSurge }}
+      maxUnavailable: {{ .Values.strategy.rollingUpdate.maxUnavailable }}
+    {{- end }}
+  selector:
+    matchLabels:
+      {{- include "zashiki-warasi.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "zashiki-warasi.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Force pod restart when the ConfigMap or Secret changes so
+        # env-only updates don't require a manual `kubectl rollout`.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.securityContext | nindent 8 }}
+      # Init container seeds /data/token.json from the OAuth Secret on
+      # first deploy. Skipped if /data already has a token (e.g. from
+      # a prior /reauth that wrote to the PVC), preventing operator's
+      # in-cluster reauth from being overwritten by a stale seed on
+      # pod restart. If `oauth.tokenJson` is empty in values (fresh
+      # deploy with no seed), the init container no-ops and the
+      # operator bootstraps via POST /reauth after startup.
+      initContainers:
+        - name: seed-token
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              if [ -f /oauth-seed/token.json ] && [ ! -f /data/token.json ]; then
+                cp /oauth-seed/token.json /data/token.json
+                chmod 600 /data/token.json
+                echo "[init] seeded /data/token.json from Secret"
+              elif [ -f /data/token.json ]; then
+                echo "[init] /data/token.json already present; not overwriting"
+              else
+                echo "[init] no seed in Secret; POST /reauth to bootstrap"
+              fi
+          volumeMounts:
+            - name: oauth-seed
+              mountPath: /oauth-seed
+              readOnly: true
+            - name: data
+              mountPath: /data
+      containers:
+        - name: zashiki-warasi
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "zashiki-warasi.fullname" . }}
+            - secretRef:
+                name: {{ include "zashiki-warasi.fullname" . }}
+          livenessProbe:
+            # /healthz reflects real dependency readiness — see the
+            # http-service spec. 503 while OAuth expires would flap
+            # the pod under a strict liveness probe, so we use a
+            # generous failureThreshold and rely on the operator's
+            # Telegram alert for that specific case.
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            - name: secrets
+              mountPath: /secrets
+              readOnly: true
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: secrets
+          secret:
+            secretName: {{ include "zashiki-warasi.fullname" . }}-oauth
+            items:
+              - key: credentials.json
+                path: credentials.json
+        # Full OAuth Secret exposed to the seed-token init container
+        # only. Includes token.json when values.oauth.tokenJson is set;
+        # otherwise the secret has no `token.json` key and the init
+        # container's `[ -f /oauth-seed/token.json ]` check is false.
+        - name: oauth-seed
+          secret:
+            secretName: {{ include "zashiki-warasi.fullname" . }}-oauth
+            optional: true
+        {{- if .Values.persistence.enabled }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "zashiki-warasi.fullname" . }}-data
+        {{- else }}
+        - name: data
+          emptyDir: {}
+        {{- end }}

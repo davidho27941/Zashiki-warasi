@@ -1,0 +1,16 @@
+apiVersion: v2
+name: zashiki-warasi
+description: Self-hosted Gmail polling AI email agent — FastAPI service + external CronJob.
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+kubeVersion: ">=1.25.0-0"
+keywords:
+  - gmail
+  - langgraph
+  - agent
+  - email
+sources:
+  - https://github.com/davidho27941/Zashiki-warasi
+maintainers:
+  - name: davidho27941

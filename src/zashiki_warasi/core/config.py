@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+import os
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 DEFAULT_SCOPES: list[str] = [
@@ -129,16 +131,93 @@ class PollerSettings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+    # Intentionally empty in v1.0. The v0.x fields
+    # (heartbeat_interval_seconds, interval_seconds) have moved out of
+    # the process: cadence is owned by the external scheduler (cron /
+    # k8s CronJob) and liveness by /healthz + the scheduler's own logs.
+    # The class is retained so future poller-scoped settings have an
+    # obvious home without changing imports.
 
-    # Periodic INFO "poller alive, cursor=<id>" cadence. Runs on top
-    # of the existing tick loop; if a tick already emits an advance
-    # INFO the heartbeat timer resets (no double-log). At default
-    # 1200 s a quiet mailbox produces ~72 lines/day — enough that a
-    # multi-hour silence in the log is a clear "poller stopped"
-    # signal, few enough not to drown real events.
-    # Set to 0 to disable the heartbeat entirely. Negative rejected
-    # via `ge=0` — silent fallback would mask the operator's intent.
-    heartbeat_interval_seconds: int = Field(default=1200, ge=0)
+
+class HttpSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="HTTP_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Default `127.0.0.1` is a safe fail-closed for local dev — the
+    # container's compose/Helm defaults override to `0.0.0.0` so the
+    # in-cluster/in-network scheduler can reach /poll. If the operator
+    # ever sets bind_host to something reachable beyond loopback, the
+    # cross-field validator below requires an api_key so /poll and
+    # /reauth aren't exposed unauthenticated.
+    bind_host: str = "127.0.0.1"
+    bind_port: int = Field(default=8080, gt=0, lt=65536)
+    # Optional shared-secret. When unset (None or empty string), /poll
+    # and /reauth accept requests without an X-API-Key header. Setting
+    # any non-empty value requires the header to match.
+    api_key: str | None = None
+
+    @model_validator(mode="after")
+    def _require_api_key_on_public_bind(self) -> "HttpSettings":
+        # Fail-fast at settings-load time: if the operator opens the
+        # bind beyond loopback but forgets to set a key, /poll and
+        # /reauth would be reachable from anywhere on the interface
+        # with no auth. Refuse to boot instead of quietly exposing.
+        if self.bind_host != "127.0.0.1" and not self.api_key:
+            raise ValueError(
+                f"HTTP_API_KEY must be set when HTTP_BIND_HOST is "
+                f"non-loopback (got HTTP_BIND_HOST={self.bind_host!r}). "
+                "Set HTTP_API_KEY to a shared secret, or revert "
+                "HTTP_BIND_HOST to 127.0.0.1 for loopback-only access."
+            )
+        return self
+
+
+class OAuthSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="OAUTH_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Absolute URL Google will redirect the operator's browser to after
+    # the consent screen. MUST match a redirect URI registered in the
+    # Google Cloud Console for this OAuth client. Loopback URIs like
+    # `http://127.0.0.1:8080/auth/callback` are allowed without HTTPS
+    # (Google special-cases them); non-loopback hosts require HTTPS +
+    # a public CA cert. Left None here so tools that don't use the web
+    # flow (CLI reauth, /healthz) don't require it; the endpoints that
+    # do need it raise HTTP 500 when it's missing at call time.
+    redirect_uri: str | None = None
+
+
+# v0.x env vars kept alive as soft-migration signals. Presence at
+# startup logs INFO ("set but ignored") so operators upgrading from
+# v0.6.x see the removed vars in their old .env and know to clean up.
+# Adding a var here (with the reason) is the entire "removal" contract
+# — no fail-fast, no crash, just a visible line in the boot log.
+_REMOVED_ENV_VARS: tuple[tuple[str, str], ...] = (
+    (
+        "POLLER_HEARTBEAT_INTERVAL_SECONDS",
+        "removed in v1.0 — heartbeat superseded by /healthz + cron logs",
+    ),
+    (
+        "POLLER_INTERVAL_SECONDS",
+        "removed in v1.0 — cadence owned by external scheduler (cron / k8s CronJob)",
+    ),
+)
+
+
+def warn_removed_env_vars(logger: logging.Logger | None = None) -> None:
+    """Emit one INFO per removed-but-present env var. Idempotent."""
+    log = logger or logging.getLogger(__name__)
+    for var, reason in _REMOVED_ENV_VARS:
+        if os.environ.get(var):
+            log.info(f"env var {var} is set but ignored ({reason})")
 
 
 class TelegramSettings(BaseSettings):

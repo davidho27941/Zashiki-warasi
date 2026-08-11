@@ -1,8 +1,10 @@
-"""Gmail history-based polling loop.
+"""Gmail history-based polling — one tick per external invocation.
 
-Per-message dedup via `processed_messages`, per-tick cursor advance
-via `gmail_sync_state`. Handler must be idempotent (we rely on
-LangGraph's checkpointer keyed by message_id to make this true).
+In v1.0 the daemon loop is gone: an external scheduler (host cron /
+k8s CronJob) fires `POST /poll`, which delegates to `tick_once(...)`
+below. Per-message dedup via `processed_messages`, per-tick cursor
+advance via `gmail_sync_state`. Handler must be idempotent (we rely
+on LangGraph's checkpointer keyed by message_id to make this true).
 """
 
 from __future__ import annotations
@@ -10,16 +12,15 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Callable, NoReturn
+from typing import Callable
 
 from google.auth.exceptions import RefreshError
 from sqlalchemy.orm import sessionmaker
 
 from zashiki_warasi.core.models import GmailSyncState, ProcessedMessage
-from zashiki_warasi.core.schemas import EmailMessage
+from zashiki_warasi.core.schemas import EmailMessage, TickResult
 from zashiki_warasi.gmail.client import GmailClient
 from zashiki_warasi.gmail.exceptions import (
-    CredentialRefreshError,
     HistoryExpiredError,
     MessageNotFoundError,
 )
@@ -34,18 +35,13 @@ EmailHandler = Callable[[EmailMessage], None]
 
 
 class Poller:
-    """Long-running Gmail poller driven by Gmail's historyId cursor.
+    """Gmail poller. Each `tick_once()` = one complete unit of work.
 
-    On every tick:
-      - read last historyId from gmail_sync_state
-      - list new message IDs since that point
-      - for each, skip if already in processed_messages
-        else fetch + invoke handler + record in processed_messages
-      - advance gmail_sync_state.history_id once the whole tick succeeds
-
-    Crash safety: per-message dedup means already-handled messages are
-    skipped on restart; per-tick cursor advance means a failure inside
-    the tick keeps the cursor still and the batch retries.
+    Holds the wiring (client, session_factory, handler, notifier) that
+    every tick needs. `_baseline_if_needed` runs inside `tick_once` so
+    a fresh deploy's first `POST /poll` bootstraps the cursor and
+    returns cleanly. Subsequent calls skip baseline via the DB row's
+    existence.
     """
 
     def __init__(
@@ -53,102 +49,110 @@ class Poller:
         client: GmailClient,
         session_factory: sessionmaker,
         handler: EmailHandler,
-        interval_seconds: int = 30,
         stop_event: threading.Event | None = None,
         notifier: TelegramNotifier | None = None,
-        heartbeat_interval_seconds: int = 1200,
     ) -> None:
         self._client = client
         self._session_factory = session_factory
         self._handler = handler
-        self._interval = interval_seconds
         self._notifier = notifier
-        # Periodic "poller alive, cursor=X" INFO so absence of a
-        # heartbeat in the log is itself an operator signal that the
-        # loop stopped. `time.monotonic()` freezes with the process
-        # (macOS sleep, App Nap, kill -STOP) — on resume, exactly one
-        # heartbeat fires from the next tick, not a catch-up burst.
-        # 0 disables. See design D2/D3.
-        self._heartbeat_interval_seconds = heartbeat_interval_seconds
-        self._last_info_at: float = time.monotonic()
-        # Exposed publicly so the app entry point can `stop_event.set()`
-        # from a signal handler without holding a reference to a private
-        # attribute.
+        # Retained for compat with pre-existing tests + graceful early
+        # exit inside a long tick if the caller ever sets it. In the
+        # FastAPI model no request-scoped code sets it; a fresh Event
+        # is fine.
         self.stop_event = stop_event or threading.Event()
 
-    def _note_info_emitted(self) -> None:
-        """Reset the heartbeat timer whenever ANY INFO event just fired
-        from the tick loop (advance INFO, heartbeat, rebaseline, etc.).
-        Prevents doubling up: a busy tick that already emitted advance
-        INFO won't also emit a heartbeat right behind it.
+    # ----- Public tick surface -----
+
+    def tick_once(self) -> TickResult:
+        """Execute exactly one poll cycle and return its outcome.
+
+        Never sleeps, never loops, never emits a heartbeat. All
+        recoverable in-tick failures are caught and surfaced via
+        `TickResult.error`; the caller decides what to do with the
+        result (FastAPI turns it into an HTTP body, CLI prints it).
+        Uncaught exceptions propagate — the caller is expected to log
+        and translate them (FastAPI's default handler emits HTTP 500).
         """
-        self._last_info_at = time.monotonic()
+        started_at = time.monotonic()
+        cursor_before: int | None = None
+        cursor_after: int | None = None
+        processed = 0
+        rebaselined = False
+        error: str | None = None
 
-    def _maybe_emit_heartbeat(self, cursor: int) -> None:
-        """Emit `poller alive, cursor=<id>` INFO if the configured
-        interval has elapsed since the last INFO. No-op when disabled
-        (interval=0) or when the timer hasn't elapsed yet."""
-        if self._heartbeat_interval_seconds <= 0:
-            return
-        if (
-            time.monotonic() - self._last_info_at
-            < self._heartbeat_interval_seconds
-        ):
-            return
-        logger.info(f"poller alive, cursor={cursor}")
-        self._note_info_emitted()
-
-    def run(self) -> None:
-        """Poll Gmail until `stop_event` is set, then return cleanly.
-
-        Shutdown points:
-          - before each tick
-          - between messages within a tick
-          - during the inter-tick sleep (Event.wait wakes immediately
-            when the event is set)
-
-        The message currently being processed always runs to completion
-        so its `processed_messages` row is written before exit.
-
-        A dead OAuth refresh token (google.auth RefreshError) is
-        unrecoverable in-process: we notify (best-effort), stop the
-        loop, and re-raise as `CredentialRefreshError` so the app entry
-        point exits non-zero.
-        """
         try:
             profile = self._client.get_profile()
         except RefreshError as exc:
-            self._handle_credential_failure(exc)
+            self._notify_credential_failure(exc)
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            return TickResult(
+                duration_ms=duration_ms,
+                messages_processed=0,
+                cursor_before=None,
+                cursor_after=None,
+                rebaselined=False,
+                error=f"credential_refresh_failed: {exc}",
+            )
+
         email = profile.email
-        logger.info(f"Poller starting for {email}")
-        self._baseline_if_needed(email, profile.history_id)
+        baseline_created = self._baseline_if_needed(email, profile.history_id)
+        if baseline_created:
+            # First-ever tick for this deploy — the row we just wrote
+            # IS the cursor; no history to walk yet. Return quickly so
+            # the operator (or cron) sees a clean success and the next
+            # tick starts consuming real history.
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            return TickResult(
+                duration_ms=duration_ms,
+                messages_processed=0,
+                cursor_before=None,
+                cursor_after=profile.history_id,
+                rebaselined=False,
+                error=None,
+            )
 
-        while not self.stop_event.is_set():
-            try:
-                self._tick(email)
-            except HistoryExpiredError as exc:
-                logger.warning(
-                    f"Gmail history expired at startHistoryId={exc}; "
-                    "re-baselining"
-                )
-                self._rebaseline(email)
-            except RefreshError as exc:
-                self._handle_credential_failure(exc)
-            except Exception:
-                logger.exception("Unhandled error during tick; will retry")
-            if self.stop_event.wait(timeout=self._interval):
-                break
+        try:
+            cursor_before, cursor_after, processed = self._run_tick(email)
+        except HistoryExpiredError as exc:
+            logger.warning(
+                f"Gmail history expired at startHistoryId={exc}; "
+                "re-baselining"
+            )
+            new_cursor = self._rebaseline(email)
+            duration_ms = int((time.monotonic() - started_at) * 1000)
+            return TickResult(
+                duration_ms=duration_ms,
+                messages_processed=0,
+                cursor_before=None,
+                cursor_after=new_cursor,
+                rebaselined=True,
+                error=None,
+            )
+        except RefreshError as exc:
+            self._notify_credential_failure(exc)
+            error = f"credential_refresh_failed: {exc}"
 
-        logger.info(f"Poller stopped for {email}")
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        return TickResult(
+            duration_ms=duration_ms,
+            messages_processed=processed,
+            cursor_before=cursor_before,
+            cursor_after=cursor_after,
+            rebaselined=rebaselined,
+            error=error,
+        )
 
-    def _handle_credential_failure(
-        self, exc: RefreshError
-    ) -> NoReturn:
-        """Notify + stop the loop, then re-raise CredentialRefreshError."""
+    # ----- Internal helpers -----
+
+    def _notify_credential_failure(self, exc: RefreshError) -> None:
+        """Log CRITICAL + best-effort Telegram alert. Does NOT raise —
+        the caller (tick_once) surfaces the failure via TickResult.error
+        so cron sees a normal 200 with an operator-actionable body."""
         message = (
             f"Gmail OAuth refresh failed ({exc}). The refresh token is "
-            "expired or revoked; the poller will exit. Run "
-            "`zashiki-warasi reauth` to re-authorise."
+            "expired or revoked. Run `zashiki-warasi reauth` (CLI) or "
+            "hit POST /reauth (headless) to re-authorise."
         )
         logger.critical(message)
         if self._notifier is not None:
@@ -156,28 +160,22 @@ class Poller:
                 self._notifier.send_message(
                     "🚨 Zashiki-warasi: Gmail 授權失效\n\n"
                     f"{exc}\n\n"
-                    "已停止 poller。請在主機上執行 "
-                    "<code>zashiki-warasi reauth</code> 重新授權。",
+                    "請執行 <code>zashiki-warasi reauth</code> 或呼叫 "
+                    "<code>POST /reauth</code> 重新授權。",
                 )
             except TelegramError:
                 logger.exception(
                     "Failed to send Telegram alert about auth failure"
                 )
-        self.stop_event.set()
-        raise CredentialRefreshError(message) from exc
-
-    # ----- Branch A: first-run baseline -----
 
     def _baseline_if_needed(
         self, email: str, current_history_id: int
-    ) -> None:
+    ) -> bool:
+        """Return True iff a fresh baseline row was created."""
         with self._session_factory() as session:
             state = session.get(GmailSyncState, email)
             if state is not None:
-                logger.info(
-                    f"Resuming from historyId={state.history_id} for {email}"
-                )
-                return
+                return False
             session.add(
                 GmailSyncState(
                     email_address=email,
@@ -185,14 +183,20 @@ class Poller:
                 )
             )
             session.commit()
-            logger.info(
-                f"First run: baseline at historyId={current_history_id} "
-                f"for {email} (backlog skipped)"
-            )
+        logger.info(
+            f"First run: baseline at historyId={current_history_id} "
+            f"for {email} (backlog skipped)"
+        )
+        return True
 
-    # ----- Branch D: normal tick -----
+    def _run_tick(self, email: str) -> tuple[int, int, int]:
+        """Consume Gmail history since the stored cursor.
 
-    def _tick(self, email: str) -> None:
+        Returns (cursor_before, cursor_after, messages_processed).
+        Any HistoryExpiredError / RefreshError propagates out — caught
+        by `tick_once`'s outer except blocks so they turn into a
+        TickResult, not an HTTP 500.
+        """
         with self._session_factory() as session:
             state = session.get(GmailSyncState, email)
             start = state.history_id
@@ -222,19 +226,11 @@ class Poller:
                         f"tick: {processed_count} new messages, cursor "
                         f"{start} -> {max_history_id}"
                     )
-                    self._note_info_emitted()
                 final_cursor = state.history_id
         else:
-            # Steady-state "loop alive" heartbeat — INFO would flood
-            # (30s cadence × 2880/day just for zero-op ticks). DEBUG
-            # keeps it visible when explicitly enabled.
             logger.debug(f"tick: 0 new, cursor unchanged at {start}")
 
-        # Periodic INFO liveness signal so a multi-hour silence in the
-        # log is itself a "poller stopped" clue. No-op when this tick
-        # already emitted advance INFO (timer just got reset) or when
-        # the heartbeat is disabled.
-        self._maybe_emit_heartbeat(final_cursor)
+        return start, final_cursor, processed_count
 
     def _process_message(self, msg_id: str) -> EmailMessage | None:
         # D1: already processed
@@ -264,9 +260,9 @@ class Poller:
             session.add(ProcessedMessage(message_id=msg_id))
             session.commit()
 
-    # ----- Branch C: history retention exceeded -----
-
-    def _rebaseline(self, email: str) -> None:
+    def _rebaseline(self, email: str) -> int:
+        """Reset the cursor to the current Gmail historyId. Returns the
+        new cursor value."""
         profile = self._client.get_profile()
         with self._session_factory() as session:
             state = session.get(GmailSyncState, email)
@@ -275,4 +271,12 @@ class Poller:
         logger.info(
             f"Re-baselined to historyId={profile.history_id} for {email}"
         )
-        self._note_info_emitted()
+        return profile.history_id
+
+
+def tick_once(poller: Poller) -> TickResult:
+    """Module-level entry point used by the FastAPI `/poll` handler
+    and the `tick` CLI subcommand. Thin delegate over `Poller.tick_once`
+    so callers don't need to import the class.
+    """
+    return poller.tick_once()

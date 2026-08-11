@@ -19,6 +19,7 @@ from zashiki_warasi.core.logging import (
     ContextFormatter,
     _CHATTY_THIRD_PARTY_LOGGERS,
     _HANDLER_SENTINEL,
+    _REQUEST_ID_CTX,
     _ZASHIKI_LOGGER_NAME,
     bind_message_context,
     configure_logging,
@@ -342,3 +343,71 @@ class TestNodeTrace:
             for r in caplog.records
             if "node=analyze" in r.getMessage()
         )
+
+
+# --- request_id ContextVar integration ---
+
+
+class TestRequestIdContextVar:
+    """The formatter reads `_REQUEST_ID_CTX` at format time so records
+    emitted anywhere inside a FastAPI request handler pick up the ID
+    the middleware set — no per-call `extra=` plumbing needed."""
+
+    def _record(self, **extra) -> logging.LogRecord:
+        record = logging.LogRecord(
+            name="zashiki_warasi.test",
+            level=logging.INFO,
+            pathname="/x.py",
+            lineno=1,
+            msg="hello",
+            args=None,
+            exc_info=None,
+        )
+        for key, value in extra.items():
+            record.__dict__[key] = value
+        return record
+
+    def test_unset_ctxvar_omits_request_id_from_output(self):
+        # Guard against test-ordering pollution.
+        _REQUEST_ID_CTX.set(None)
+        out = ContextFormatter().format(self._record())
+        assert "request_id" not in out
+
+    def test_set_ctxvar_renders_request_id_in_brackets(self):
+        token = _REQUEST_ID_CTX.set("abcd1234")
+        try:
+            out = ContextFormatter().format(self._record())
+        finally:
+            _REQUEST_ID_CTX.reset(token)
+        assert "[request_id=abcd1234]" in out
+
+    def test_request_id_appears_before_message_id_in_context_block(self):
+        """`_CONTEXT_FIELDS` declares `request_id` first so operators
+        grepping the log get a stable left-to-right order."""
+        token = _REQUEST_ID_CTX.set("req-1")
+        try:
+            out = ContextFormatter().format(
+                self._record(message_id="msg-42")
+            )
+        finally:
+            _REQUEST_ID_CTX.reset(token)
+        assert "[request_id=req-1,message_id=msg-42]" in out
+
+    def test_both_ctxvar_and_extra_absent_produces_no_brackets(self):
+        _REQUEST_ID_CTX.set(None)
+        out = ContextFormatter().format(self._record())
+        assert "[" not in out.split("hello")[0]
+
+    def test_ctxvar_reset_restores_previous_value(self):
+        """Middleware relies on token-reset semantics to prevent
+        request_id leaking across requests handled on the same task."""
+        _REQUEST_ID_CTX.set(None)
+        t1 = _REQUEST_ID_CTX.set("outer")
+        t2 = _REQUEST_ID_CTX.set("inner")
+        try:
+            assert _REQUEST_ID_CTX.get() == "inner"
+        finally:
+            _REQUEST_ID_CTX.reset(t2)
+        assert _REQUEST_ID_CTX.get() == "outer"
+        _REQUEST_ID_CTX.reset(t1)
+        assert _REQUEST_ID_CTX.get() is None

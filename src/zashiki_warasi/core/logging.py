@@ -23,9 +23,19 @@ import logging
 import sys
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Iterator
 
 from zashiki_warasi.core.config import LoggingSettings
+
+
+# Request-scoped context set by the FastAPI request-id middleware.
+# Handlers running inside a request (and any sync work they spawn via
+# threadpool that inherits the context) see this value; bootstrap /
+# background threads see None and their log records omit request_id.
+_REQUEST_ID_CTX: ContextVar[str | None] = ContextVar(
+    "zashiki_request_id", default=None
+)
 
 
 # Loggers that would otherwise flood the operator's terminal at INFO
@@ -51,6 +61,7 @@ _CHATTY_THIRD_PARTY_LOGGERS: tuple[str, ...] = (
 # ignored — prevents accidentally leaking arbitrary attributes and
 # keeps the format stable across modules.
 _CONTEXT_FIELDS: tuple[str, ...] = (
+    "request_id",
     "message_id",
     "thread_id",
     "expense_id",
@@ -80,12 +91,22 @@ class ContextFormatter(logging.Formatter):
         )
 
     def format(self, record: logging.LogRecord) -> str:
-        # Build the [k=v,k=v] block from any allowlisted fields the
-        # caller (LoggerAdapter or direct `extra=`) placed on the
-        # record. Only fields whose value is not None render.
+        # Merge two sources of context into the [k=v,...] block:
+        # (1) request_id from the module-scoped ContextVar the FastAPI
+        #     middleware sets — flows into every sync/async call inside
+        #     a request without any per-call plumbing.
+        # (2) message_id / thread_id / expense_id from LoggerAdapter
+        #     `extra=` — set by `bind_message_context` for per-message
+        #     code paths.
+        # Missing values render nothing (no `request_id=None`). Field
+        # order follows `_CONTEXT_FIELDS` declaration order so
+        # grep-friendly log output stays stable across releases.
         pairs: list[str] = []
         for key in _CONTEXT_FIELDS:
-            value = record.__dict__.get(key)
+            if key == "request_id":
+                value = _REQUEST_ID_CTX.get()
+            else:
+                value = record.__dict__.get(key)
             if value is None:
                 continue
             pairs.append(f"{key}={value}")

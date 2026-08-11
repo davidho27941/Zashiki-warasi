@@ -53,6 +53,26 @@ class ProfileInfo(BaseModel):
     history_id: int
 
 
+class TickResult(BaseModel):
+    """Structured outcome of a single `tick_once()` invocation.
+
+    Returned to callers (FastAPI `POST /poll`, CLI `tick` subcommand)
+    so debugging a cron run doesn't require tailing the log. `error`
+    is populated ONLY for in-tick failures the code caught internally
+    (HistoryExpiredError → rebaseline, CredentialRefreshError →
+    notified + logged); uncaught exceptions propagate as HTTP 500.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    duration_ms: int = Field(ge=0)
+    messages_processed: int = Field(ge=0)
+    cursor_before: int | None = None
+    cursor_after: int | None = None
+    rebaselined: bool = False
+    error: str | None = None
+
+
 # ----- Analysis -----
 
 
