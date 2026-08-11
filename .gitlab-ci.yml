@@ -2,9 +2,10 @@
 #
 # Runner requirements (matches homelab template):
 #   - Runner tagged `build` (shell / docker executor with dockerd access).
-#   - CI/CD variables `GITLAB_USER` + `GITLAB_PAT` set at project or
-#     group level, marked "Protected" + "Masked". PAT needs
-#     `write_registry` scope.
+#   - Uses GitLab's built-in `$CI_REGISTRY_*` variables (auto-injected
+#     on every job, job-scoped, no ref-protection dependency) to
+#     authenticate to the project's own registry — no PAT or manual
+#     CI/CD variables required.
 #
 # Tagging strategy:
 #   - Every push builds and tags with the short commit SHA — smoke
@@ -32,7 +33,7 @@ Build_Image:
   script:
     - echo "Building $IMAGE_SHA (branch=$CI_COMMIT_REF_NAME)"
     - docker build -t "$IMAGE_SHA" .
-    - echo "$GITLAB_PAT" | docker login gitlab.davidho.dev:5050 -u "$GITLAB_USER" --password-stdin
+    - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     - docker push "$IMAGE_SHA"
     # Convenience `latest` on main only. Never rely on it in prod values.
     - |
