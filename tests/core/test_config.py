@@ -454,3 +454,162 @@ class TestWarnRemovedEnvVars:
             warn_removed_env_vars()
         matches = [r for r in caplog.records if "set but ignored" in r.message]
         assert len(matches) == 2
+
+
+# --- LoggingSettings.format (LOG_FORMAT) ---
+
+
+class TestLoggingSettingsFormat:
+    def test_default_is_text(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("LOG_FORMAT", raising=False)
+        assert LoggingSettings().format == "text"
+
+    def test_env_json_lowercased(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LOG_FORMAT", "json")
+        assert LoggingSettings().format == "json"
+
+    def test_env_uppercase_still_accepted(self, monkeypatch, tmp_path):
+        # str_to_upper=True on the class uppercases the value at
+        # coercion; the validator must lower it before comparing.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LOG_FORMAT", "JSON")
+        assert LoggingSettings().format == "json"
+
+    def test_invalid_raises(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LOG_FORMAT", "yaml")
+        with pytest.raises(Exception) as exc_info:
+            LoggingSettings()
+        assert "yaml" in str(exc_info.value).lower()
+
+    def test_empty_string_falls_back_to_default(self, monkeypatch, tmp_path):
+        # str_strip_whitespace + empty string -> ""; validator should
+        # treat that as "unset" and use the default, mirroring the
+        # existing level validator behavior.
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("LOG_FORMAT", "")
+        assert LoggingSettings().format == "text"
+
+
+# --- ObservabilitySettings ---
+
+
+class TestObservabilitySettings:
+    @pytest.fixture(autouse=True)
+    def _isolate_env(self, monkeypatch, tmp_path):
+        # ObservabilitySettings uses an empty env_prefix — it will pick
+        # up ANY env var whose name matches its field names. Isolate by
+        # clearing the OTEL_* namespace + chdir'ing out of the repo so
+        # its .env doesn't leak.
+        for var in (
+            "OTEL_ENABLED",
+            "OTEL_SERVICE_NAME",
+            "OTEL_EXPORTER_OTLP_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_PROTOCOL",
+            "OTEL_TRACES_SAMPLER",
+            "OTEL_TRACES_SAMPLER_ARG",
+            "OTEL_RESOURCE_ATTRIBUTES",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.chdir(tmp_path)
+
+    def test_defaults(self):
+        from zashiki_warasi.core.config import ObservabilitySettings
+
+        s = ObservabilitySettings()
+        assert s.otel_enabled is False
+        assert s.otel_service_name == "zashiki-warasi"
+        assert s.otel_exporter_otlp_endpoint == "http://localhost:4317"
+        assert s.otel_exporter_otlp_protocol == "grpc"
+        assert s.otel_traces_sampler == "parentbased_traceidratio"
+        assert s.otel_traces_sampler_arg == 1.0
+        assert s.otel_resource_attributes == ""
+
+    def test_enabled_toggle(self, monkeypatch):
+        from zashiki_warasi.core.config import ObservabilitySettings
+
+        monkeypatch.setenv("OTEL_ENABLED", "1")
+        assert ObservabilitySettings().otel_enabled is True
+
+    def test_service_name_override(self, monkeypatch):
+        from zashiki_warasi.core.config import ObservabilitySettings
+
+        monkeypatch.setenv("OTEL_SERVICE_NAME", "zw-prod")
+        assert ObservabilitySettings().otel_service_name == "zw-prod"
+
+    def test_endpoint_override(self, monkeypatch):
+        from zashiki_warasi.core.config import ObservabilitySettings
+
+        monkeypatch.setenv(
+            "OTEL_EXPORTER_OTLP_ENDPOINT", "http://otelcol:4317"
+        )
+        assert (
+            ObservabilitySettings().otel_exporter_otlp_endpoint
+            == "http://otelcol:4317"
+        )
+
+    def test_resource_attributes_comma_separated(self, monkeypatch):
+        # Regression pin for the pydantic-settings NoDecode gotcha:
+        # this field must stay `str`-typed so the OTel-standard comma
+        # form isn't JSON-decoded by EnvSettingsSource. Value is
+        # forwarded to the OTel SDK's Resource merger as-is.
+        from zashiki_warasi.core.config import ObservabilitySettings
+
+        monkeypatch.setenv(
+            "OTEL_RESOURCE_ATTRIBUTES",
+            "deployment.environment=prod,team=obs",
+        )
+        assert (
+            ObservabilitySettings().otel_resource_attributes
+            == "deployment.environment=prod,team=obs"
+        )
+
+    def test_sampler_arg_valid_range(self, monkeypatch):
+        from zashiki_warasi.core.config import ObservabilitySettings
+
+        for value in ("0.0", "0.1", "0.5", "1.0"):
+            monkeypatch.setenv("OTEL_TRACES_SAMPLER_ARG", value)
+            assert ObservabilitySettings().otel_traces_sampler_arg == float(
+                value
+            )
+
+    def test_sampler_arg_above_1_rejected(self, monkeypatch):
+        from zashiki_warasi.core.config import ObservabilitySettings
+
+        monkeypatch.setenv("OTEL_TRACES_SAMPLER_ARG", "1.5")
+        with pytest.raises(Exception) as exc_info:
+            ObservabilitySettings()
+        assert "1.5" in str(exc_info.value) or "1.0" in str(exc_info.value)
+
+    def test_sampler_arg_negative_rejected(self, monkeypatch):
+        from zashiki_warasi.core.config import ObservabilitySettings
+
+        monkeypatch.setenv("OTEL_TRACES_SAMPLER_ARG", "-0.1")
+        with pytest.raises(Exception):
+            ObservabilitySettings()
+
+    def test_no_cross_contamination_with_logging(self, monkeypatch):
+        # Regression pin: LOG_FORMAT belongs to LoggingSettings (prefix
+        # LOG_); OTEL_* belongs to ObservabilitySettings (empty prefix).
+        # Setting one MUST NOT affect the other model's population.
+        from zashiki_warasi.core.config import (
+            LoggingSettings,
+            ObservabilitySettings,
+        )
+
+        monkeypatch.setenv("LOG_FORMAT", "json")
+        monkeypatch.setenv("OTEL_SERVICE_NAME", "zw-x")
+
+        log_settings = LoggingSettings()
+        obs_settings = ObservabilitySettings()
+
+        # LoggingSettings picks up LOG_FORMAT, not OTEL_SERVICE_NAME
+        assert log_settings.format == "json"
+        # ObservabilitySettings picks up OTEL_SERVICE_NAME, defaults for
+        # LOG_FORMAT (which it doesn't own)
+        assert obs_settings.otel_service_name == "zw-x"
+        # Neither leaks into the other's un-owned fields
+        assert not hasattr(log_settings, "otel_service_name")
+        assert not hasattr(obs_settings, "format")
