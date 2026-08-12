@@ -54,6 +54,10 @@ Thumbs.db
 # Local notes / lessons learned (kept out of public repo)
 docs/lessons/
 
+# Claude Code local IDE state — settings.local.json, per-session
+# commands/skills the tooling drops here. Not part of the project.
+.claude/
+
 # Local debugging / diagnostic scripts + generated PR bodies
 scripts/
 # Committed exceptions: repo tooling that happens to live under scripts/
