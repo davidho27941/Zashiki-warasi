@@ -40,6 +40,11 @@ from zashiki_warasi.core.schemas import (
 from zashiki_warasi.gmail.client import GmailClient
 from zashiki_warasi.notifications.notion import NotionExpenseRecorder
 from zashiki_warasi.notifications.telegram import TelegramNotifier
+from zashiki_warasi.observability import (
+    llm_calls_total,
+    llm_latency_seconds,
+)
+from zashiki_warasi.observability.instrumentation import record_call
 
 logger = logging.getLogger(__name__)
 
@@ -305,12 +310,18 @@ class EmailAgent:
                 f"{body}"
             )
             try:
-                analysis = self._analyze_model.invoke(
-                    [
-                        SystemMessage(content=ANALYZE_SYSTEM_PROMPT),
-                        HumanMessage(content=user_text),
-                    ]
-                )
+                with record_call(
+                    counter=llm_calls_total,
+                    histogram=llm_latency_seconds,
+                    counter_labels={"node": "analyze"},
+                    histogram_labels={"node": "analyze"},
+                ):
+                    analysis = self._analyze_model.invoke(
+                        [
+                            SystemMessage(content=ANALYZE_SYSTEM_PROMPT),
+                            HumanMessage(content=user_text),
+                        ]
+                    )
             except LengthFinishReasonError as exc:
                 usage = exc.completion.usage
                 detail = (

@@ -33,6 +33,7 @@ from fastapi.responses import PlainTextResponse, RedirectResponse
 from zashiki_warasi.core.services import Services
 from zashiki_warasi.gmail.auth import _persist
 from zashiki_warasi.notifications.telegram import TelegramError
+from zashiki_warasi.observability import oauth_refresh_total
 from zashiki_warasi.web.dependencies import get_services
 
 logger = logging.getLogger(__name__)
@@ -82,10 +83,16 @@ def auth_callback(
     except Exception as exc:
         # Google's error page usually shows the reason in the browser
         # already; log for our own record and 400 the operator.
+        oauth_refresh_total.labels(outcome="error").inc()
         logger.warning(f"oauth: fetch_token failed (state={state[:8]}): {exc}")
         raise HTTPException(
             status_code=400, detail=f"fetch_token_failed: {exc}"
         )
+    # fetch_token succeeded — count as a successful refresh so the
+    # metric covers BOTH the automatic-refresh path in gmail/auth.py
+    # AND this operator-triggered web-flow reauth. Alert rules that
+    # watch outcome="error" then treat the two paths uniformly.
+    oauth_refresh_total.labels(outcome="success").inc()
     credentials = flow.credentials
     token_path = services.gmail_settings.token_path
     _persist(credentials, token_path)

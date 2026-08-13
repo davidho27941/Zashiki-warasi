@@ -31,6 +31,11 @@ from zashiki_warasi.notifications.notion import (
     NotionExpenseRecorder,
     NotionSyncError,
 )
+from zashiki_warasi.observability import (
+    llm_calls_total,
+    llm_latency_seconds,
+)
+from zashiki_warasi.observability.instrumentation import record_call
 
 logger = logging.getLogger(__name__)
 
@@ -328,12 +333,18 @@ class ExpenseSubgraph:
                 }
 
             user_prompt = self._build_user_prompt(email, text)
-            draft: ExpenseDraft = self._structured_model.invoke(
-                [
-                    SystemMessage(content=EXPENSE_EXTRACT_SYSTEM_PROMPT),
-                    HumanMessage(content=user_prompt),
-                ]
-            )
+            with record_call(
+                counter=llm_calls_total,
+                histogram=llm_latency_seconds,
+                counter_labels={"node": "expense_extract"},
+                histogram_labels={"node": "expense_extract"},
+            ):
+                draft: ExpenseDraft = self._structured_model.invoke(
+                    [
+                        SystemMessage(content=EXPENSE_EXTRACT_SYSTEM_PROMPT),
+                        HumanMessage(content=user_prompt),
+                    ]
+                )
             log.info(
                 f"expense: extracted vendor={draft.vendor} "
                 f"amount={draft.amount} currency={draft.currency}"

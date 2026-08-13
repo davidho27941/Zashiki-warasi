@@ -20,6 +20,12 @@ from zashiki_warasi.coordination.advisory_lock import (
 from zashiki_warasi.core.schemas import TickResult
 from zashiki_warasi.core.services import Services
 from zashiki_warasi.gmail.poller import tick_once
+from zashiki_warasi.observability import (
+    tick_conflicts_total,
+    tick_duration_seconds,
+    tick_messages_processed_total,
+    tick_rebaseline_total,
+)
 from zashiki_warasi.web.dependencies import get_services, require_api_key
 
 router = APIRouter(tags=["poll"])
@@ -53,8 +59,37 @@ async def poll(services: Services = Depends(get_services)):
 
     result = await asyncio.to_thread(_do_tick)
     if result is _CONFLICT:
+        # Increment BEFORE returning so a scrape immediately after the
+        # 409 reflects the conflict. tick_duration_seconds does NOT
+        # observe here — the tick body never ran; conflicts have their
+        # own dedicated counter.
+        tick_conflicts_total.inc()
         return JSONResponse(
             status_code=409, content={"reason": "tick_in_flight"}
         )
+    # Tick body ran. Emit business metrics from the TickResult itself
+    # (single source of truth for duration + counts) rather than
+    # re-timing the handler — result.duration_ms already excludes the
+    # advisory-lock overhead, which is what we want in the histogram.
+    _emit_tick_metrics(result)
     # FastAPI serializes the pydantic TickResult natively.
     return result
+
+
+def _emit_tick_metrics(result: TickResult) -> None:
+    """Wire the TickResult into the observability contract.
+
+    `outcome` is `error` iff result.error is a non-None non-empty
+    string. duration_ms → seconds because Prometheus histogram
+    convention is seconds. messages_processed and rebaseline are
+    additive counters — inc by the reported values (rebaselined is
+    boolean, treated as 0 or 1).
+    """
+    outcome = "error" if result.error else "success"
+    tick_duration_seconds.labels(outcome=outcome).observe(
+        result.duration_ms / 1000.0
+    )
+    if result.messages_processed:
+        tick_messages_processed_total.inc(result.messages_processed)
+    if result.rebaselined:
+        tick_rebaseline_total.inc()
