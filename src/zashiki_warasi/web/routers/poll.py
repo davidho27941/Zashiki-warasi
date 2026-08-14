@@ -26,6 +26,7 @@ from zashiki_warasi.observability import (
     tick_messages_processed_total,
     tick_rebaseline_total,
 )
+from zashiki_warasi.observability.instrumentation import zashiki_span
 from zashiki_warasi.web.dependencies import get_services, require_api_key
 
 router = APIRouter(tags=["poll"])
@@ -49,13 +50,19 @@ async def poll(services: Services = Depends(get_services)):
         # advisory_lock holds a Postgres connection for the whole with-
         # block so the session-scoped lock covers the tick body. Runs
         # in a threadpool because tick_once is sync + holds a DB conn.
+        # asyncio.to_thread propagates contextvars (including the OTel
+        # current-span pointer) so `zashiki_span` here parents under
+        # the FastAPI SERVER span emitted by FastAPIInstrumentor.
         with advisory_lock(services.checkpointer_pool, TICK_LOCK_KEY) as (
             acquired,
             _conn,
         ):
             if not acquired:
                 return _CONFLICT
-            return tick_once(services.poller)
+            with zashiki_span("tick_once") as span:
+                result = tick_once(services.poller)
+                _set_tick_span_attributes(span, result)
+                return result
 
     result = await asyncio.to_thread(_do_tick)
     if result is _CONFLICT:
@@ -74,6 +81,24 @@ async def poll(services: Services = Depends(get_services)):
     _emit_tick_metrics(result)
     # FastAPI serializes the pydantic TickResult natively.
     return result
+
+
+def _set_tick_span_attributes(span, result: TickResult) -> None:
+    """Copy TickResult fields onto the tick_once span per the
+    observability spec's attribute contract."""
+    span.set_attribute(
+        "zashiki.messages_processed", result.messages_processed
+    )
+    span.set_attribute("zashiki.rebaselined", result.rebaselined)
+    if result.cursor_before is not None:
+        span.set_attribute("zashiki.cursor_before", result.cursor_before)
+    if result.cursor_after is not None:
+        span.set_attribute("zashiki.cursor_after", result.cursor_after)
+    if result.error:
+        from opentelemetry.trace import Status, StatusCode
+
+        span.set_status(Status(StatusCode.ERROR, result.error))
+        span.set_attribute("zashiki.error", result.error)
 
 
 def _emit_tick_metrics(result: TickResult) -> None:

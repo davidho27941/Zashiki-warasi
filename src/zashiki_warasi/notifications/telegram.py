@@ -13,7 +13,10 @@ import httpx
 
 from zashiki_warasi.core.config import TelegramSettings
 from zashiki_warasi.observability import telegram_send_total
-from zashiki_warasi.observability.instrumentation import observe_outcome
+from zashiki_warasi.observability.instrumentation import (
+    observe_outcome,
+    zashiki_span,
+)
 
 
 class TelegramError(Exception):
@@ -42,7 +45,10 @@ class TelegramNotifier:
         in observe_outcome so callers that catch and log the exception
         (email_agent's notify node) still see the counter increment.
         """
-        with observe_outcome(counter=telegram_send_total):
+        with zashiki_span(
+            "notify.telegram",
+            attributes={"messaging.system": "telegram"},
+        ), observe_outcome(counter=telegram_send_total):
             url = (
                 f"{self._settings.api_base}/bot{self._settings.bot_token}"
                 "/sendMessage"

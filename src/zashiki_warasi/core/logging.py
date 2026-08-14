@@ -162,7 +162,8 @@ def bind_message_context(
 def node_trace(
     log: logging.Logger | logging.LoggerAdapter, name: str
 ) -> Iterator[None]:
-    """DEBUG-level entry/exit trace around a LangGraph node body.
+    """DEBUG-level entry/exit trace + OpenTelemetry span around a
+    LangGraph node body.
 
     Usage inside a node method:
 
@@ -175,24 +176,68 @@ def node_trace(
     - exception:     `node=<name> exit_error elapsed_ms=<int> exc=<type>`
       (then re-raises the original exception unchanged)
 
+    In parallel, opens an OpenTelemetry span named `zashiki.node.<name>`.
+    When `log` is a `LoggerAdapter` carrying `message_id` in its `extra`,
+    it's attached as `zashiki.message_id` span attribute so the span
+    grep-joins with the log stream. On exception the span is marked
+    ERROR and the exception recorded on it; the exception itself
+    propagates unchanged.
+
     `elapsed_ms` uses `time.monotonic` — safe against wall-clock skew.
-    Overhead is a few microseconds per node call, insignificant next
-    to the LLM/DB/HTTP work inside every node.
+    Overhead is a few microseconds per node call under a NoOp tracer
+    (OTel disabled) and ~tens of microseconds under a real tracer —
+    insignificant next to the LLM / DB / HTTP work inside every node.
     """
+    # OTel API is always installed (opentelemetry-api is a v1.1 dep);
+    # under OTEL_ENABLED=0 the tracer_provider is NoOp and
+    # start_as_current_span produces a NoOp span with near-zero cost.
+    from opentelemetry import trace
+
+    tracer = trace.get_tracer("zashiki_warasi.node")
+
     log.debug(f"node={name} enter")
     started = time.monotonic()
-    try:
-        yield
-    except BaseException as exc:
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        log.debug(
-            f"node={name} exit_error elapsed_ms={elapsed_ms} "
-            f"exc={type(exc).__name__}"
-        )
-        raise
-    else:
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        log.debug(f"node={name} exit elapsed_ms={elapsed_ms}")
+    with tracer.start_as_current_span(f"zashiki.node.{name}") as span:
+        _attach_context_attributes(span, log)
+        try:
+            yield
+        except BaseException as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            log.debug(
+                f"node={name} exit_error elapsed_ms={elapsed_ms} "
+                f"exc={type(exc).__name__}"
+            )
+            _mark_span_error(span, exc)
+            raise
+        else:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            log.debug(f"node={name} exit elapsed_ms={elapsed_ms}")
+
+
+def _attach_context_attributes(
+    span, log: logging.Logger | logging.LoggerAdapter
+) -> None:
+    """Copy well-known context (`request_id`, `message_id`) from the
+    logger / contextvar into the span so operators grepping either
+    signal can pivot to the other. No-op on NoOp spans."""
+    request_id = _REQUEST_ID_CTX.get()
+    if request_id:
+        span.set_attribute("zashiki.request_id", request_id)
+    if isinstance(log, logging.LoggerAdapter):
+        message_id = (log.extra or {}).get("message_id")
+        if message_id:
+            span.set_attribute("zashiki.message_id", message_id)
+
+
+def _mark_span_error(span, exc: BaseException) -> None:
+    """Set span status to ERROR + record the exception. Guarded so a
+    NoOp span (OTEL_ENABLED=0) does nothing."""
+    from opentelemetry.trace import Status, StatusCode
+
+    span.set_status(Status(StatusCode.ERROR, str(exc)))
+    # record_exception is safe on NoOp spans (no-op) and adds an
+    # exception event on real spans.
+    span.record_exception(exc)
 
 
 def configure_logging(settings: LoggingSettings | None = None) -> None:

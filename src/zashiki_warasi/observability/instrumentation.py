@@ -92,3 +92,105 @@ def observe_outcome(
     finally:
         merged = {**extra_labels, "outcome": outcome}
         counter.labels(**merged).inc()
+
+
+# --- OTel span helpers -----------------------------------------------
+#
+# These wrap `tracer.start_as_current_span` in patterns specific to our
+# span-name contract (`zashiki.*`). Under OTEL_ENABLED=0 the tracer
+# provider is NoOp and every helper here reduces to a few microseconds
+# of function-call overhead — no allocations, no exports.
+
+
+@contextmanager
+def zashiki_span(
+    name: str,
+    *,
+    attributes: dict[str, object] | None = None,
+) -> Iterator[object]:
+    """Open a `zashiki.<name>` OTel span. Yields the span so the
+    caller can set attributes discovered during the block body
+    (e.g. TickResult fields on the tick_once span).
+
+    On exception, marks the span ERROR + records the exception and
+    re-raises. Attribute-set errors (rare — usually attribute-type
+    mismatches) are swallowed with a debug log so telemetry never
+    bubbles up as a request failure.
+    """
+    from opentelemetry import trace
+    from opentelemetry.trace import Status, StatusCode
+
+    tracer = trace.get_tracer("zashiki_warasi")
+    with tracer.start_as_current_span(f"zashiki.{name}") as span:
+        if attributes:
+            for k, v in attributes.items():
+                if v is not None:
+                    _safe_set_attribute(span, k, v)
+        try:
+            yield span
+        except BaseException as exc:
+            span.set_status(Status(StatusCode.ERROR, str(exc)))
+            span.record_exception(exc)
+            raise
+
+
+def _safe_set_attribute(span, key: str, value: object) -> None:
+    """set_attribute wrapper that swallows type-validation errors.
+
+    OTel's Attribute type accepts str / bool / int / float / seq of
+    same. A caller passing e.g. a datetime through by mistake would
+    raise inside the SDK — we don't want telemetry to break a
+    request path, so degrade to str() and log.
+    """
+    try:
+        span.set_attribute(key, value)
+    except Exception:
+        try:
+            span.set_attribute(key, str(value))
+        except Exception:
+            pass  # Give up silently.
+
+
+def set_gen_ai_attributes(
+    span, *, system: str, model: str, response: object | None = None
+) -> None:
+    """Attach OTel GenAI semantic-convention attributes to a live
+    span. `system` is the provider identifier (`openai`, `anthropic`);
+    `model` is the requested model name. `response` — if provided —
+    is inspected for token-usage metadata (LangChain-shaped:
+    `usage_metadata` on AIMessage, or `response_metadata.token_usage`
+    on older paths). Silently skips fields the response doesn't
+    expose — structured-output models often strip usage from the
+    returned pydantic instance.
+    """
+    _safe_set_attribute(span, "gen_ai.system", system)
+    _safe_set_attribute(span, "gen_ai.request.model", model)
+    if response is None:
+        return
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        rm = getattr(response, "response_metadata", None) or {}
+        if isinstance(rm, dict):
+            usage = rm.get("token_usage") or rm.get("usage")
+    if not usage:
+        return
+    input_tokens = None
+    output_tokens = None
+    if isinstance(usage, dict):
+        input_tokens = usage.get("input_tokens") or usage.get(
+            "prompt_tokens"
+        )
+        output_tokens = usage.get("output_tokens") or usage.get(
+            "completion_tokens"
+        )
+    else:
+        input_tokens = getattr(usage, "input_tokens", None) or getattr(
+            usage, "prompt_tokens", None
+        )
+        output_tokens = getattr(
+            usage, "output_tokens", None
+        ) or getattr(usage, "completion_tokens", None)
+    if input_tokens is not None:
+        _safe_set_attribute(span, "gen_ai.usage.input_tokens", input_tokens)
+    if output_tokens is not None:
+        _safe_set_attribute(span, "gen_ai.usage.output_tokens", output_tokens)
