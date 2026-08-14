@@ -284,16 +284,22 @@ class TestConfigureTracing:
 
 
 class TestRateLimitedBSP:
-    """Exercises the BatchSpanProcessor subclass built by
-    `_make_rate_limited_bsp`. Uses a fake in-memory exporter to avoid
-    the OTLP gRPC path.
+    """Exercises the `RateLimitedBSP` subclass. Uses a fake in-memory
+    exporter to avoid the OTLP gRPC path.
+
+    Imported directly from its submodule (design D24 — top-level class,
+    lazy-module-imported inside configure_tracing).
     """
 
     def _make_processor(self, exporter_export_side_effect=None):
-        """Build the real processor via the factory. Fake exporter's
-        `export()` returns SUCCESS by default; pass a side_effect to
-        make it raise for the export_failed path."""
+        """Build the processor directly by class construction. Fake
+        exporter's `export()` returns SUCCESS by default; pass a
+        side_effect to make it raise for the export_failed path."""
         from opentelemetry.sdk.trace.export import SpanExportResult
+
+        from zashiki_warasi.observability._rate_limited_bsp import (
+            RateLimitedBSP,
+        )
 
         exporter = MagicMock()
         exporter._endpoint = "http://collector:4317"
@@ -302,7 +308,7 @@ class TestRateLimitedBSP:
         else:
             exporter.export.side_effect = exporter_export_side_effect
         log = logging.getLogger("test.bsp")
-        proc = tracing._make_rate_limited_bsp(exporter, log=log)
+        proc = RateLimitedBSP(exporter, log=log)
         return proc, exporter, log
 
     def test_warn_rate_limited_first_call_emits(self, caplog):
@@ -361,3 +367,23 @@ class TestRateLimitedBSP:
             r for r in caplog.records if "export_failed" in r.message
         ]
         assert len(matches) == 1
+
+    def test_is_batchspanprocessor_subclass(self):
+        """Regression pin for D24: RateLimitedBSP is a top-level class
+        that subclasses BatchSpanProcessor and can be `isinstance`-
+        checked from outside. The pre-D24 factory shape couldn't be
+        checked this way."""
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+        from zashiki_warasi.observability._rate_limited_bsp import (
+            RateLimitedBSP,
+        )
+
+        proc, _, _ = self._make_processor()
+        assert isinstance(proc, RateLimitedBSP)
+        assert isinstance(proc, BatchSpanProcessor)
+        # Fully-qualified name is clean (no `.<locals>.` from the
+        # old factory shape).
+        assert (
+            RateLimitedBSP.__qualname__ == "RateLimitedBSP"
+        ), "class __qualname__ should be plain, not nested"

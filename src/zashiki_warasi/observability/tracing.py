@@ -51,7 +51,6 @@ import logging
 import os
 import re
 import sys
-import time
 import uuid
 
 from zashiki_warasi.core.config import ObservabilitySettings
@@ -102,7 +101,15 @@ def configure_tracing(
     exporter = OTLPSpanExporter(
         endpoint=settings.otel_exporter_otlp_endpoint,
     )
-    processor = _make_rate_limited_bsp(exporter, log=log)
+    # Lazy-import the BSP submodule — its top-level `from
+    # opentelemetry.sdk.trace.export import BatchSpanProcessor` is what
+    # triggers the SDK import chain, and we only want that on the
+    # enabled path (design D24).
+    from zashiki_warasi.observability._rate_limited_bsp import (
+        RateLimitedBSP,
+    )
+
+    processor = RateLimitedBSP(exporter, log=log)
     provider.add_span_processor(processor)
     trace.set_tracer_provider(provider)
 
@@ -319,102 +326,11 @@ def _build_sampler(settings: ObservabilitySettings):
     return ParentBased(root=TraceIdRatioBased(arg))
 
 
-# --- BatchSpanProcessor wrapper with rate-limited errors ------------
-
-
-def _make_rate_limited_bsp(exporter, *, log: logging.Logger | None = None):
-    """Build a `BatchSpanProcessor` subclass that:
-
-    - Counts drops on `zashiki_traces_dropped_total{reason=...}`
-    - Rate-limits WARNING lines about exporter failures to at most
-      one per minute per (reason) category, so a downed collector
-      does not spam the log stream
-
-    We SUBCLASS `BatchSpanProcessor` (via a dynamically-built class
-    inside this factory) rather than wrap-and-delegate — the SDK's
-    internal `SpanProcessor` protocol has grown methods like
-    `_on_ending` that new SDK versions call from inside `span.end()`,
-    and manually delegating each one is a moving target. Subclassing
-    inherits every method automatically; we only override the two
-    hooks we care about (`on_end` for queue-full detection, `shutdown`
-    for in-flight-count).
-
-    Kept as a factory (not a top-level class) so the SDK import stays
-    lazy — modules that import `tracing` without going through
-    `configure_tracing` don't pay the SDK import cost.
-    """
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-
-    from zashiki_warasi.observability import traces_dropped_total
-
-    _WINDOW_SECONDS = 60.0
-    log_ = log or logger
-
-    class _RateLimitedBSP(BatchSpanProcessor):
-        def __init__(self, exp):
-            super().__init__(exp)
-            self._exporter_ref = exp
-            self._last_warned: dict[str, float] = {}
-            self._install_export_wrapper()
-
-        def _install_export_wrapper(self) -> None:
-            """Wrap the exporter's export() to count export failures.
-
-            Called from __init__ so every span batch export goes
-            through our counter regardless of the caller path
-            (BSP worker thread, force_flush, shutdown drain).
-            """
-            original_export = self._exporter_ref.export
-
-            def _export(spans):
-                try:
-                    return original_export(spans)
-                except Exception:
-                    traces_dropped_total.labels(
-                        reason="export_failed"
-                    ).inc(len(spans))
-                    self._warn_rate_limited("export_failed")
-                    raise
-
-            self._exporter_ref.export = _export
-
-        def on_end(self, span):
-            # Sample the queue length BEFORE calling super so we can
-            # detect the "queue was already full" case (which means
-            # the SDK dropped this span rather than enqueuing it).
-            queue_size_before = len(getattr(self, "queue", []))
-            super().on_end(span)
-            max_size = getattr(self, "max_queue_size", None)
-            if max_size is not None and queue_size_before >= max_size:
-                traces_dropped_total.labels(reason="queue_full").inc()
-                self._warn_rate_limited("queue_full")
-
-        def shutdown(self):
-            # Count in-flight spans as shutdown drops (best effort —
-            # some may still export cleanly if force_flush was
-            # already called).
-            remaining = len(getattr(self, "queue", []))
-            if remaining > 0:
-                traces_dropped_total.labels(reason="shutdown").inc(
-                    remaining
-                )
-            super().shutdown()
-
-        def _warn_rate_limited(self, reason: str) -> None:
-            now = time.monotonic()
-            prior = self._last_warned.get(reason, 0.0)
-            if now - prior >= _WINDOW_SECONDS:
-                self._last_warned[reason] = now
-                log_.warning(
-                    "OTel span export dropping traces (reason=%s). "
-                    "Check collector reachability at %s.",
-                    reason,
-                    getattr(
-                        self._exporter_ref, "_endpoint", "<unknown>"
-                    ),
-                )
-
-    return _RateLimitedBSP(exporter)
+# NOTE: `RateLimitedBSP` lives in `observability/_rate_limited_bsp.py`
+# (top-level class in a dedicated submodule, design D24). It is imported
+# lazily inside `configure_tracing()` above, preserving the OTEL_ENABLED=0
+# zero-SDK-import contract while giving up the code-smell of a factory
+# with a class defined inline.
 
 
 # --- Library instrumentation ----------------------------------------
