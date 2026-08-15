@@ -129,3 +129,116 @@ docker compose down
   whether the tick is genuinely long-running or the advisory lock is
   stuck (see the openspec migrate-to-fastapi-service change's
   MIGRATION-v1.md troubleshooting section).
+
+## Observability profile (v1.1, opt-in)
+
+The default `docker compose up` renders the same one-service stack as
+v1.0. To also bring up a self-contained OTel Collector + Prometheus +
+Tempo + Grafana observability stack on the same compose network:
+
+```
+docker compose --profile observability up -d
+```
+
+**On first boot** you get 4 additional containers:
+
+| Service | Role | Internal endpoint |
+|---|---|---|
+| `otel-collector` | Receives OTLP/gRPC spans from the app, forwards to Tempo | `otel-collector:4317` |
+| `prometheus` | Scrapes app `/metrics` + collector self-metrics every 15s | `prometheus:9090` |
+| `tempo` | Stores traces, 24h retention, filesystem-backed | `tempo:3200` |
+| `grafana` | UI, Prometheus + Tempo datasources pre-provisioned | http://127.0.0.1:3000 |
+
+### Enable tracing on the app
+
+In `.env`, set:
+
+```
+OTEL_ENABLED=1
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+```
+
+Restart the `zashiki-warasi` container. Every `POST /poll` now produces
+a full span tree in Tempo (see `docs/tracing-architecture.md` for the
+contract).
+
+### Login to Grafana
+
+- URL: <http://127.0.0.1:3000>
+- Username: `admin`
+- Password: value of `GRAFANA_ADMIN_PASSWORD` in `.env` (default
+  placeholder `change-me-observability` — **rotate before exposing
+  the port beyond loopback**).
+
+The `Zashiki-warasi > Zashiki-warasi overview` dashboard is
+auto-loaded and shows tick lifecycle, gmail/llm/notify signals,
+healthz gauge, oauth expiry countdown, and telemetry-pipeline
+drops.
+
+### Adjusting Prometheus retention
+
+Default is 7 days. To change, set `PROMETHEUS_RETENTION_TIME` in
+`.env` and restart the prometheus container:
+
+```
+PROMETHEUS_RETENTION_TIME=30d
+docker compose --profile observability up -d prometheus
+```
+
+Sizing at current metric shape (~13 zashiki_* families + process/GC):
+- 7d ≈ <100 MB
+- 30d ≈ <500 MB
+- 90d ≈ <2 GB
+
+### Exposing Grafana beyond loopback (BE CAREFUL)
+
+The compose file binds Grafana to `127.0.0.1:3000` on the host by
+default. Exposing to the LAN or public means anyone reachable can
+try to log in with the default admin password.
+
+**Before** changing the port mapping:
+
+1. Rotate `GRAFANA_ADMIN_PASSWORD` in `.env` to a strong secret.
+2. Consider putting Grafana behind an ingress that adds SSO / mTLS.
+
+Then edit `docker-compose.yml`:
+
+```
+  grafana:
+    ports:
+      - "0.0.0.0:3000:3000"   # or a specific interface IP
+```
+
+Prometheus, Tempo, and OTel Collector are commented-out entirely
+by default — same rule applies if you uncomment their port mappings.
+
+### Provisioned dashboards are read-only
+
+Grafana's file provider re-reads
+`deploy/compose/observability/grafana/dashboards/*.json` on every
+container start and reconciles the UI. **Edits made through the
+Grafana UI to a provisioned dashboard are lost on restart.**
+
+To customize:
+
+- **Small tweaks**: edit the source JSON file, restart Grafana
+  (or wait 30s for auto-reconcile).
+- **Big changes**: use Grafana's *Save As* to create a fresh
+  non-provisioned dashboard that survives restarts (stored in the
+  `grafana-data` volume).
+
+### Tearing down without losing app state
+
+Stopping only the observability profile keeps `zashiki-warasi`
+running:
+
+```
+docker compose --profile observability down
+```
+
+Data volumes (`prometheus-data`, `tempo-data`, `grafana-data`)
+persist across down/up cycles. Add `-v` to also wipe them:
+
+```
+docker compose --profile observability down -v
+```

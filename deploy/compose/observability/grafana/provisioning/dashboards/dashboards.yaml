@@ -1,0 +1,26 @@
+# Grafana dashboard provider for the compose observability profile.
+#
+# File provider — points at /var/lib/grafana/dashboards, which is
+# mounted from ./observability/grafana/dashboards/*.json in docker-
+# compose.yml.
+#
+# Grafana rescans this dir every `updateIntervalSeconds` and reconciles.
+# Provisioned dashboards are TREATED AS READ-ONLY from the UI —
+# changes made in Grafana are lost on reconcile. To customize,
+# either edit the source JSON or "Save As" a new dashboard through
+# the UI.
+
+apiVersion: 1
+
+providers:
+  - name: zashiki-warasi
+    orgId: 1
+    folder: Zashiki-warasi
+    folderUid: zashiki-warasi
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: false   # provisioned dashboards are read-only
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
