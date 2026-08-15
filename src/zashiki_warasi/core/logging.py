@@ -81,12 +81,12 @@ _CONTEXT_FIELDS: tuple[str, ...] = (
 # knows a second call is a re-configure, not a first-time attach.
 _HANDLER_SENTINEL = "_zashiki_owned"
 
-# Module-scoped flag guarding one-shot install of the OTel-trace-context
-# LogRecord factory. Second and subsequent `configure_logging()` calls
-# see this True and skip re-installing — chaining N wrappers around
-# the same factory would be N times the per-record cost, and there's
-# no `uninstall_factory` API to undo it.
-_FACTORY_INSTALLED = False
+# Sentinel attribute set on the LogRecord factory when we install our
+# trace-context wrapper. Semantically the state IS "is the current
+# factory our wrapper?" — attaching it to the factory object itself
+# is cleaner than shadowing in a module-level flag (D25). Same
+# pattern as `_HANDLER_SENTINEL` on the stream handler.
+_FACTORY_SENTINEL = "__zashiki_installed__"
 
 _ZASHIKI_LOGGER_NAME = "zashiki_warasi"
 
@@ -329,7 +329,8 @@ def configure_logging(settings: LoggingSettings | None = None) -> None:
       1. Resolve settings (fail-fast on invalid level / format via
          `LoggingSettings`).
       2. Install the OTel trace-context LogRecord factory ONCE per
-         process (idempotent, uses `_FACTORY_INSTALLED` guard).
+         process (idempotent, uses `_FACTORY_SENTINEL` attr on the
+         factory itself — see D25).
       3. Attach a single StreamHandler(sys.stderr) to the root logger
          if not already attached.
       4. Set the handler's formatter based on `settings.format`
@@ -388,10 +389,11 @@ def _install_trace_context_factory() -> None:
     process so every emitted LogRecord carries `trace_id` and
     `span_id` when an OTel span context is active.
 
-    - `_FACTORY_INSTALLED` guard: idempotent. `configure_logging()`
-      may be called multiple times (tests, lifespan restarts); we
-      install our wrapper only on the first call. Chaining N times
-      would incur N-times the per-record cost forever after.
+    - Idempotency: sentinel attribute `_FACTORY_SENTINEL` stamped on
+      our wrapper. If the currently-installed factory already carries
+      it, re-install is a no-op. Same pattern as `_HANDLER_SENTINEL`
+      on the stream handler — state lives on the object it describes,
+      not in a shadow module variable (D25).
     - Chain-wrap (not replace) the existing factory so anything a
       test harness / third-party library installed before us keeps
       working.
@@ -402,12 +404,9 @@ def _install_trace_context_factory() -> None:
       for span_id) matching W3C traceparent + Grafana Tempo query
       conventions.
     """
-    global _FACTORY_INSTALLED
-    if _FACTORY_INSTALLED:
-        return
-    _FACTORY_INSTALLED = True
-
     prior_factory = logging.getLogRecordFactory()
+    if getattr(prior_factory, _FACTORY_SENTINEL, False):
+        return
 
     def _trace_context_factory(
         *args: Any, **kwargs: Any
@@ -427,6 +426,7 @@ def _install_trace_context_factory() -> None:
             pass
         return record
 
+    setattr(_trace_context_factory, _FACTORY_SENTINEL, True)
     logging.setLogRecordFactory(_trace_context_factory)
 
 

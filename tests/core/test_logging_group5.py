@@ -395,7 +395,7 @@ class TestTraceContextFactory:
     def test_factory_chains_existing_factory(self):
         """If a test harness / third-party lib set its own factory
         before us, our wrapper must run on top, not replace it."""
-        # Rig: we can't easily reset _FACTORY_INSTALLED, so instead
+        # Rig: we can't easily reset factory-sentinel state, so instead
         # we verify the CURRENT factory produces a record that carries
         # the chained-in attribute when the chain is in place.
         #
@@ -410,6 +410,16 @@ class TestTraceContextFactory:
         assert record.name == "t"
         assert record.levelname == "INFO"
         assert record.msg == "hello"
+
+    def test_installed_factory_carries_sentinel_attribute(self):
+        """Regression pin for D25: the installed factory has our
+        sentinel attribute set. This is HOW `_install_trace_context_
+        factory` decides to skip re-install on subsequent calls — the
+        state lives on the factory object itself, not in a module
+        variable."""
+        configure_logging(LoggingSettings())
+        factory = logging.getLogRecordFactory()
+        assert getattr(factory, "__zashiki_installed__", False) is True
 
 
 # --- Trace context reaches formatter (integration) ------------------
