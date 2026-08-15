@@ -77,8 +77,8 @@ def configure_tracing(
 
     if not settings.otel_enabled:
         log.debug(
-            "OTEL_ENABLED=%s → tracing disabled (SDK not initialized)",
-            settings.otel_enabled,
+            f"OTEL_ENABLED={settings.otel_enabled} → tracing "
+            "disabled (SDK not initialized)"
         )
         return
 
@@ -116,11 +116,10 @@ def configure_tracing(
     _instrument_libraries(log)
 
     log.info(
-        "OTel tracing enabled: service=%s endpoint=%s sampler=%s ratio=%s",
-        settings.otel_service_name,
-        settings.otel_exporter_otlp_endpoint,
-        settings.otel_traces_sampler,
-        settings.otel_traces_sampler_arg,
+        f"OTel tracing enabled: service={settings.otel_service_name} "
+        f"endpoint={settings.otel_exporter_otlp_endpoint} "
+        f"sampler={settings.otel_traces_sampler} "
+        f"ratio={settings.otel_traces_sampler_arg}"
     )
 
 
@@ -149,18 +148,17 @@ def check_web_concurrency(log: logging.Logger | None = None) -> None:
         # An unparseable value is a config bug; refuse to boot rather
         # than let uvicorn later crash with a less helpful error.
         log.critical(
-            "WEB_CONCURRENCY=%r is not an integer. Unset it or set to '1'.",
-            raw,
+            f"WEB_CONCURRENCY={raw!r} is not an integer. "
+            "Unset it or set to '1'."
         )
         sys.exit(1)
     if value > 1:
         log.critical(
-            "WEB_CONCURRENCY=%d is unsupported: prometheus_client "
+            f"WEB_CONCURRENCY={value} is unsupported: prometheus_client "
             "registry is process-local and multi-worker mode fragments "
             "counters across workers, breaking scraper contract. Use "
             "replicaCount for horizontal scale instead. See "
-            "docs/lessons/2026-08-12-prometheus-multi-worker.md",
-            value,
+            "docs/lessons/2026-08-12-prometheus-multi-worker.md"
         )
         sys.exit(1)
 
@@ -208,11 +206,10 @@ def _guard_resource_attributes_secrets(
         if matched is None:
             continue
         log.critical(
-            "OTEL_RESOURCE_ATTRIBUTES key %r matched secret pattern %r "
-            "and would be attached to every exported span. Refusing to "
-            "boot. Remove the offending key/value from the env var.",
-            key,
-            matched,
+            f"OTEL_RESOURCE_ATTRIBUTES key {key!r} matched secret "
+            f"pattern {matched!r} and would be attached to every "
+            "exported span. Refusing to boot. Remove the offending "
+            "key/value from the env var."
         )
         sys.exit(1)
 
@@ -319,9 +316,8 @@ def _build_sampler(settings: ObservabilitySettings):
     # Unknown sampler name — behave like the OTel SDK would with a
     # missing env var, and pick a reasonable default rather than crash.
     logger.warning(
-        "Unknown OTEL_TRACES_SAMPLER=%r; falling back to "
-        "parentbased_traceidratio",
-        name,
+        f"Unknown OTEL_TRACES_SAMPLER={name!r}; falling back to "
+        "parentbased_traceidratio"
     )
     return ParentBased(root=TraceIdRatioBased(arg))
 

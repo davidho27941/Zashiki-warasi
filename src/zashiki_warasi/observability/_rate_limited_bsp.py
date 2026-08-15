@@ -119,9 +119,10 @@ class RateLimitedBSP(BatchSpanProcessor):
         prior = self._last_warned.get(reason, 0.0)
         if now - prior >= _WINDOW_SECONDS:
             self._last_warned[reason] = now
+            endpoint = getattr(
+                self._exporter_ref, "_endpoint", "<unknown>"
+            )
             self._log.warning(
-                "OTel span export dropping traces (reason=%s). "
-                "Check collector reachability at %s.",
-                reason,
-                getattr(self._exporter_ref, "_endpoint", "<unknown>"),
+                f"OTel span export dropping traces (reason={reason}). "
+                f"Check collector reachability at {endpoint}."
             )
