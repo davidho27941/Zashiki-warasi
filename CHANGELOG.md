@@ -5,6 +5,167 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0]
+
+Adds the observability side of v1.0's FastAPI service. Prometheus
+metrics endpoint (always on), OpenTelemetry tracing (opt-in), JSON
+log format with trace-context correlation, and both a self-contained
+Docker Compose observability stack (`--profile observability`) and
+opt-in kube-prometheus-stack integration templates in the Helm chart.
+Fully backward-compatible: v1.0.x → v1.1 with no config changes = same
+runtime behavior. Full write-up in the `add-observability-stack`
+OpenSpec change (25 design decisions D1–D25). Operator-facing enable
+guide in `docs/observability.md` (+ `.zh.md`); tracing implementation
+KT in `docs/tracing-architecture.md`; OTel-vs-Langfuse selection
+rationale in `docs/observability-tool-choice.md`.
+
+### Added
+
+- **`observability` capability** — new `zashiki_warasi/observability/`
+  package. `/metrics` Prometheus endpoint (always on, no app-layer
+  toggle — D7); 13-family metric contract with cardinality guardrails
+  (`_assert_no_forbidden_labels` rejects `message_id`/`email`/etc.
+  at declaration time); OTel SDK bootstrap (`configure_tracing`,
+  opt-in via `OTEL_ENABLED=1`, lazy SDK import so disabled = zero
+  cost); span emission at 3 tiers — auto (FastAPI/httpx/psycopg
+  instrumentation), manual business spans (`zashiki.tick_once`,
+  `zashiki.node.*`, `zashiki.llm.chat`, `zashiki.notify.telegram`),
+  auto span attribute propagation (`zashiki.message_id`,
+  `zashiki.request_id`, OTel GenAI semconv on LLM spans);
+  `_RateLimitedBSP` BatchSpanProcessor subclass counting
+  `zashiki_traces_dropped_total{reason}` + rate-limiting exporter-
+  error WARNINGs to one per minute per reason.
+- **Two runtime guardrails** — `check_web_concurrency` (D18) fail-
+  fasts on `WEB_CONCURRENCY>1` because prometheus_client registry is
+  process-local; `_guard_resource_attributes_secrets` (D22) fail-
+  fasts if `OTEL_RESOURCE_ATTRIBUTES` looks like it carries a secret
+  (5 known token prefixes + base64 shape), refusing to boot rather
+  than leak into every exported span forever.
+- **`logging` capability** — extended `LoggingSettings.format`
+  (`text|json`), new `JsonContextFormatter` (NDJSON with
+  `ensure_ascii=False` for Chinese preservation, `default=str` for
+  non-JSON-serializable extras); `_install_trace_context_factory`
+  chain-wraps `logging.getLogRecordFactory` exactly once per process
+  so every LogRecord carries `trace_id` + `span_id` when an OTel span
+  context is active; `_CONTEXT_FIELDS` extended to include
+  `trace_id` + `span_id` so both text and JSON formatters render them.
+- **`http-service` capability** — new `GET /metrics` route
+  (unconditionally registered, no `X-API-Key` gate).
+- **`container-deployment` capability**:
+  - Compose: new `deploy/compose/observability/` config files
+    (OTel Collector + Prometheus + Tempo + Grafana with pre-
+    provisioned datasources + starter dashboard); 4 profile-guarded
+    services in `docker-compose.yml`; Prometheus retention env-driven
+    via `PROMETHEUS_RETENTION_TIME` (default 7d, D20); Grafana port
+    loopback-only default (`127.0.0.1:3000:3000`) with rotate-
+    password warning inline.
+  - Helm: three new templates all default OFF —
+    `servicemonitor.yaml` (with `job` relabeling for stable alert
+    query matching), `prometheusrule.yaml` (5 starter alerts, each
+    independently toggleable + threshold-tunable, `additionalRules`
+    append point non-destructively, D19), `dashboard-configmap.yaml`
+    (per-dashboard toggle so disabling → sidecar auto-removes panel
+    from Grafana, no manual UI cleanup).
+- **Middleware conversion** — `RequestIdMiddleware` refactored from
+  Starlette `BaseHTTPMiddleware` to pure ASGI (D17); prevents
+  anyio-task-group boundary from breaking OTel `contextvars`-based
+  span parenting. New `MetricsMiddleware` also pure ASGI. Behavior
+  identical to v1.0; all 7 pre-existing request-id tests pass without
+  modification.
+- **7 new business metric wire-ups** — `zashiki_tick_*`,
+  `zashiki_gmail_api_*`, `zashiki_llm_*`, `zashiki_telegram_send_total`,
+  `zashiki_oauth_refresh_total`, `zashiki_oauth_token_expires_in_seconds`,
+  `zashiki_healthz_status` — emitted at business call sites via
+  shared `record_call` / `observe_outcome` helpers so a future new
+  concern only needs the metric declaration + one `with` at the call
+  site.
+- **Documentation** —
+  - `docs/observability.md` + `.zh.md` — operator-facing enable +
+    reference (compose + k3s paths, metric contract, span structure,
+    JSON log schema, tuning knobs, troubleshooting).
+  - `docs/tracing-architecture.md` — implementation KT (full-scope
+    architecture, three landmines documented).
+  - `docs/observability-tool-choice.md` — why OTel/Tempo over
+    Langfuse for this project (three-axis evaluation framework).
+  - `docs/lessons/2026-08-11-basehttp-middleware-vs-otel-tracing.md`
+    — pure-ASGI-middleware requirement lesson.
+  - `docs/lessons/2026-08-12-prometheus-multi-worker.md` —
+    single-worker fail-fast lesson.
+
+### Changed
+
+- `LoggingSettings.format` field added (env `LOG_FORMAT`, default
+  `text`). v1.0 text format preserved byte-identical for records
+  without OTel context; regression pin in `tests/core/test_logging_
+  group5.py::TestTextFormatRegression`.
+- `_CONTEXT_FIELDS` allowlist extended with `trace_id` + `span_id`
+  (order: `request_id` → `trace_id` → `span_id` → per-message IDs).
+- `RequestIdMiddleware` — pure ASGI. `scope["state"]["request_id"]`
+  set for handler consumption (unchanged semantics vs v1.0).
+- `check_env_parity.py` extended `COMPOSE_ONLY` allowlist with
+  `PROMETHEUS_RETENTION_TIME` + `GRAFANA_ADMIN_PASSWORD` (compose-
+  only knobs; k3s uses kube-prom-stack's own retention + auth).
+- FastAPI application factory now attaches `FastAPIInstrumentor` on
+  create — reads current TracerProvider at request time so
+  `OTEL_ENABLED=0` renders NoOp spans (near-zero overhead).
+
+### Added dependencies
+
+- `prometheus-client>=0.20,<1.0`
+- `opentelemetry-api>=1.30,<2.0`
+- `opentelemetry-sdk>=1.30,<2.0`
+- `opentelemetry-exporter-otlp-proto-grpc>=1.30,<2.0`
+- `opentelemetry-instrumentation-fastapi>=0.51b0,<1.0`
+- `opentelemetry-instrumentation-httpx>=0.51b0,<1.0`
+- `opentelemetry-instrumentation-psycopg>=0.51b0,<1.0` (compat probed
+  against psycopg 3.2.13)
+
+Image size delta: pending measurement (task 8a.2). No `python-json-
+logger` dep (JSON formatter is hand-rolled, D5); no
+`opentelemetry-instrumentation-logging` dep (custom `setLogRecord
+Factory` bridge in `core/logging.py`, D4); no LangSmith / Langfuse
+SDK (OTel + GenAI semconv is the neutral integration surface, see
+`docs/observability-tool-choice.md`).
+
+### Test count
+
+559 (v1.0) → 700 (v1.1). New categories: observability metric
+contract + label guard (14), `/metrics` endpoint (7), Group 3 metric
+wire-ups (17), Group 4 tracing bootstrap + BSP (35), Group 4b span
+tree integration (7), Group 5 log format + trace correlation (28),
+Group 7 Helm observability manifests (17), + minor test additions
+along refactors (D24 subclass isinstance, D25 factory sentinel attr).
+Zero regression on the v1.0 baseline.
+
+### Backward compatibility
+
+Nothing on the runtime path changes for operators who don't opt in:
+
+- `/healthz`, `/poll`, `/reauth`, `/auth/*` behavior identical
+- Text log format byte-identical
+- `docker compose up` (no profile) renders the same one-service stack
+- `helm install ...` (no observability flags) renders the same
+  manifests as v1.0
+
+Upgrade v1.0.x → v1.1 requires no config change. Opt-in per surface
+after the upgrade — start with metrics (near-zero cost), add
+dashboards + alerts, enable tracing last (needs a collector).
+
+### Non-goals (explicitly deferred to future changes)
+
+- Log aggregation with Grafana Loki (candidate name
+  `add-log-aggregation-loki`; depends on this change's `LOG_FORMAT=
+  json` + trace context fields)
+- Prometheus exemplars (metric → trace jump)
+- Alertmanager receiver bundle (routing is cluster-owned)
+- Route-specific trace sampling (fold in only if `/healthz` traces
+  become clutter)
+- Unified telemetry pipeline via Grafana Alloy
+- LLM prompt / completion span content capture (PII + payload size)
+- Multi-worker uvicorn support via `PROMETHEUS_MULTIPROC_DIR`
+- CI test job for `.gitlab-ci.yml` (v1.0-inherited limitation:
+  pipeline only builds image, does not run pytest)
+
 ## [1.0.0]
 
 Replaces the long-running Python daemon with a FastAPI service driven
