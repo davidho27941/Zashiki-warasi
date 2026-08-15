@@ -1,0 +1,116 @@
+{{- /*
+PrometheusRule shipping the 5-alert starter bundle. Each alert has
+an independent enabled/for/severity toggle + one threshold knob
+(where relevant). See values.yaml `observability.prometheusRule.alerts.*`.
+
+Every rule's expr filters on `job="<fullname>"` so alert rules match
+the same label our ServiceMonitor stamps via relabelings. That
+coupling is the whole reason the SM sets `job` explicitly (see
+servicemonitor.yaml comment).
+
+Operator's own alerts can be appended via
+`observability.prometheusRule.additionalRules: []` — added AFTER
+the starter set, non-destructive.
+
+Requires the `monitoring.coreos.com/v1` PrometheusRule CRD.
+*/}}
+{{- if .Values.observability.prometheusRule.enabled }}
+{{- $fullname := include "zashiki-warasi.fullname" . }}
+{{- $alerts := .Values.observability.prometheusRule.alerts }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "zashiki-warasi.labels" . | nindent 4 }}
+    {{- with .Values.observability.prometheusRule.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  groups:
+    - name: zashiki-warasi
+      rules:
+        {{- with $alerts.tickNoSuccessfulTick }}
+        {{- if .enabled }}
+        - alert: ZashikiTickNoSuccessfulTick
+          expr: increase(zashiki_tick_messages_processed_total{job="{{ $fullname }}"}[{{ .for }}]) == 0
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "No successful Zashiki tick in the last {{ .for }}"
+            description: >-
+              zashiki_tick_messages_processed_total has not incremented
+              in {{ .for }}. Either no new mail (benign — check inbox)
+              or the poller stopped processing (check /healthz + Telegram
+              alerts).
+        {{- end }}
+        {{- end }}
+        {{- with $alerts.tickErrorRateHigh }}
+        {{- if .enabled }}
+        - alert: ZashikiTickErrorRateHigh
+          expr: rate(zashiki_tick_duration_seconds_count{outcome="error",job="{{ $fullname }}"}[5m]) * 60 > {{ .ratePerMinute }}
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "Zashiki tick error rate above {{ .ratePerMinute }}/min for {{ .for }}"
+            description: >-
+              Sustained tick failures. Common causes: Gmail API
+              throttling, LLM backend down, checkpointer DB unreachable.
+              Check Grafana overview → Tick lifecycle panel for the
+              latency shape, and Tempo for a failing trace.
+        {{- end }}
+        {{- end }}
+        {{- with $alerts.tickConflictRateHigh }}
+        {{- if .enabled }}
+        - alert: ZashikiTickConflictRateHigh
+          expr: rate(zashiki_tick_conflicts_total{job="{{ $fullname }}"}[5m]) * 60 > {{ .ratePerMinute }}
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "Zashiki tick 409-conflict rate above {{ .ratePerMinute }}/min"
+            description: >-
+              Cron cadence is tighter than tick duration — schedulers
+              are racing on the advisory lock. Not a bug in itself
+              (single-flight is doing its job), but signals that either
+              cadence should relax or tick_once should be faster.
+        {{- end }}
+        {{- end }}
+        {{- with $alerts.healthzUnhealthy }}
+        {{- if .enabled }}
+        - alert: ZashikiHealthzUnhealthy
+          expr: zashiki_healthz_status{job="{{ $fullname }}"} == 0
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "Zashiki /healthz reporting unhealthy for {{ .for }}"
+            description: >-
+              At least one of {db, oauth} checks in /healthz is
+              failing. Grafana overview → Healthz panel + Grafana
+              overview → OAuth token expires in panel narrow the
+              cause. DB unreachable → exit code 71 restart cycle;
+              OAuth expired → run /reauth or `zashiki-warasi reauth`.
+        {{- end }}
+        {{- end }}
+        {{- with $alerts.oauthRefreshFailing }}
+        {{- if .enabled }}
+        - alert: ZashikiOAuthRefreshFailing
+          expr: increase(zashiki_oauth_refresh_total{outcome="error",job="{{ $fullname }}"}[{{ .for }}]) > 0
+          for: {{ .for }}
+          labels:
+            severity: {{ .severity }}
+          annotations:
+            summary: "Zashiki OAuth refresh failing in the last {{ .for }}"
+            description: >-
+              Refresh token is expired or revoked. Automatic recovery
+              is not possible — operator must run `zashiki-warasi
+              reauth` (CLI) or hit POST /reauth (headless).
+        {{- end }}
+        {{- end }}
+        {{- with .Values.observability.prometheusRule.additionalRules }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}
