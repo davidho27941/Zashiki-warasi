@@ -138,9 +138,29 @@ helm upgrade --install tempo grafana/tempo \
     --set persistence.size=10Gi
 ```
 
-在 kube-prom-stack Grafana 加一個 Tempo datasource(datasource
-snippet 參考 grafana/tempo chart README,指向
-`http://tempo.kube-prometheus-stack.svc:3100`)。
+在 kube-prom-stack Grafana 加一個 Tempo datasource。`grafana/tempo`
+chart 的 query API 走 `3200`(不是 `3100`);最簡單:丟一個帶
+`grafana_datasource=1` label 的 ConfigMap,讓 kube-prom-stack Grafana
+sidecar 自動 import:
+
+```
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-datasource
+  namespace: kube-prometheus-stack
+  labels:
+    grafana_datasource: "1"
+data:
+  tempo-datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Tempo
+        type: tempo
+        uid: tempo
+        url: http://tempo.kube-prometheus-stack.svc:3200
+        access: proxy
+```
 
 打開 app 端:
 

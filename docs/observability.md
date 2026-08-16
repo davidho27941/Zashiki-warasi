@@ -144,9 +144,29 @@ helm upgrade --install tempo grafana/tempo \
     --set persistence.size=10Gi
 ```
 
-Add a Tempo datasource to your kube-prom-stack Grafana (see the
-grafana/tempo chart README for the datasource snippet — it points at
-`http://tempo.kube-prometheus-stack.svc:3100`).
+Add a Tempo datasource to your kube-prom-stack Grafana. The
+`grafana/tempo` chart exposes its query API on port `3200` (not `3100`);
+easiest is to drop a datasource ConfigMap labeled `grafana_datasource=1`
+so the kube-prom-stack Grafana sidecar auto-imports it:
+
+```
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-datasource
+  namespace: kube-prometheus-stack
+  labels:
+    grafana_datasource: "1"
+data:
+  tempo-datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Tempo
+        type: tempo
+        uid: tempo
+        url: http://tempo.kube-prometheus-stack.svc:3200
+        access: proxy
+```
 
 Flip the app on:
 
