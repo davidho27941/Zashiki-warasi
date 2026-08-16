@@ -51,7 +51,7 @@ services:
 
   otel-collector:
     profiles: [observability]
-    image: otel/opentelemetry-collector-contrib:0.115.0
+    image: otel/opentelemetry-collector-contrib:0.115.1
     container_name: zashiki-otel-collector
     restart: unless-stopped
     command: ["--config=/etc/otel-collector-config.yaml"]
