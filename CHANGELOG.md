@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Docs** — `docs/observability.md` (+ `.zh.md`) k3s section 4
+  ("Enable tracing") rewritten. Recommended path is now installing
+  `grafana/tempo` in single-binary mode and pointing the app's OTLP
+  exporter directly at Tempo — no OTel Collector in the middle.
+  Standalone OTel Collector / Grafana Alloy / Tempo Operator are now
+  presented as trigger-based alternatives (fan-out, sampling, planned
+  Loki, multi-tenant), not equal-weight options. Notes explicitly that
+  the compose observability profile bundles a collector as a
+  reference-architecture demo, not a prescription for k3s. No chart,
+  code, or runtime behavior change — this closes the deferred v1.1
+  task 9.7 (k3s tracing e2e) knowledge gap. See the
+  `enable-k3s-tracing` OpenSpec change for context.
+
 ## [1.1.0]
 
 Adds the observability side of v1.0's FastAPI service. Prometheus

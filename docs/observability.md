@@ -123,15 +123,66 @@ Tune individual alerts without editing PromQL:
     --set observability.prometheusRule.alerts.tickConflictRateHigh.enabled=false
 ```
 
-### 4. Enable tracing (needs an OTel Collector in-cluster)
+### 4. Enable tracing
+
+The chart doesn't ship a trace backend. Enabling tracing = install a
+backend, then set two env keys on the app.
+
+**Recommended path — Tempo single-binary, no collector.** At single-user
+homelab scale you almost certainly don't need an OTel Collector in
+between. Tempo has an OTLP receiver built in on `:4317`; the app pushes
+straight to it. One fewer pod, one fewer config file, one fewer place
+to break.
+
+Install Tempo alongside your kube-prom-stack:
 
 ```
+helm upgrade --install tempo grafana/tempo \
+    --namespace kube-prometheus-stack \
+    --set tempo.storage.trace.backend=local \
+    --set persistence.enabled=true \
+    --set persistence.size=10Gi
+```
+
+Add a Tempo datasource to your kube-prom-stack Grafana (see the
+grafana/tempo chart README for the datasource snippet — it points at
+`http://tempo.kube-prometheus-stack.svc:3100`).
+
+Flip the app on:
+
+```
+helm upgrade zashiki ./deploy/helm/zashiki-warasi \
+    --reset-then-reuse-values \
     --set env.OTEL_ENABLED=1 \
-    --set env.OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.observability.svc.cluster.local:4317
+    --set env.OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo.kube-prometheus-stack.svc:4317
 ```
 
-The chart does NOT deploy a Collector — expected to already exist
-in the cluster (or deploy separately).
+(Use `--reset-then-reuse-values` not `--reuse-values` — see
+[v1.1 implementation notes](v1.1-implementation-notes.md) for why.)
+
+**When to add a Collector or a heavier setup.** These are triggers, not
+an equal-weighted menu — reach for them ONLY when one applies:
+
+- **Standalone OTel Collector** (`open-telemetry/opentelemetry-collector`
+  chart) — you need to fan out spans to a second backend (e.g. Tempo
+  in-cluster + Grafana Cloud), or you need tail-based sampling, or you
+  need attribute redaction the app doesn't do itself. If none of those
+  apply, skip.
+- **Grafana Alloy** (DaemonSet) — you're also planning to add Loki
+  for log aggregation. Alloy handles logs + metrics + traces through
+  one agent, so consolidating makes sense at that point. Adopting
+  Alloy now when there's nothing to consolidate is premature —
+  revisit alongside the Loki follow-up.
+- **Tempo Operator** — you're running multi-tenant Tempo, or your
+  storage backend is S3/GCS/Azure Blob and you want the operator to
+  manage the `TempoStack` CR. Overkill for a single-user homelab.
+
+**Why compose has a collector but k3s doesn't.** The compose observability
+profile (`--profile observability`) bundles `otel-collector → tempo →
+grafana` as a **reference architecture** — it demonstrates the
+prod-shape flow (app → collector → backend). That's a demo, not a
+prescription. Don't cargo-cult the collector into k3s just because
+compose has one.
 
 Full details:
 [`deploy/helm/zashiki-warasi/README.md`](../deploy/helm/zashiki-warasi/README.md)
