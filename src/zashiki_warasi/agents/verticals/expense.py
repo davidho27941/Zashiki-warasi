@@ -31,6 +31,15 @@ from zashiki_warasi.notifications.notion import (
     NotionExpenseRecorder,
     NotionSyncError,
 )
+from zashiki_warasi.observability import (
+    llm_calls_total,
+    llm_latency_seconds,
+)
+from zashiki_warasi.observability.instrumentation import (
+    record_call,
+    set_gen_ai_attributes,
+    zashiki_span,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -273,11 +282,19 @@ class ExpenseSubgraph:
         client: GmailClient,
         model: BaseChatModel,
         notion: NotionExpenseRecorder | None = None,
+        llm_model_name: str = "unknown",
+        llm_system: str = "unknown",
     ) -> None:
         self._session_factory = session_factory
         self._client = client
         self._notion = notion
         self._structured_model = model.with_structured_output(ExpenseDraft)
+        # Kept for GenAI span attributes (`gen_ai.request.model` /
+        # `gen_ai.system`). `unknown` defaults let older tests
+        # construct without wiring settings; production always passes
+        # both from LLMSettings.
+        self._llm_model_name = llm_model_name
+        self._llm_system = llm_system
         self.graph = self._build_graph(checkpointer)
 
     def _build_graph(self, checkpointer: PostgresSaver | None):
@@ -328,12 +345,29 @@ class ExpenseSubgraph:
                 }
 
             user_prompt = self._build_user_prompt(email, text)
-            draft: ExpenseDraft = self._structured_model.invoke(
-                [
-                    SystemMessage(content=EXPENSE_EXTRACT_SYSTEM_PROMPT),
-                    HumanMessage(content=user_prompt),
-                ]
-            )
+            with zashiki_span("llm.chat") as _span, record_call(
+                counter=llm_calls_total,
+                histogram=llm_latency_seconds,
+                counter_labels={"node": "expense_extract"},
+                histogram_labels={"node": "expense_extract"},
+            ):
+                set_gen_ai_attributes(
+                    _span,
+                    system=self._llm_system,
+                    model=self._llm_model_name,
+                )
+                draft: ExpenseDraft = self._structured_model.invoke(
+                    [
+                        SystemMessage(content=EXPENSE_EXTRACT_SYSTEM_PROMPT),
+                        HumanMessage(content=user_prompt),
+                    ]
+                )
+                set_gen_ai_attributes(
+                    _span,
+                    system=self._llm_system,
+                    model=self._llm_model_name,
+                    response=draft,
+                )
             log.info(
                 f"expense: extracted vendor={draft.vendor} "
                 f"amount={draft.amount} currency={draft.currency}"

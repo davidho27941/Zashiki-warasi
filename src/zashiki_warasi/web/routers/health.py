@@ -10,10 +10,15 @@ the cached `Credentials` object.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Response
 
 from zashiki_warasi.core.services import Services
+from zashiki_warasi.observability import (
+    healthz_status,
+    oauth_token_expires_in_seconds,
+)
 from zashiki_warasi.web.dependencies import get_services
 
 logger = logging.getLogger(__name__)
@@ -29,10 +34,40 @@ def healthz(
     db_ok = _check_db(services)
     oauth_ok = _check_oauth(services)
     checks = {"db": db_ok, "oauth": oauth_ok}
-    if db_ok and oauth_ok:
+    # Emit observability metrics on the same code path — the checks
+    # are computed regardless, so the gauge writes are free. The
+    # oauth-expiry gauge covers the case where the token is still
+    # cached even when oauth_ok is False (expired but has refresh_
+    # token — still refreshable, just past its own `expiry` clock).
+    healthy = db_ok and oauth_ok
+    healthz_status.set(1 if healthy else 0)
+    oauth_token_expires_in_seconds.set(_seconds_to_expiry(services))
+    if healthy:
         return {"status": "healthy", "checks": checks}
     response.status_code = 503
     return {"status": "unhealthy", "checks": checks}
+
+
+def _seconds_to_expiry(services: Services) -> float:
+    """Return seconds remaining until the cached OAuth token's expiry.
+
+    Negative when the token has expired but a refresh has not yet run
+    (still meaningful — dashboards can show "expired for N seconds").
+    Returns 0.0 when no cached credential is present (no token to time).
+
+    google.auth's Credentials.expiry is a naive UTC datetime; compare
+    against a naive UTC `datetime.utcnow()` equivalent to avoid the
+    "can't subtract offset-naive from offset-aware" TypeError.
+    """
+    creds = getattr(services, "credentials", None)
+    if creds is None:
+        return 0.0
+    expiry = getattr(creds, "expiry", None)
+    if expiry is None:
+        return 0.0
+    # Credentials.expiry is naive-UTC per google.auth convention.
+    now_utc_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    return (expiry - now_utc_naive).total_seconds()
 
 
 def _check_db(services: Services) -> bool:

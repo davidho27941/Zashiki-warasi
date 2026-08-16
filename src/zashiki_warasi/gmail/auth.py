@@ -14,6 +14,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 
 from zashiki_warasi.core.config import GmailSettings
 from zashiki_warasi.gmail.exceptions import CredentialRefreshError
+from zashiki_warasi.observability import oauth_refresh_total
 
 logger = logging.getLogger(__name__)
 
@@ -28,8 +29,10 @@ def get_credentials(settings: GmailSettings | None = None) -> Credentials:
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
+            oauth_refresh_total.labels(outcome="success").inc()
             logger.info("credentials refreshed successfully")
         except RefreshError as exc:
+            oauth_refresh_total.labels(outcome="error").inc()
             raise CredentialRefreshError(
                 _refresh_error_message(settings.token_path, exc)
             ) from exc

@@ -27,6 +27,19 @@ from zashiki_warasi.gmail.exceptions import (
     HistoryExpiredError,
     MessageNotFoundError,
 )
+from zashiki_warasi.observability import (
+    gmail_api_calls_total,
+    gmail_api_latency_seconds,
+)
+from zashiki_warasi.observability.instrumentation import record_call
+
+# Bounded set of `operation` label values for the gmail_api_* metrics.
+# Adding one? Also add it to the metric family's documented labelset
+# and the dashboard query — dashboards fingerprint the enum.
+_OP_HISTORY = "history"
+_OP_MESSAGE_GET = "message_get"
+_OP_ATTACHMENT_GET = "attachment_get"
+_OP_PROFILE = "profile"
 
 
 class GmailClient:
@@ -116,12 +129,18 @@ class GmailClient:
                 longer accessible.
         """
         try:
-            raw = (
-                self._service.users()
-                .messages()
-                .get(userId=self._user_id, id=message_id, format="full")
-                .execute()
-            )
+            with record_call(
+                counter=gmail_api_calls_total,
+                histogram=gmail_api_latency_seconds,
+                counter_labels={"operation": _OP_MESSAGE_GET},
+                histogram_labels={"operation": _OP_MESSAGE_GET},
+            ):
+                raw = (
+                    self._service.users()
+                    .messages()
+                    .get(userId=self._user_id, id=message_id, format="full")
+                    .execute()
+                )
         except HttpError as exc:
             if exc.resp.status == 404:
                 raise MessageNotFoundError(message_id) from exc
@@ -143,17 +162,23 @@ class GmailClient:
             Raw attachment bytes (caller is responsible for any further
             decoding such as PDF extraction).
         """
-        raw = (
-            self._service.users()
-            .messages()
-            .attachments()
-            .get(
-                userId=self._user_id,
-                messageId=message_id,
-                id=attachment_id,
+        with record_call(
+            counter=gmail_api_calls_total,
+            histogram=gmail_api_latency_seconds,
+            counter_labels={"operation": _OP_ATTACHMENT_GET},
+            histogram_labels={"operation": _OP_ATTACHMENT_GET},
+        ):
+            raw = (
+                self._service.users()
+                .messages()
+                .attachments()
+                .get(
+                    userId=self._user_id,
+                    messageId=message_id,
+                    id=attachment_id,
+                )
+                .execute()
             )
-            .execute()
-        )
         return base64.urlsafe_b64decode(raw["data"] + "==")
 
     # ---------- Infrastructure (used by poller) ----------
@@ -163,11 +188,17 @@ class GmailClient:
 
         Used to baseline the history cursor on first run.
         """
-        raw = (
-            self._service.users()
-            .getProfile(userId=self._user_id)
-            .execute()
-        )
+        with record_call(
+            counter=gmail_api_calls_total,
+            histogram=gmail_api_latency_seconds,
+            counter_labels={"operation": _OP_PROFILE},
+            histogram_labels={"operation": _OP_PROFILE},
+        ):
+            raw = (
+                self._service.users()
+                .getProfile(userId=self._user_id)
+                .execute()
+            )
         return ProfileInfo(
             email=raw["emailAddress"],
             history_id=int(raw["historyId"]),
@@ -206,7 +237,17 @@ class GmailClient:
                 }
                 if page_token:
                     kwargs["pageToken"] = page_token
-                response = history_api.list(**kwargs).execute()
+                # One metric observation per page fetch. Multi-page
+                # ticks emit multiple observations; rate() over the
+                # counter reflects real API call rate, not caller-
+                # visible list_history invocations.
+                with record_call(
+                    counter=gmail_api_calls_total,
+                    histogram=gmail_api_latency_seconds,
+                    counter_labels={"operation": _OP_HISTORY},
+                    histogram_labels={"operation": _OP_HISTORY},
+                ):
+                    response = history_api.list(**kwargs).execute()
             except HttpError as exc:
                 if exc.resp.status == 404:
                     raise HistoryExpiredError(start_history_id) from exc

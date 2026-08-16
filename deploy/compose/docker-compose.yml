@@ -37,3 +37,95 @@ services:
       timeout: 5s
       start_period: 15s
       retries: 3
+
+  # ==================================================================
+  # OBSERVABILITY PROFILE
+  #
+  # All services below are hidden unless started with:
+  #   docker compose --profile observability up -d
+  #
+  # Default `docker compose up` renders the same one-service stack as
+  # v1.0 — operator opts in explicitly. See ./README.md `Observability
+  # profile` section for enablement + how to safely expose Grafana.
+  # ==================================================================
+
+  otel-collector:
+    profiles: [observability]
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    container_name: zashiki-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./observability/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    # ports:
+    #   - "4317:4317"    # OTLP/gRPC (uncomment to accept OTLP from host processes)
+    #   - "4318:4318"    # OTLP/HTTP
+    #   - "8888:8888"    # collector self-metrics (Prom scrape)
+    #   - "13133:13133"  # health_check extension
+    depends_on:
+      - tempo
+
+  prometheus:
+    profiles: [observability]
+    image: prom/prometheus:v2.55.1
+    container_name: zashiki-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      # Retention env-driven — see .env.example PROMETHEUS_RETENTION_TIME.
+      # `${VAR:-default}` shell-style expansion works in compose command:.
+      - "--storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-7d}"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    # ports:
+    #   - "9090:9090"    # Prometheus UI (uncomment to browse from host)
+    depends_on:
+      - zashiki-warasi
+      - otel-collector
+
+  tempo:
+    profiles: [observability]
+    image: grafana/tempo:2.6.1
+    container_name: zashiki-tempo
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./observability/tempo.yaml:/etc/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    # ports:
+    #   - "3200:3200"    # Tempo query API (Grafana talks to this on the compose net)
+
+  grafana:
+    profiles: [observability]
+    image: grafana/grafana:11.4.0
+    container_name: zashiki-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_ADMIN_PASSWORD:-change-me-observability}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      # Disable analytics / update-check phone-home for self-hosted.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      # LOOPBACK-ONLY default (127.0.0.1). Grafana ships with the
+      # env-set admin password — if you uncomment `0.0.0.0:3000:3000`
+      # without rotating GRAFANA_ADMIN_PASSWORD from the .env.example
+      # placeholder, any host reachable from your LAN can log in with
+      # the well-known default. Rotate first, then expose.
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      - prometheus
+      - tempo
+
+volumes:
+  prometheus-data:
+  tempo-data:
+  grafana-data:

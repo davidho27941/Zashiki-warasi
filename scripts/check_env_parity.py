@@ -30,6 +30,15 @@ COMPOSE_ONLY: frozenset[str] = frozenset(
         # Host-side path knobs used by docker-compose.yml volume binds.
         "GMAIL_CREDENTIALS_HOST_PATH",
         "DATA_DIR",
+        # v1.1 observability-profile knobs. Prometheus retention drives
+        # a `command:` flag on the compose Prometheus service; Helm
+        # deploys don't ship Prometheus (kube-prometheus-stack owns
+        # retention via its own `prometheus.prometheusSpec.retention`).
+        # Grafana admin password is likewise only relevant when the
+        # compose profile bundles Grafana; k3s uses kube-prom-stack's
+        # existing Grafana with its own auth story.
+        "PROMETHEUS_RETENTION_TIME",
+        "GRAFANA_ADMIN_PASSWORD",
     }
 )
 

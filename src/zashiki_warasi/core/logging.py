@@ -19,11 +19,13 @@ Stdlib only — no structlog / loguru dep. The formatter shape is
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from typing import Any, Iterator
 
 from zashiki_warasi.core.config import LoggingSettings
@@ -56,12 +58,20 @@ _CHATTY_THIRD_PARTY_LOGGERS: tuple[str, ...] = (
     "psycopg.pool",
 )
 
-# Allowlist of `extra` keys the formatter will render inside the
-# `[k=v]` block. Anything else on the LogRecord's `__dict__` is
-# ignored — prevents accidentally leaking arbitrary attributes and
-# keeps the format stable across modules.
+# Allowlist of `extra` keys the formatter will render (in both the
+# text `[k=v]` block and the JSON top-level payload). Anything else on
+# the LogRecord's `__dict__` is ignored — prevents accidentally
+# leaking arbitrary attributes and keeps the format stable across
+# modules.
+#
+# Order is grep-friendly stability: request_id first (broadest
+# scope, one per HTTP request), then trace/span (OTel identity, only
+# present when tracing is on), then per-message identifiers set by
+# LoggerAdapter extras.
 _CONTEXT_FIELDS: tuple[str, ...] = (
     "request_id",
+    "trace_id",
+    "span_id",
     "message_id",
     "thread_id",
     "expense_id",
@@ -70,6 +80,13 @@ _CONTEXT_FIELDS: tuple[str, ...] = (
 # Sentinel attribute set on our stream handler so `configure_logging`
 # knows a second call is a re-configure, not a first-time attach.
 _HANDLER_SENTINEL = "_zashiki_owned"
+
+# Sentinel attribute set on the LogRecord factory when we install our
+# trace-context wrapper. Semantically the state IS "is the current
+# factory our wrapper?" — attaching it to the factory object itself
+# is cleaner than shadowing in a module-level flag (D25). Same
+# pattern as `_HANDLER_SENTINEL` on the stream handler.
+_FACTORY_SENTINEL = "__zashiki_installed__"
 
 _ZASHIKI_LOGGER_NAME = "zashiki_warasi"
 
@@ -112,6 +129,71 @@ class ContextFormatter(logging.Formatter):
             pairs.append(f"{key}={value}")
         record.zashiki_context = f"[{','.join(pairs)}]" if pairs else ""
         return super().format(record)
+
+
+class JsonContextFormatter(logging.Formatter):
+    """One-JSON-object-per-record formatter (NDJSON / JSON Lines).
+
+    Contract:
+    - `timestamp`: ISO-8601 UTC with millisecond precision, Z suffix
+    - `level`: uppercase name (`DEBUG` / `INFO` / ...)
+    - `logger`: dotted Python logger name
+    - `message`: post-`%`-substitution message string
+    - Every context field in `_CONTEXT_FIELDS` that has a value
+      becomes a top-level key (not nested — log-search tools filter
+      without knowing the structure). Absent fields OMITTED entirely
+      (never emitted as `null` / `""` / `"None"`).
+    - On `exc_info`: `traceback` string field + `exception` object
+      `{type, message}`.
+
+    Serialization uses `ensure_ascii=False` — this codebase's log
+    messages are frequently Chinese (`classified as 消費支出`,
+    category names, notification text). Default `ensure_ascii=True`
+    would render them as `消費支出` — technically valid JSON,
+    operationally a disaster (grep-by-substring breaks, human-
+    readable dashboards break).
+
+    Serialization uses `default=str` — `extra=` may carry `datetime`,
+    `Decimal`, `UUID`, `Path`, custom objects. Without a fallback,
+    `json.dumps` raises `TypeError` inside the logger call, which
+    propagates and can crash whatever code emitted the log line.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload: dict[str, Any] = {
+            "timestamp": _iso_utc_timestamp(record.created),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        for key in _CONTEXT_FIELDS:
+            if key == "request_id":
+                value: Any = _REQUEST_ID_CTX.get()
+            else:
+                value = record.__dict__.get(key)
+            # Falsy skip: None, "", 0 all excluded — the contract is
+            # "field appears only when meaningful", matching text
+            # formatter's `if value is None: continue` intent.
+            if value:
+                payload[key] = value
+        if record.exc_info:
+            payload["traceback"] = self.formatException(record.exc_info)
+            exc_type, exc_value, _ = record.exc_info
+            payload["exception"] = {
+                "type": exc_type.__name__ if exc_type else "",
+                "message": str(exc_value) if exc_value else "",
+            }
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _iso_utc_timestamp(unix_ts: float) -> str:
+    """Format a Unix timestamp as ISO-8601 UTC with milliseconds + Z.
+
+    Example: `2026-08-15T09:12:34.567Z`
+    """
+    dt = datetime.fromtimestamp(unix_ts, tz=timezone.utc)
+    ms = dt.microsecond // 1000
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ms:03d}Z"
 
 
 class _MessageContextAdapter(logging.LoggerAdapter):
@@ -162,7 +244,8 @@ def bind_message_context(
 def node_trace(
     log: logging.Logger | logging.LoggerAdapter, name: str
 ) -> Iterator[None]:
-    """DEBUG-level entry/exit trace around a LangGraph node body.
+    """DEBUG-level entry/exit trace + OpenTelemetry span around a
+    LangGraph node body.
 
     Usage inside a node method:
 
@@ -175,49 +258,106 @@ def node_trace(
     - exception:     `node=<name> exit_error elapsed_ms=<int> exc=<type>`
       (then re-raises the original exception unchanged)
 
+    In parallel, opens an OpenTelemetry span named `zashiki.node.<name>`.
+    When `log` is a `LoggerAdapter` carrying `message_id` in its `extra`,
+    it's attached as `zashiki.message_id` span attribute so the span
+    grep-joins with the log stream. On exception the span is marked
+    ERROR and the exception recorded on it; the exception itself
+    propagates unchanged.
+
     `elapsed_ms` uses `time.monotonic` — safe against wall-clock skew.
-    Overhead is a few microseconds per node call, insignificant next
-    to the LLM/DB/HTTP work inside every node.
+    Overhead is a few microseconds per node call under a NoOp tracer
+    (OTel disabled) and ~tens of microseconds under a real tracer —
+    insignificant next to the LLM / DB / HTTP work inside every node.
     """
+    # OTel API is always installed (opentelemetry-api is a v1.1 dep);
+    # under OTEL_ENABLED=0 the tracer_provider is NoOp and
+    # start_as_current_span produces a NoOp span with near-zero cost.
+    from opentelemetry import trace
+
+    tracer = trace.get_tracer("zashiki_warasi.node")
+
     log.debug(f"node={name} enter")
     started = time.monotonic()
-    try:
-        yield
-    except BaseException as exc:
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        log.debug(
-            f"node={name} exit_error elapsed_ms={elapsed_ms} "
-            f"exc={type(exc).__name__}"
-        )
-        raise
-    else:
-        elapsed_ms = int((time.monotonic() - started) * 1000)
-        log.debug(f"node={name} exit elapsed_ms={elapsed_ms}")
+    with tracer.start_as_current_span(f"zashiki.node.{name}") as span:
+        _attach_context_attributes(span, log)
+        try:
+            yield
+        except BaseException as exc:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            log.debug(
+                f"node={name} exit_error elapsed_ms={elapsed_ms} "
+                f"exc={type(exc).__name__}"
+            )
+            _mark_span_error(span, exc)
+            raise
+        else:
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            log.debug(f"node={name} exit elapsed_ms={elapsed_ms}")
+
+
+def _attach_context_attributes(
+    span, log: logging.Logger | logging.LoggerAdapter
+) -> None:
+    """Copy well-known context (`request_id`, `message_id`) from the
+    logger / contextvar into the span so operators grepping either
+    signal can pivot to the other. No-op on NoOp spans."""
+    request_id = _REQUEST_ID_CTX.get()
+    if request_id:
+        span.set_attribute("zashiki.request_id", request_id)
+    if isinstance(log, logging.LoggerAdapter):
+        message_id = (log.extra or {}).get("message_id")
+        if message_id:
+            span.set_attribute("zashiki.message_id", message_id)
+
+
+def _mark_span_error(span, exc: BaseException) -> None:
+    """Set span status to ERROR + record the exception. Guarded so a
+    NoOp span (OTEL_ENABLED=0) does nothing."""
+    from opentelemetry.trace import Status, StatusCode
+
+    span.set_status(Status(StatusCode.ERROR, str(exc)))
+    # record_exception is safe on NoOp spans (no-op) and adds an
+    # exception event on real spans.
+    span.record_exception(exc)
 
 
 def configure_logging(settings: LoggingSettings | None = None) -> None:
     """Bootstrap logging for the app process.
 
-    Order matters (see design.md D6):
-      1. Resolve settings (fail-fast on invalid level via LoggingSettings).
-      2. Attach a single StreamHandler(sys.stderr) with our formatter
-         to the root logger — if already attached, skip.
-      3. Set root level.
-      4. Set `zashiki_warasi` level if the operator gave an override,
-         otherwise clear it so the root level rules.
-      5. Pin chatty third-party loggers to WARNING.
+    Order matters:
+      1. Resolve settings (fail-fast on invalid level / format via
+         `LoggingSettings`).
+      2. Install the OTel trace-context LogRecord factory ONCE per
+         process (idempotent, uses `_FACTORY_SENTINEL` attr on the
+         factory itself — see D25).
+      3. Attach a single StreamHandler(sys.stderr) to the root logger
+         if not already attached.
+      4. Set the handler's formatter based on `settings.format`
+         (`ContextFormatter` for `text`, `JsonContextFormatter` for
+         `json`). Runs on every call so re-configure can flip format.
+      5. Set root level.
+      6. Set `zashiki_warasi` tree level if operator overrode.
+      7. Pin chatty third-party loggers to WARNING.
 
-    Safe to call more than once. Re-entry updates levels without
-    stacking handlers (which would cause duplicated output lines).
+    Safe to call more than once. Re-entry updates levels and formatter
+    without stacking handlers (duplicated output lines) or factories
+    (chained N-times slowdown).
     """
     settings = settings or LoggingSettings()
+
+    _install_trace_context_factory()
 
     root = logging.getLogger()
     if not _has_our_handler(root):
         handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(ContextFormatter())
         setattr(handler, _HANDLER_SENTINEL, True)
         root.addHandler(handler)
+
+    formatter = _build_formatter(settings.format)
+    for h in root.handlers:
+        if getattr(h, _HANDLER_SENTINEL, False):
+            h.setFormatter(formatter)
 
     root.setLevel(_level_int(settings.level))
 
@@ -232,6 +372,62 @@ def configure_logging(settings: LoggingSettings | None = None) -> None:
 
     for name in _CHATTY_THIRD_PARTY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
+
+
+def _build_formatter(fmt: str) -> logging.Formatter:
+    """Map the validated `LoggingSettings.format` value to the actual
+    Formatter instance. `LoggingSettings` validation guarantees the
+    value is `text` or `json` (lowercased), so the else-branch is
+    defensive-only."""
+    if fmt == "json":
+        return JsonContextFormatter()
+    return ContextFormatter()
+
+
+def _install_trace_context_factory() -> None:
+    """Chain-wrap `logging.getLogRecordFactory()` exactly once per
+    process so every emitted LogRecord carries `trace_id` and
+    `span_id` when an OTel span context is active.
+
+    - Idempotency: sentinel attribute `_FACTORY_SENTINEL` stamped on
+      our wrapper. If the currently-installed factory already carries
+      it, re-install is a no-op. Same pattern as `_HANDLER_SENTINEL`
+      on the stream handler — state lives on the object it describes,
+      not in a shadow module variable (D25).
+    - Chain-wrap (not replace) the existing factory so anything a
+      test harness / third-party library installed before us keeps
+      working.
+    - Fully guarded: if `opentelemetry.trace` cannot be imported or
+      the SDK misbehaves, the wrapper degrades to a no-op — a log
+      emission must NEVER crash because of telemetry.
+    - Uses lowercase-hex formatting (`032x` for trace_id, `016x`
+      for span_id) matching W3C traceparent + Grafana Tempo query
+      conventions.
+    """
+    prior_factory = logging.getLogRecordFactory()
+    if getattr(prior_factory, _FACTORY_SENTINEL, False):
+        return
+
+    def _trace_context_factory(
+        *args: Any, **kwargs: Any
+    ) -> logging.LogRecord:
+        record = prior_factory(*args, **kwargs)
+        try:
+            from opentelemetry import trace
+
+            span = trace.get_current_span()
+            ctx = span.get_span_context() if span is not None else None
+            if ctx is not None and ctx.is_valid:
+                record.trace_id = format(ctx.trace_id, "032x")
+                record.span_id = format(ctx.span_id, "016x")
+        except Exception:
+            # OTel not installed, or SDK internal error — telemetry
+            # must never propagate exceptions into the log call path.
+            pass
+        return record
+
+    setattr(_trace_context_factory, _FACTORY_SENTINEL, True)
+    logging.setLogRecordFactory(_trace_context_factory)
 
 
 def _has_our_handler(logger: logging.Logger) -> bool:

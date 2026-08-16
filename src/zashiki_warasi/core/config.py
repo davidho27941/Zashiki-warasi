@@ -293,6 +293,37 @@ class LoggingSettings(BaseSettings):
         _reject_unknown_level(value)
         return value
 
+    # Log emission format. `text` keeps the v1.0 one-line human-readable
+    # format (byte-identical for regressions). `json` emits one JSON
+    # object per line with `ensure_ascii=False` + `default=str` — see
+    # openspec add-observability-stack for the full JSON contract.
+    #
+    # Python field is named `format` (NOT `log_format`) so the derived
+    # env var is `LOG_FORMAT` — prefix `LOG_` + `FORMAT` = `LOG_FORMAT`.
+    # Naming it `log_format` would produce env `LOG_LOG_FORMAT` (double
+    # prefix). Shadowing the builtin `format()` inside a pydantic model
+    # is fine.
+    #
+    # Class-level `str_to_upper=True` uppercases every string field at
+    # coercion time (so LOG_LEVEL comparisons are simple), but the log
+    # format contract is lowercase (`text`/`json`) — the validator
+    # lowercases again before checking membership and stores the
+    # canonical lowercase value.
+    format: str = Field(default="text")
+
+    @field_validator("format", mode="after")
+    @classmethod
+    def _check_format(cls, value: str) -> str:
+        if not value:
+            return "text"
+        normalized = value.lower()
+        if normalized not in _VALID_LOG_FORMATS:
+            raise ValueError(
+                f"invalid log format {value!r}; must be one of "
+                f"{sorted(_VALID_LOG_FORMATS)}"
+            )
+        return normalized
+
 
 def _reject_unknown_level(value: str) -> None:
     if value not in _VALID_LOG_LEVELS:
@@ -300,6 +331,81 @@ def _reject_unknown_level(value: str) -> None:
             f"invalid log level {value!r}; must be one of "
             f"{sorted(_VALID_LOG_LEVELS)}"
         )
+
+
+_VALID_LOG_FORMATS = {"text", "json"}
+
+
+class ObservabilitySettings(BaseSettings):
+    """OpenTelemetry + metrics runtime knobs.
+
+    Uses an empty `env_prefix` so the `OTEL_*` field names map to the
+    standard OTel SDK env var names verbatim (`OTEL_SERVICE_NAME`,
+    `OTEL_EXPORTER_OTLP_ENDPOINT`, ...). Introducing a project prefix
+    would break interop with tools that read the standard OTel envs
+    (auto-instrumentation, sidecar SDKs, etc.).
+
+    `LOG_FORMAT` deliberately lives on `LoggingSettings` (env prefix
+    `LOG_`), NOT here — placing it on this empty-prefix model would
+    collide with `LoggingSettings`'s claim on the `LOG_` namespace.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # Master switch for OTel tracing. Default off so operators without a
+    # collector see no OTLP connection attempts, no exporter noise.
+    otel_enabled: bool = Field(default=False)
+
+    # Resource attribute `service.name`. Multi-replica deploys should
+    # keep this identical across replicas — instance disambiguation is
+    # `service.instance.id` (auto-populated from HOSTNAME at bootstrap,
+    # see configure_tracing).
+    otel_service_name: str = Field(default="zashiki-warasi")
+
+    # OTLP collector endpoint. Default `localhost:4317` is the compose
+    # observability profile's collector; k3s operators override to the
+    # in-cluster collector's Service DNS.
+    otel_exporter_otlp_endpoint: str = Field(
+        default="http://localhost:4317"
+    )
+    otel_exporter_otlp_protocol: str = Field(default="grpc")
+
+    # Standard OTel SDK sampler names. `parentbased_traceidratio` +
+    # `1.0` means: inherit sampled decision from parent if present,
+    # else sample everything. Sized for v1.0 volume (~1500 traces/day);
+    # env-tunable so operators can drop to `0.1` if volume grows.
+    otel_traces_sampler: str = Field(default="parentbased_traceidratio")
+    otel_traces_sampler_arg: float = Field(default=1.0)
+
+    # Standard OTel-spec comma-separated `k=v,k=v` string, passed to
+    # the SDK's Resource merger as-is. Typed `str` (NOT `dict`) because
+    # pydantic-settings' EnvSettingsSource JSON-decodes dict fields
+    # before validators run — the OTel-standard comma form would break.
+    # If a future refactor wants `dict` typing, use
+    # `Annotated[dict[str, str], NoDecode]`.
+    #
+    # SHALL NOT contain secrets (API keys, tokens) — resource attrs are
+    # attached to every exported span. `configure_tracing()` scans this
+    # value for well-known secret prefixes and refuses to boot on match.
+    otel_resource_attributes: str = Field(default="")
+
+    @field_validator("otel_traces_sampler_arg", mode="after")
+    @classmethod
+    def _check_sampler_ratio(cls, value: float) -> float:
+        # OTel SDK's ratio sampler expects [0.0, 1.0]. Values outside
+        # this range silently produce nonsense sampling behavior in
+        # some SDK versions; fail-fast at settings load instead.
+        if not (0.0 <= value <= 1.0):
+            raise ValueError(
+                f"OTEL_TRACES_SAMPLER_ARG must be in [0.0, 1.0], "
+                f"got {value!r}"
+            )
+        return value
 
 
 class NotionSettings(BaseSettings):

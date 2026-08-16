@@ -1,0 +1,45 @@
+# Grafana Tempo config for the compose observability profile.
+#
+# Single-binary mode (monolithic), filesystem storage — sized for
+# single-node homelab, NOT for multi-tenant / long-retention prod.
+#
+# Retention: 24h. At current volume (~1500 traces/day × ~20 spans =
+# ~30 000 spans/day × ~500 bytes ≈ 15 MB/day), 24h buffer is
+# generous and stays well under any homelab disk budget.
+
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9095
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: 0.0.0.0:4317
+        http:
+          endpoint: 0.0.0.0:4318
+
+ingester:
+  # Flush spans to storage after 5m of inactivity or 5m max age.
+  # Low-volume homelab — no need for aggressive batching.
+  max_block_duration: 5m
+  max_block_bytes: 100_000_000
+  trace_idle_period: 10s
+
+compactor:
+  compaction:
+    # Delete blocks older than 24h. This is the retention knob.
+    block_retention: 24h
+
+storage:
+  trace:
+    backend: local
+    local:
+      path: /var/tempo/traces
+    wal:
+      path: /var/tempo/wal
+    pool:
+      # Number of concurrent bloom-filter lookups. Low for homelab.
+      max_workers: 20
+      queue_depth: 100

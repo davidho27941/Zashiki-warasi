@@ -24,6 +24,12 @@ variables:
   IMAGE: gitlab.davidho.dev:5050/homelab/$CI_PROJECT_NAME
   # $CI_COMMIT_SHORT_SHA = 8-char stable ref, always populated.
   IMAGE_SHA: $IMAGE:$CI_COMMIT_SHORT_SHA
+  # Advisory ceiling on the built image size (MB). v1.0 baseline
+  # ~470 MB, v1.1 with observability deps ~494 MB. 600 MB gives ~20%
+  # headroom for future intentional dep additions. When a real change
+  # justifies bumping this, edit the number here — it's a lint, not
+  # a hard architectural constraint. See CHANGELOG [1.1.0].
+  IMAGE_SIZE_LIMIT_MB: "600"
 
 Build_Image:
   tags:
@@ -33,6 +39,18 @@ Build_Image:
   script:
     - echo "Building $IMAGE_SHA (branch=$CI_COMMIT_REF_NAME)"
     - docker build -t "$IMAGE_SHA" .
+    # Image size guard — fails the build BEFORE we push a bloated
+    # image to the registry. Adjust IMAGE_SIZE_LIMIT_MB in the top
+    # `variables:` block if a real change justifies growing it.
+    - |
+      IMAGE_SIZE_BYTES=$(docker inspect --format='{{.Size}}' "$IMAGE_SHA")
+      IMAGE_SIZE_MB=$((IMAGE_SIZE_BYTES / 1024 / 1024))
+      echo "Image size: ${IMAGE_SIZE_MB} MB (limit: ${IMAGE_SIZE_LIMIT_MB} MB)"
+      if [ "$IMAGE_SIZE_MB" -gt "$IMAGE_SIZE_LIMIT_MB" ]; then
+        echo "ERROR: image size ${IMAGE_SIZE_MB} MB exceeds limit ${IMAGE_SIZE_LIMIT_MB} MB." >&2
+        echo "If this growth is intentional, bump IMAGE_SIZE_LIMIT_MB in .gitlab-ci.yml." >&2
+        exit 1
+      fi
     - echo "$CI_REGISTRY_PASSWORD" | docker login "$CI_REGISTRY" -u "$CI_REGISTRY_USER" --password-stdin
     - docker push "$IMAGE_SHA"
     # Convenience `latest` on main only. Never rely on it in prod values.

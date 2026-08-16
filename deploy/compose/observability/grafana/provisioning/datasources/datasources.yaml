@@ -1,0 +1,52 @@
+# Grafana datasource provisioning for the compose observability profile.
+#
+# Two datasources auto-connected on first boot:
+#   - Prometheus (default): scrapes app + collector self-metrics
+#   - Tempo: OTel traces from the app
+#
+# `traceToMetrics` and `tracesToLogs` cross-links are configured so
+# Grafana Explore lets operators pivot from trace → metric (and later,
+# trace → log once the Loki follow-up change lands).
+
+apiVersion: 1
+
+datasources:
+  # ---- Prometheus (default) ----
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    jsonData:
+      httpMethod: POST
+      timeInterval: 15s
+      # Enable exemplars — reserved for future when we ship
+      # OpenMetrics exposition (backlog).
+      exemplarTraceIdDestinations:
+        - name: trace_id
+          datasourceUid: tempo
+
+  # ---- Tempo (traces) ----
+  - name: Tempo
+    type: tempo
+    uid: tempo
+    access: proxy
+    url: http://tempo:3200
+    jsonData:
+      httpMethod: GET
+      # From a trace span, "Explore metrics for span" opens Prometheus
+      # pre-filtered by service.name — operator jumps in one click.
+      tracesToMetrics:
+        datasourceUid: prometheus
+        tags:
+          - key: service.name
+            value: service
+      # nodeGraph shows the span-parent tree as a visual DAG in the
+      # trace inspector.
+      nodeGraph:
+        enabled: true
+      # search field is the primary UX in Tempo v2+
+      search:
+        hide: false
+      serviceMap:
+        datasourceUid: prometheus

@@ -1,0 +1,39 @@
+{{- /*
+Grafana dashboard ConfigMaps for the kube-prometheus-stack Grafana
+sidecar. The sidecar watches for CMs labeled `grafana_dashboard: "1"`
+(or whatever label is configured on the sidecar via
+`sidecar.dashboards.label` in kube-prom-stack values) and auto-
+imports the JSON as a dashboard.
+
+One CM per bundled dashboard, each gated by two flags:
+  - observability.dashboards.enabled           (master switch)
+  - observability.dashboards.<name>.enabled    (per-dashboard toggle)
+
+Disabling a per-dashboard toggle removes its CM → sidecar auto-
+removes the panel from Grafana on next reconcile. No manual UI
+cleanup needed.
+
+Dashboard JSON lives at `dashboards/<name>.json` inside the chart
+directory (helm .Files.Get is chart-relative). This is a copy of
+`deploy/compose/observability/grafana/dashboards/<name>.json` —
+same content, kept in two places until we refactor to a shared
+source. Duplication tax is acceptable at this stage.
+*/}}
+{{- if .Values.observability.dashboards.enabled }}
+{{- $sidecarKey := .Values.observability.dashboards.sidecarLabel.key }}
+{{- $sidecarValue := .Values.observability.dashboards.sidecarLabel.value }}
+
+{{- if .Values.observability.dashboards.overview.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "zashiki-warasi.fullname" . }}-dashboard-overview
+  labels:
+    {{- include "zashiki-warasi.labels" . | nindent 4 }}
+    {{ $sidecarKey }}: {{ $sidecarValue | quote }}
+data:
+  zashiki-warasi-overview.json: |
+{{ .Files.Get "dashboards/zashiki-warasi-overview.json" | indent 4 }}
+{{- end }}
+
+{{- end }}

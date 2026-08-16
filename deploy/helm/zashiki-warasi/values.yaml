@@ -88,6 +88,26 @@ env:
   # DATABASE_CHECKPOINTER_POOL_MAX_SIZE: "5"
   # DATABASE_CHECKPOINTER_POOL_MAX_LIFETIME_SECONDS: "1800"
   # DATABASE_CHECKPOINTER_POOL_MAX_IDLE_SECONDS: "600"
+  # Log emission format: `text` (default one-liner) or `json`
+  # (structured NDJSON — one JSON per line, ships trace_id/span_id
+  # when OTel tracing is on). See docs/tracing-architecture.md.
+  # LOG_FORMAT: "text"
+  # ---------- OpenTelemetry tracing (v1.1, opt-in) ----------
+  # Master switch. `1` initializes the SDK and connects to the
+  # collector below. `0` (default) = no SDK import.
+  OTEL_ENABLED: "0"
+  # OTEL_SERVICE_NAME: "zashiki-warasi"
+  # OTLP collector endpoint. Point at your in-cluster OTel Collector
+  # Service. Example values for a typical kube-prometheus-stack
+  # sibling deploy: `http://otel-collector.observability.svc.cluster.local:4317`
+  # OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+  # OTEL_EXPORTER_OTLP_PROTOCOL: "grpc"
+  # OTEL_TRACES_SAMPLER: "parentbased_traceidratio"
+  # OTEL_TRACES_SAMPLER_ARG: "1.0"
+  # Extra resource attributes (k=v,k=v). SHALL NOT contain secrets
+  # — app scans this at startup for known token prefixes + base64
+  # shapes and refuses to boot on match. See design D22.
+  # OTEL_RESOURCE_ATTRIBUTES: "deployment.environment=prod"
 
 # ---------- Secrets (rendered into a Secret) ----------
 # Provide values via `--set secrets.databaseUrl=...` or a values file
@@ -159,3 +179,85 @@ securityContext:
   runAsUser: 10001
   runAsGroup: 10001
   fsGroup: 10001
+
+# ---------- Observability (v1.1, opt-in, all default OFF) ----------
+#
+# Three independent knobs — turn on per your cluster's posture:
+#
+#   observability.serviceMonitor.enabled=true  → let kube-prometheus-
+#     stack (or any Prometheus Operator install) scrape our /metrics
+#   observability.prometheusRule.enabled=true  → ship the starter
+#     alert bundle as a PrometheusRule CRD
+#   observability.dashboards.enabled=true      → ship Grafana
+#     dashboards as ConfigMaps for the kube-prom-stack Grafana
+#     sidecar to auto-import
+#
+# Prometheus / Grafana / Alertmanager themselves are NOT deployed by
+# this chart — they're expected to already exist in the cluster
+# (kube-prometheus-stack). If the CRDs (ServiceMonitor, PrometheusRule)
+# aren't installed, `helm upgrade` with these flags on will fail at
+# `kubectl apply` time — install the Prometheus Operator first.
+observability:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    # Empty = scrape from same namespace only. For cross-namespace
+    # scrape, set {matchNames: [<ns>]} or {any: true}.
+    namespaceSelector: {}
+    # Extra labels for kube-prometheus-stack's Prometheus to select
+    # this SM. Common: `release: kube-prometheus-stack` — check what
+    # your Prometheus CR's `serviceMonitorSelector` expects.
+    additionalLabels: {}
+
+  prometheusRule:
+    enabled: false
+    additionalLabels: {}
+    # Starter alert bundle. Each alert has an independent `enabled`
+    # toggle so operators can pick a subset without touching PromQL.
+    # Threshold knobs (`ratePerMinute`, `for`) are exposed for tuning.
+    # See docs/tracing-architecture.md + design D19 for rationale.
+    alerts:
+      tickNoSuccessfulTick:
+        enabled: true
+        for: 15m
+        severity: warning
+      tickErrorRateHigh:
+        enabled: true
+        for: 10m
+        severity: warning
+        # Errors per minute averaged over 5m. > 0.5 for 10m = trip.
+        ratePerMinute: 0.5
+      tickConflictRateHigh:
+        enabled: true
+        for: 10m
+        severity: info
+        # 409/min averaged over 5m. > 5 for 10m = trip.
+        # Info-level: over-scheduling isn't a bug, just a signal.
+        ratePerMinute: 5
+      healthzUnhealthy:
+        enabled: true
+        for: 5m
+        severity: critical
+      oauthRefreshFailing:
+        enabled: true
+        for: 15m
+        severity: warning
+    # Append custom Prometheus alerting rules AFTER the starter set.
+    # Each entry is a full rule dict: alert / expr / for / labels /
+    # annotations. Additive — starter alerts stay unless individually
+    # disabled above.
+    additionalRules: []
+
+  dashboards:
+    enabled: false
+    # kube-prometheus-stack's Grafana sidecar watches for ConfigMaps
+    # with this label and auto-imports the JSON as a dashboard.
+    # Override if your kube-prom-stack install uses a different label.
+    sidecarLabel:
+      key: grafana_dashboard
+      value: "1"
+    # Per-dashboard toggle. Disabling here removes the CM entirely →
+    # the sidecar auto-removes the panel from Grafana on next
+    # reconcile. No manual Grafana UI cleanup needed.
+    overview:
+      enabled: true

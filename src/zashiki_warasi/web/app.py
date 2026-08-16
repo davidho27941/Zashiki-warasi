@@ -13,11 +13,15 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from zashiki_warasi.core.config import warn_removed_env_vars
+from zashiki_warasi.core.config import (
+    ObservabilitySettings,
+    warn_removed_env_vars,
+)
 from zashiki_warasi.core.logging import configure_logging
 from zashiki_warasi.core.services import build_services, close_services
+from zashiki_warasi.observability.tracing import configure_tracing
 from zashiki_warasi.web.middleware.request_id import RequestIdMiddleware
-from zashiki_warasi.web.routers import auth, health, poll, reauth
+from zashiki_warasi.web.routers import auth, health, metrics, poll, reauth
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,12 @@ async def lifespan(app: FastAPI):
     """
     configure_logging()
     warn_removed_env_vars(logger)
+    # OTel bootstrap runs BEFORE build_services so the psycopg
+    # instrumentation is in place before the checkpointer pool opens
+    # its first connection (else those queries wouldn't be spanned).
+    # Also runs the WEB_CONCURRENCY guard — if multi-worker was
+    # requested, we exit here before touching Postgres.
+    configure_tracing(ObservabilitySettings())
     services = build_services()
     app.state.services = services
     logger.info("FastAPI service ready")
@@ -58,10 +68,37 @@ def create_app() -> FastAPI:
     # any handler / dependency / log line executes for the request.
     application.add_middleware(RequestIdMiddleware)
     application.include_router(health.router)
+    application.include_router(metrics.router)
     application.include_router(poll.router)
     application.include_router(auth.router)
     application.include_router(reauth.router)
+    # OTel FastAPI auto-instrumentation. Attaches middleware that reads
+    # the CURRENT tracer_provider at request time — so calling this
+    # before configure_tracing() (which runs in lifespan) is safe: the
+    # NoOp provider used at import time is replaced with the real one
+    # before the first request. When OTEL_ENABLED=0 the current
+    # provider stays NoOp and this middleware is a cheap wrapper doing
+    # no export work.
+    _instrument_fastapi(application)
     return application
+
+
+def _instrument_fastapi(application: FastAPI) -> None:
+    """Best-effort FastAPI instrumentation. Lazy-imports so a test env
+    that stripped OTel deps doesn't break app creation."""
+    try:
+        from opentelemetry.instrumentation.fastapi import (
+            FastAPIInstrumentor,
+        )
+    except ImportError:
+        return
+    try:
+        FastAPIInstrumentor.instrument_app(application)
+    except Exception:
+        logger.exception(
+            "FastAPI OTel instrumentation failed; continuing without "
+            "server spans"
+        )
 
 
 app = create_app()

@@ -1,0 +1,40 @@
+{{- /*
+ServiceMonitor for kube-prometheus-stack / any Prometheus Operator
+install. Renders only when observability.serviceMonitor.enabled=true.
+
+Requires the `monitoring.coreos.com/v1` CRD (installed by
+Prometheus Operator). Without the CRD, `kubectl apply` on the
+rendered manifest fails with "no matches for kind".
+*/}}
+{{- if .Values.observability.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "zashiki-warasi.fullname" . }}
+  labels:
+    {{- include "zashiki-warasi.labels" . | nindent 4 }}
+    {{- with .Values.observability.serviceMonitor.additionalLabels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "zashiki-warasi.selectorLabels" . | nindent 6 }}
+  namespaceSelector:
+    {{- toYaml .Values.observability.serviceMonitor.namespaceSelector | nindent 4 }}
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.observability.serviceMonitor.interval }}
+      scheme: http
+      # Give scraped series a predictable `job` label equal to the
+      # chart fullname. Prometheus Operator's default job label is
+      # `{namespace}/{servicemonitor-name}` which is awkward for
+      # alert regexes; setting a stable value here decouples our
+      # PrometheusRule from PrOp naming internals + matches the
+      # docs/tracing-architecture.md "review checklist" pin.
+      relabelings:
+        - action: replace
+          targetLabel: job
+          replacement: {{ include "zashiki-warasi.fullname" . }}
+{{- end }}

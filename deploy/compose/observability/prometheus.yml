@@ -1,0 +1,37 @@
+# Prometheus scrape config for the compose observability profile.
+#
+# Two targets:
+#   - zashiki-warasi:8080/metrics  ← app's business + process metrics
+#   - otel-collector:8888/metrics  ← collector self-metrics (health)
+#
+# Retention lives on the prometheus service's command line
+# (`--storage.tsdb.retention.time=${PROMETHEUS_RETENTION_TIME:-7d}`),
+# not here — see docker-compose.yml.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+  external_labels:
+    # Attached to every series so operators can distinguish this
+    # environment's data if they ever federate multiple Prometheus.
+    deployment_environment: homelab-compose
+
+scrape_configs:
+  # ---- Zashiki-warasi app ----
+  - job_name: zashiki-warasi
+    static_configs:
+      - targets: [zashiki-warasi:8080]
+        labels:
+          service: zashiki-warasi
+    metrics_path: /metrics
+    scheme: http
+
+  # ---- OTel Collector self-metrics ----
+  - job_name: otel-collector
+    static_configs:
+      - targets: [otel-collector:8888]
+        labels:
+          service: otel-collector
+    metrics_path: /metrics
+    scheme: http
