@@ -130,24 +130,26 @@ docker compose down
   stuck (see the openspec migrate-to-fastapi-service change's
   MIGRATION-v1.md troubleshooting section).
 
-## Observability profile (v1.1, opt-in)
+## Observability profile (v1.1 + v1.2, opt-in)
 
 The default `docker compose up` renders the same one-service stack as
-v1.0. To also bring up a self-contained OTel Collector + Prometheus +
-Tempo + Grafana observability stack on the same compose network:
+v1.0. To also bring up a self-contained metrics + traces + logs
+observability stack on the same compose network:
 
 ```
 docker compose --profile observability up -d
 ```
 
-**On first boot** you get 4 additional containers:
+**On first boot** you get 6 additional containers:
 
 | Service | Role | Internal endpoint |
 |---|---|---|
 | `otel-collector` | Receives OTLP/gRPC spans from the app, forwards to Tempo | `otel-collector:4317` |
 | `prometheus` | Scrapes app `/metrics` + collector self-metrics every 15s | `prometheus:9090` |
 | `tempo` | Stores traces, 24h retention, filesystem-backed | `tempo:3200` |
-| `grafana` | UI, Prometheus + Tempo datasources pre-provisioned | http://127.0.0.1:3000 |
+| `loki` | Stores logs, env-driven retention, filesystem-backed (v1.2) | `loki:3100` |
+| `alloy` | Tails Docker container stdout via socket, forwards to Loki (v1.2) | `alloy:12345` (UI, unexposed) |
+| `grafana` | UI, Prometheus + Tempo + Loki datasources pre-provisioned | http://127.0.0.1:3000 |
 
 ### Enable tracing on the app
 
@@ -161,6 +163,26 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
 Restart the `zashiki-warasi` container. Every `POST /poll` now produces
 a full span tree in Tempo (see `docs/tracing-architecture.md` for the
 contract).
+
+### Enable log aggregation (v1.2)
+
+Set in `.env`:
+
+```
+LOG_FORMAT=json
+```
+
+Restart the `zashiki-warasi` container. App logs now emit as JSON
+lines with `trace_id` / `span_id` / `request_id` / `message_id` as
+first-class fields, and Alloy ships them into Loki.
+
+In Grafana → **Explore → Loki** you can query all container logs
+(`{container="zashiki-warasi"}`), and any row with a `trace_id` field
+gets a **View trace in Tempo** link that opens the exact span tree
+for that request — the log→trace jump.
+
+Text-format logs also reach Loki, but the derived-field regex won't
+match, so the trace-jump link won't appear on those rows.
 
 ### Login to Grafana
 
@@ -189,6 +211,20 @@ Sizing at current metric shape (~13 zashiki_* families + process/GC):
 - 7d ≈ <100 MB
 - 30d ≈ <500 MB
 - 90d ≈ <2 GB
+
+### Adjusting Loki retention (v1.2)
+
+Default is 7 days. To change, set `LOKI_RETENTION_PERIOD` in `.env`
+and restart the loki container:
+
+```
+LOKI_RETENTION_PERIOD=30d
+docker compose --profile observability up -d loki
+```
+
+Sizing is workload-dependent (log volume × line length). Measure the
+`loki-data` volume after 7d of representative traffic and scale
+linearly. Accepts `h` / `d` / `w` suffixes.
 
 ### Exposing Grafana beyond loopback (BE CAREFUL)
 
@@ -236,8 +272,9 @@ running:
 docker compose --profile observability down
 ```
 
-Data volumes (`prometheus-data`, `tempo-data`, `grafana-data`)
-persist across down/up cycles. Add `-v` to also wipe them:
+Data volumes (`prometheus-data`, `tempo-data`, `loki-data`,
+`alloy-data`, `grafana-data`) persist across down/up cycles. Add `-v`
+to also wipe them:
 
 ```
 docker compose --profile observability down -v

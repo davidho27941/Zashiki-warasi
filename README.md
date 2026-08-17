@@ -112,7 +112,7 @@ Gmail API ◀──────▶│ GmailClient (auth, fetch, history)   │
   on. **Web application** type works too but requires you to register
   the redirect URI in the console. See [`docs/oauth-redirect-uri.md`](docs/oauth-redirect-uri.md).
 
-### Optional (v1.1 observability)
+### Optional (v1.1 + v1.2 observability)
 
 - **Prometheus + Grafana** — if you want to scrape the `/metrics`
   endpoint. Compose deploy ships a self-contained stack under
@@ -120,10 +120,15 @@ Gmail API ◀──────▶│ GmailClient (auth, fetch, history)   │
   deploys assume kube-prometheus-stack already lives in the cluster.
   See [`docs/observability.md`](docs/observability.md) for enable
   paths.
-- **OpenTelemetry Collector** — required only if you want tracing
+- **Tempo + trace backend** — required only if you want tracing
   (opt-in via `OTEL_ENABLED=1`). Compose observability profile
-  bundles a collector; k3s expects one deployed separately (chart
-  does not ship a Collector).
+  bundles Tempo; k3s expects `grafana/tempo` installed separately
+  (chart does not ship Tempo). See v1.1.1 docs.
+- **Loki + Alloy** — required only if you want log aggregation +
+  Grafana log→trace jump (v1.2, opt-in via `LOG_FORMAT=json` on the
+  app + the observability profile / operator-installed Loki chart).
+  Compose observability profile bundles both; k3s expects
+  `grafana/loki` + `grafana/alloy` installed separately.
 - **Runtime worker count** — the runtime is designed for
   single-worker uvicorn. `WEB_CONCURRENCY>1` fails fast at startup
   (`prometheus_client` registry is process-local; horizontal scale

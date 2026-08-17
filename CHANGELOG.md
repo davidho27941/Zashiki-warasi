@@ -5,6 +5,71 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Adds the third leg of the observability trilogy — **log aggregation
+via Loki**, unified with Alloy as the shipper on both compose and
+k3s. The JSON log format's `trace_id`/`span_id` fields (shipped in
+v1.1) now unlock end-to-end **log → trace jump** in Grafana:
+click any log row's `trace_id` → land on the corresponding Tempo
+span tree. Zero app code, chart, or spec-runtime change; pure
+infrastructure + docs on top of v1.1's foundation.
+
+### Added
+
+- **Compose observability profile**: two new services under
+  `--profile observability` — `loki` (`grafana/loki:3.2.1`,
+  single-binary mode, filesystem backend, env-driven retention via
+  `LOKI_RETENTION_PERIOD`) and `alloy` (`grafana/alloy:v1.5.1`,
+  tails Docker container stdout via `/var/run/docker.sock`, forwards
+  to Loki with container name + stream + compose-service labels).
+- **Grafana provisioning**: Loki datasource pre-provisioned with a
+  **derived field** `trace_id → Tempo` — every JSON log row with a
+  `trace_id` gets a clickable `View trace in Tempo` link. Tempo
+  datasource also gains `tracesToLogsV2` so the jump works
+  bidirectionally (span → filtered log query).
+- **`LOKI_RETENTION_PERIOD`** env var (compose-only, defaults `7d`)
+  — same env-driven-retention shape as `PROMETHEUS_RETENTION_TIME`.
+- **`docs/observability.md`** (+ `.zh.md`): Path A gains a rewritten
+  "Enable log aggregation" section 4 (bundled Loki/Alloy + trace-jump
+  UX); Path B adds a new section 5 for k3s (install
+  `grafana/loki` single-binary + `grafana/alloy` DaemonSet + UI-add
+  Loki datasource with derived field, since kube-prom-stack Grafana
+  sidecar's provisioning-reload API is auth-locked).
+
+### Changed
+
+- `scripts/check_env_parity.py` `COMPOSE_ONLY` allowlist gains
+  `LOKI_RETENTION_PERIOD` (compose-only, same rationale as
+  `PROMETHEUS_RETENTION_TIME` + `GRAFANA_ADMIN_PASSWORD` — Helm
+  deploys own log retention via the operator-installed loki chart).
+- `deploy/compose/README.md` Observability profile section: service
+  table grows from 4 → 6 rows, adds "Adjusting Loki retention"
+  subsection, updates data-volumes list.
+- `LOG_FORMAT` env in `.env.example` gets a "recommended for the
+  observability profile" note (derived-field regex only matches JSON).
+
+### Backward compatibility
+
+- App: **zero change**. `LOG_FORMAT=json` + `trace_id`/`span_id`
+  in log fields already shipped in v1.1. Default remains `text`.
+- Chart: **zero change**. K3s operators install `grafana/loki` +
+  `grafana/alloy` charts separately (same pattern as v1.1.1
+  Tempo-direct recommendation).
+- Compose: `docker compose up` without `--profile observability`
+  still renders the same one-service stack as v1.0/v1.1.
+
+### Non-goals
+
+- Log-based alerts (v1.1 metric alerts cover the operational
+  scenarios; adding Loki-alerting rules doubles mental footprint
+  for minimal marginal value).
+- Bundling Loki/Alloy into the app Helm chart (cluster observability
+  infra belongs in kube-prometheus-stack namespace, not app namespace).
+- Multi-tenant Loki / S3-backed storage (homelab scale).
+- Migrating Prometheus/Tempo shippers through Alloy (Prom scrape
+  works, no reason to disturb).
+
 ## [1.1.1] — 2026-08-17
 
 Docs-only patch. Closes the deferred v1.1 task 9.7 (k3s tracing e2e)

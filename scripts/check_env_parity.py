@@ -39,6 +39,12 @@ COMPOSE_ONLY: frozenset[str] = frozenset(
         # existing Grafana with its own auth story.
         "PROMETHEUS_RETENTION_TIME",
         "GRAFANA_ADMIN_PASSWORD",
+        # v1.2 add-log-aggregation-loki: Loki retention drives compose
+        # loki service via `-config.expand-env=true` + config-file
+        # substitution. Helm deploys don't ship Loki (operator installs
+        # `grafana/loki` chart separately and owns retention via the
+        # chart's `limits_config.retention_period` values override).
+        "LOKI_RETENTION_PERIOD",
     }
 )
 
