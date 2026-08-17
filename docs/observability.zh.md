@@ -119,14 +119,80 @@ label 的 ConfigMap,自動 import dashboard。
     --set observability.prometheusRule.alerts.tickConflictRateHigh.enabled=false
 ```
 
-### 4. 開 tracing(需要 cluster 內有 OTel Collector)
+### 4. 開 tracing
+
+Chart 不 ship trace backend。開 tracing = **裝 backend + app 上設兩個
+env key**。
+
+**推薦路徑 —— Tempo single-binary,不用 collector。** 單用戶 homelab
+規模你幾乎不需要中間放 OTel Collector。Tempo 內建 OTLP receiver on
+`:4317`,app 直接 push 過去。少一個 pod、少一份 config、少一個爆點。
+
+在 kube-prom-stack 旁邊裝 Tempo:
 
 ```
+helm upgrade --install tempo grafana/tempo \
+    --namespace kube-prometheus-stack \
+    --set tempo.storage.trace.backend=local \
+    --set persistence.enabled=true \
+    --set persistence.size=10Gi
+```
+
+在 kube-prom-stack Grafana 加一個 Tempo datasource。`grafana/tempo`
+chart 的 query API 走 `3200`(不是 `3100`);最簡單:丟一個帶
+`grafana_datasource=1` label 的 ConfigMap,讓 kube-prom-stack Grafana
+sidecar 自動 import:
+
+```
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-datasource
+  namespace: kube-prometheus-stack
+  labels:
+    grafana_datasource: "1"
+data:
+  tempo-datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Tempo
+        type: tempo
+        uid: tempo
+        url: http://tempo.kube-prometheus-stack.svc:3200
+        access: proxy
+```
+
+打開 app 端:
+
+```
+helm upgrade zashiki ./deploy/helm/zashiki-warasi \
+    --reset-then-reuse-values \
     --set env.OTEL_ENABLED=1 \
-    --set env.OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector.observability.svc.cluster.local:4317
+    --set env.OTEL_EXPORTER_OTLP_ENDPOINT=http://tempo.kube-prometheus-stack.svc:4317
 ```
 
-Chart **不部署 Collector** —— 要 cluster 內已有,或另外自架。
+(用 `--reset-then-reuse-values` 不是 `--reuse-values` —— 原因見
+[v1.1 implementation notes](v1.1-implementation-notes.zh.md)。)
+
+**什麼時候加 Collector 或更重的方案。** 這是**條件觸發**,不是同等重
+量的菜單 —— 只有下列情境符合才用:
+
+- **Standalone OTel Collector**(`open-telemetry/opentelemetry-collector`
+  chart)—— 需要 fan-out span 到第二個 backend(例如同時 Tempo +
+  Grafana Cloud);或需要 tail-based sampling;或需要 attribute
+  redaction 而 app 不做。以上都沒有就不用裝。
+- **Grafana Alloy**(DaemonSet)—— 你打算之後加 Loki 做 log
+  aggregation。Alloy 一個 agent 同時處理 log + metric + trace,那時
+  一次整合有意義。現在裝(還沒東西可整合)是早了 —— 留到 Loki 那個
+  follow-up 再看。
+- **Tempo Operator** —— 跑 multi-tenant Tempo,或後端 storage 是
+  S3/GCS/Azure Blob 需要 operator 管 `TempoStack` CR。單用戶 homelab
+  用這個過度殺。
+
+**為何 compose 有 collector 但 k3s 不建議。** Compose 的觀察性 profile
+(`--profile observability`)綁 `otel-collector → tempo → grafana` 是
+**參考架構** —— 示範 prod-shape 流程(app → collector → backend)。那
+是 demo,不是規範。**別**因為 compose 這樣所以在 k3s 也複製一份 collector。
 
 完整細節:
 [`deploy/helm/zashiki-warasi/README.md`](../deploy/helm/zashiki-warasi/README.md)
