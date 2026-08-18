@@ -244,6 +244,17 @@ discovery.kubernetes "pods" {
 discovery.relabel "pods" {
   targets = discovery.kubernetes.pods.targets
 
+  // v1.2 預設:只收 zashiki namespace。長期跑的 cluster-infra pod
+  //(longhorn / cert-manager / kube-state-metrics 等)首次 import 時
+  // 會送出幾週前的歷史 log,Loki 預設會拒 > 7d
+  //(reject_old_samples_max_age=7d)。要全 cluster 收 log 就改 regex,
+  // 例:"zashiki|kube-prometheus-stack"。
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    regex         = "zashiki"
+    action        = "keep"
+  }
+
   rule {
     source_labels = ["__meta_kubernetes_namespace"]
     target_label  = "namespace"

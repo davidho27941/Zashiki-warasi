@@ -255,6 +255,18 @@ discovery.kubernetes "pods" {
 discovery.relabel "pods" {
   targets = discovery.kubernetes.pods.targets
 
+  // v1.2 default: keep only the zashiki namespace. Long-running
+  // cluster-infra pods (longhorn, cert-manager, kube-state-metrics)
+  // otherwise deliver historical log content on first import that
+  // Loki rejects as "entry too far behind" (default
+  // reject_old_samples_max_age=7d). Widen the regex when you actually
+  // want cluster-wide log aggregation — e.g. "zashiki|kube-prometheus-stack".
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    regex         = "zashiki"
+    action        = "keep"
+  }
+
   rule {
     source_labels = ["__meta_kubernetes_namespace"]
     target_label  = "namespace"
