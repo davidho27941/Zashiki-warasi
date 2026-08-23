@@ -62,3 +62,10 @@ docs/lessons/
 scripts/
 # Committed exceptions: repo tooling that happens to live under scripts/
 !scripts/check_env_parity.py
+
+# Repo-root scratch YAML — k3s helm-values / other one-off overrides
+# an operator might drop next to the repo (e.g. `alloy.yaml`,
+# `loki.yaml` scratch files during the v1.2 k3s smoke). Deploy-side
+# real values files live under deploy/ and are not affected.
+/alloy.yaml
+/loki.yaml
