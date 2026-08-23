@@ -69,10 +69,22 @@ Every `POST /poll` now produces a full span tree in Tempo.
   (rotate the placeholder before exposing beyond loopback)
 - Dashboard: `Zashiki-warasi > Zashiki-warasi overview` auto-imported
 
-### 4. (Optional) JSON logs
+### 4. Enable log aggregation (v1.2)
 
-Set `LOG_FORMAT=json` in `.env`, restart. Now `docker logs
-zashiki-warasi` emits NDJSON — pipe into any structured log shipper.
+Set in `.env`:
+
+```
+LOG_FORMAT=json
+```
+
+Restart `zashiki-warasi`. The observability profile's `loki` + `alloy`
+containers (bundled since v1.2) now capture app logs into Loki, and
+Grafana's Loki datasource ships a **derived field** that turns every
+log row's `trace_id` into a clickable **View trace in Tempo** link —
+one click, log line → span tree.
+
+Adjust retention via `LOKI_RETENTION_PERIOD` in `.env` (default `7d`;
+accepts `h` / `d` / `w`).
 
 Full details: [`deploy/compose/README.md`](../deploy/compose/README.md)
 `Observability profile` section.
@@ -207,6 +219,112 @@ compose has one.
 Full details:
 [`deploy/helm/zashiki-warasi/README.md`](../deploy/helm/zashiki-warasi/README.md)
 `Observability` section.
+
+### 5. Enable log aggregation (v1.2)
+
+Same principle as tracing (§4): the chart doesn't ship Loki/Alloy —
+you install them alongside kube-prometheus-stack, then flip the app's
+`LOG_FORMAT` env.
+
+**Recommended path — Loki single-binary + Alloy DaemonSet.**
+
+```
+helm upgrade --install loki grafana/loki \
+    --namespace kube-prometheus-stack \
+    --set deploymentMode=SingleBinary \
+    --set loki.commonConfig.replication_factor=1 \
+    --set loki.storage.type=filesystem \
+    --set singleBinary.persistence.enabled=true \
+    --set singleBinary.persistence.size=20Gi
+
+helm upgrade --install alloy grafana/alloy \
+    --namespace kube-prometheus-stack \
+    --set alloy.configMap.content='...'   # see the docs snippet below
+```
+
+The Alloy DaemonSet tails `/var/log/pods/*/*/*.log` (k8s CRI log
+path), extracts pod / namespace / container labels, and pushes to
+`http://loki:3100/loki/api/v1/push`. Config snippet (River syntax,
+paste into a values override or a ConfigMap):
+
+```
+discovery.kubernetes "pods" {
+  role = "pod"
+}
+
+discovery.relabel "pods" {
+  targets = discovery.kubernetes.pods.targets
+
+  // v1.2 default: keep only the zashiki namespace. Long-running
+  // cluster-infra pods (longhorn, cert-manager, kube-state-metrics)
+  // otherwise deliver historical log content on first import that
+  // Loki rejects as "entry too far behind" (default
+  // reject_old_samples_max_age=7d). Widen the regex when you actually
+  // want cluster-wide log aggregation — e.g. "zashiki|kube-prometheus-stack".
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    regex         = "zashiki"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    target_label  = "namespace"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_name"]
+    target_label  = "pod"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_container_name"]
+    target_label  = "container"
+  }
+}
+
+loki.source.kubernetes "pods" {
+  targets    = discovery.relabel.pods.output
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki.kube-prometheus-stack.svc:3100/loki/api/v1/push"
+  }
+}
+```
+
+**Add the Loki datasource to kube-prom-stack Grafana via UI.** The
+sidecar's `provisioning/reload` API is rate-limit-locked on this
+cluster (see `MEMORY.md`
+`kube-prom-stack-sidecar-auth-locked` — provisioning ConfigMaps don't
+auto-apply). Manual add is the reliable path:
+
+- Grafana → Connections → Data sources → Add data source → Loki
+- URL: `http://loki.kube-prometheus-stack.svc:3100`
+- **Derived fields** (scroll to that section):
+  - Name: `trace_id`
+  - Regex: `"trace_id":\s*"([a-f0-9]{32})"`
+  - Query URL: `${__value.raw}` *(literal, single `$` — Grafana UI doesn't need the escape)*
+  - Internal link: **Tempo** datasource
+  - URL Label: `View trace in Tempo`
+
+**Turn on JSON logs on the app.**
+
+```
+helm upgrade zashiki ./deploy/helm/zashiki-warasi \
+    --reset-then-reuse-values \
+    --set env.LOG_FORMAT=json
+```
+
+Verify in Grafana → Explore → Loki → query `{namespace="zashiki"}`.
+Log rows should show a `trace_id` link that opens the corresponding
+Tempo trace.
+
+**When to reach for something heavier.** Same rationale as the tracing
+section (§4): the recommended path is what fits homelab scale — one
+Loki, one Alloy DaemonSet, no multi-tenant, no S3. Grafana Alloy
+subsumes metrics/traces shipping too if you ever want to consolidate
+onto one agent later.
 
 ---
 

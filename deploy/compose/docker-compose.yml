@@ -98,6 +98,46 @@ services:
     # ports:
     #   - "3200:3200"    # Tempo query API (Grafana talks to this on the compose net)
 
+  loki:
+    profiles: [observability]
+    image: grafana/loki:3.2.1
+    container_name: zashiki-loki
+    restart: unless-stopped
+    command:
+      - "-config.file=/etc/loki/loki-config.yaml"
+      # Enables ${VAR:default} expansion in loki-config.yaml — needed
+      # for the LOKI_RETENTION_PERIOD env override.
+      - "-config.expand-env=true"
+    environment:
+      # Feeds ${LOKI_RETENTION_PERIOD:7d} in loki-config.yaml.
+      # Override via .env; see .env.example.
+      LOKI_RETENTION_PERIOD: "${LOKI_RETENTION_PERIOD:-7d}"
+    volumes:
+      - ./observability/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+    # ports:
+    #   - "3100:3100"    # Loki HTTP API (Grafana talks on the compose net)
+
+  alloy:
+    profiles: [observability]
+    image: grafana/alloy:v1.5.1
+    container_name: zashiki-alloy
+    restart: unless-stopped
+    command:
+      - "run"
+      - "--server.http.listen-addr=0.0.0.0:12345"
+      - "--storage.path=/var/lib/alloy/data"
+      - "/etc/alloy/config.alloy"
+    volumes:
+      - ./observability/alloy-config.alloy:/etc/alloy/config.alloy:ro
+      # Read-only Docker socket for container discovery + log tailing.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy-data:/var/lib/alloy/data
+    # ports:
+    #   - "12345:12345"  # Alloy UI (component graph, self-metrics)
+    depends_on:
+      - loki
+
   grafana:
     profiles: [observability]
     image: grafana/grafana:11.4.0
@@ -124,8 +164,11 @@ services:
     depends_on:
       - prometheus
       - tempo
+      - loki
 
 volumes:
   prometheus-data:
   tempo-data:
   grafana-data:
+  loki-data:
+  alloy-data:

@@ -66,10 +66,22 @@ docker compose up -d zashiki-warasi
   換掉 placeholder**)
 - Dashboard:`Zashiki-warasi > Zashiki-warasi overview` 自動 import
 
-### 4. (選項)JSON logs
+### 4. 開 log aggregation(v1.2)
 
-`.env` 設 `LOG_FORMAT=json` 重啟。`docker logs zashiki-warasi` 現在
-出 NDJSON —— 可 pipe 進任何結構化 log shipper。
+`.env` 設:
+
+```
+LOG_FORMAT=json
+```
+
+重啟 `zashiki-warasi`。Observability profile 的 `loki` + `alloy`
+兩個 container(v1.2 起 bundle 進去)會把 app log 收進 Loki,Grafana
+的 Loki datasource 預埋了 **derived field** —— 每行 log 的
+`trace_id` 都變成可點的 **View trace in Tempo** 連結,一鍵從 log 跳
+到對應的 span tree。
+
+Retention 調整:`.env` 設 `LOKI_RETENTION_PERIOD`(預設 `7d`,接受
+`h` / `d` / `w`)。
 
 完整細節:[`deploy/compose/README.md`](../deploy/compose/README.md)
 的 `Observability profile` 章節。
@@ -197,6 +209,107 @@ helm upgrade zashiki ./deploy/helm/zashiki-warasi \
 完整細節:
 [`deploy/helm/zashiki-warasi/README.md`](../deploy/helm/zashiki-warasi/README.md)
 的 `Observability` 章節。
+
+### 5. 開 log aggregation(v1.2)
+
+跟 tracing(§4)同樣精神:chart 不 ship Loki/Alloy —— 你自己把它們
+裝到 kube-prometheus-stack 旁邊,再把 app 的 `LOG_FORMAT` env 打開。
+
+**推薦路徑 —— Loki single-binary + Alloy DaemonSet。**
+
+```
+helm upgrade --install loki grafana/loki \
+    --namespace kube-prometheus-stack \
+    --set deploymentMode=SingleBinary \
+    --set loki.commonConfig.replication_factor=1 \
+    --set loki.storage.type=filesystem \
+    --set singleBinary.persistence.enabled=true \
+    --set singleBinary.persistence.size=20Gi
+
+helm upgrade --install alloy grafana/alloy \
+    --namespace kube-prometheus-stack \
+    --set alloy.configMap.content='...'   # 見下面 River snippet
+```
+
+Alloy DaemonSet 收 `/var/log/pods/*/*/*.log`(k8s CRI log 路徑),抽
+pod / namespace / container label 出來,push 到
+`http://loki:3100/loki/api/v1/push`。River 設定 snippet(貼進 values
+override 或 ConfigMap):
+
+```
+discovery.kubernetes "pods" {
+  role = "pod"
+}
+
+discovery.relabel "pods" {
+  targets = discovery.kubernetes.pods.targets
+
+  // v1.2 預設:只收 zashiki namespace。長期跑的 cluster-infra pod
+  //(longhorn / cert-manager / kube-state-metrics 等)首次 import 時
+  // 會送出幾週前的歷史 log,Loki 預設會拒 > 7d
+  //(reject_old_samples_max_age=7d)。要全 cluster 收 log 就改 regex,
+  // 例:"zashiki|kube-prometheus-stack"。
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    regex         = "zashiki"
+    action        = "keep"
+  }
+
+  rule {
+    source_labels = ["__meta_kubernetes_namespace"]
+    target_label  = "namespace"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_name"]
+    target_label  = "pod"
+  }
+  rule {
+    source_labels = ["__meta_kubernetes_pod_container_name"]
+    target_label  = "container"
+  }
+}
+
+loki.source.kubernetes "pods" {
+  targets    = discovery.relabel.pods.output
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki.kube-prometheus-stack.svc:3100/loki/api/v1/push"
+  }
+}
+```
+
+**在 kube-prom-stack Grafana 用 UI 加 Loki datasource。** Sidecar 的
+`provisioning/reload` API 在你這集群認證被 rate-limit 鎖住(見
+`MEMORY.md` `kube-prom-stack-sidecar-auth-locked` —— provisioning
+ConfigMap 不會自動生效)。UI 手動加是可靠路徑:
+
+- Grafana → Connections → Data sources → Add data source → Loki
+- URL:`http://loki.kube-prometheus-stack.svc:3100`
+- **Derived fields**(拉到那節):
+  - Name:`trace_id`
+  - Regex:`"trace_id":\s*"([a-f0-9]{32})"`
+  - Query URL:`${__value.raw}` *(字面上單 `$`,UI 不用像 provisioning YAML 那樣 escape)*
+  - Internal link:**Tempo** datasource
+  - URL Label:`View trace in Tempo`
+
+**打開 app 的 JSON log。**
+
+```
+helm upgrade zashiki ./deploy/helm/zashiki-warasi \
+    --reset-then-reuse-values \
+    --set env.LOG_FORMAT=json
+```
+
+到 Grafana → Explore → Loki 查 `{namespace="zashiki"}`。log 行應該有
+`trace_id` 連結,一點就跳對應的 Tempo trace。
+
+**什麼時候要更重的方案。** 同 tracing 段(§4)的理由:推薦路徑就是最
+貼合 homelab 規模的 —— 一份 Loki、一個 Alloy DaemonSet、非 multi-tenant、
+非 S3。之後想合併 metric/trace shipping 也可,Grafana Alloy 本來就吃
+得下三種訊號。
 
 ---
 

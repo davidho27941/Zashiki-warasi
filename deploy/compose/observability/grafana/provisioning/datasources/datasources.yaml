@@ -41,6 +41,12 @@ datasources:
         tags:
           - key: service.name
             value: service
+      # From a trace span, jump to logs in Loki for the same trace_id.
+      tracesToLogsV2:
+        datasourceUid: loki
+        spanStartTimeShift: '-1m'
+        spanEndTimeShift: '1m'
+        filterByTraceID: true
       # nodeGraph shows the span-parent tree as a visual DAG in the
       # trace inspector.
       nodeGraph:
@@ -50,3 +56,29 @@ datasources:
         hide: false
       serviceMap:
         datasourceUid: prometheus
+
+  # ---- Loki (logs, v1.2 add-log-aggregation-loki) ----
+  # Paired with the compose profile's `alloy` shipper (tails Docker
+  # container stdout via /var/run/docker.sock) and the `loki` service.
+  #
+  # Derived field turns any log line's `trace_id` key into a clickable
+  # link that opens the Tempo datasource pre-loaded with that trace's
+  # span tree — the log→trace jump that makes the JSON log format's
+  # trace-context fields (shipped in v1.1) operationally useful.
+  #
+  # Note: the URL uses `$${__value.raw}` (double $) because Grafana
+  # provisioning treats a single `$` as an env-var expansion — see the
+  # Grafana docs on "Using environment variables in the provisioning
+  # file". Escaping preserves the literal Grafana template token.
+  - name: Loki
+    type: loki
+    uid: loki
+    access: proxy
+    url: http://loki:3100
+    jsonData:
+      derivedFields:
+        - name: trace_id
+          matcherRegex: '"trace_id":\s*"([a-f0-9]{32})"'
+          url: '$${__value.raw}'
+          datasourceUid: tempo
+          urlDisplayLabel: 'View trace in Tempo'

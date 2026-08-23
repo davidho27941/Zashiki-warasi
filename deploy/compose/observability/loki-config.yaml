@@ -1,0 +1,53 @@
+# Grafana Loki single-binary config for the compose observability profile.
+#
+# Env expansion (${LOKI_RETENTION_PERIOD:7d}) requires
+# `-config.expand-env=true` on the loki container's command — see
+# docker-compose.yml. The LOKI_RETENTION_PERIOD env comes from .env
+# (compose-side only; k3s deploys own retention via their loki chart).
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    instance_addr: 127.0.0.1
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+compactor:
+  working_directory: /loki/compactor
+  compaction_interval: 10m
+  retention_enabled: true
+  retention_delete_delay: 2h
+  retention_delete_worker_count: 150
+  delete_request_store: filesystem
+
+limits_config:
+  # Retention env-driven. Loki accepts <n>h / <n>d / <n>w. Override via
+  # .env's LOKI_RETENTION_PERIOD; docs default is 7d.
+  retention_period: ${LOKI_RETENTION_PERIOD:7d}
+  allow_structured_metadata: true
+
+# Phone-home disabled for self-hosted.
+analytics:
+  reporting_enabled: false

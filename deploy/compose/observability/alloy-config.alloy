@@ -1,0 +1,52 @@
+// Grafana Alloy config for the compose observability profile.
+//
+// Tails Docker container stdout/stderr via the Docker API and forwards
+// each log line to Loki with container name + stream labels attached.
+//
+// Uses loki.source.docker (not loki.source.file) so container add/remove
+// events are handled automatically and per-container metadata labels
+// come from Docker directly — one component vs the discovery+file-match
+// pipeline needed for the file-based path.
+
+discovery.docker "containers" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "5s"
+}
+
+discovery.relabel "containers" {
+  targets = discovery.docker.containers.targets
+
+  // Docker container names come prefixed with "/" — strip so the label
+  // matches what `docker ps` shows.
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  // Log stream (stdout|stderr) as a label; useful for separating "app"
+  // from "error output" in Loki queries.
+  rule {
+    source_labels = ["__meta_docker_container_log_stream"]
+    target_label  = "stream"
+  }
+
+  // compose service name if present.
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+}
+
+loki.source.docker "containers" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.relabel.containers.output
+  labels     = { source = "docker" }
+  forward_to = [loki.write.local.receiver]
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}
