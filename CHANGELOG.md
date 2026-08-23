@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Compose Grafana Prometheus datasource `uid`** — added explicit
+  `uid: prometheus` to
+  `deploy/compose/observability/grafana/provisioning/datasources/datasources.yaml`.
+  Without it, Grafana auto-generates a UID on first boot (e.g.
+  `PBFA97CFB590B2093`); the bundled starter dashboard's panels
+  reference `"uid": "prometheus"`, so the reference doesn't match
+  and every panel silently renders "No data" despite the metric
+  pipeline being healthy. Known-issue since v1.1 (documented in
+  `docs/v1.1-implementation-notes.md`); now fixed at the config
+  layer. Tempo and Loki datasources were already correct
+  (`uid: tempo` / `uid: loki`); this closes the gap. K3s side
+  unaffected — operators add datasources via UI per v1.1.1 workaround.
+
 ## [1.2.0] — 2026-08-23
 
 Adds the third leg of the observability trilogy — **log aggregation
