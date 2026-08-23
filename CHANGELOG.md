@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.2.0] — 2026-08-23
 
 Adds the third leg of the observability trilogy — **log aggregation
 via Loki**, unified with Alloy as the shipper on both compose and
@@ -14,6 +14,15 @@ v1.1) now unlock end-to-end **log → trace jump** in Grafana:
 click any log row's `trace_id` → land on the corresponding Tempo
 span tree. Zero app code, chart, or spec-runtime change; pure
 infrastructure + docs on top of v1.1's foundation.
+
+Live-validated on both compose (macOS) and k3s (nttu-gpu-lab) —
+compose smoke: `POST /poll` → trace + JSON log → Grafana Loki
+`{container="zashiki-warasi"}` → click `trace_id` link → Tempo span
+tree renders. K3s smoke: same UX via operator-installed Loki +
+Alloy DaemonSet (namespace-scoped to zashiki). Alloy DaemonSet 24h
+obs on nttu-gpu-lab: CPU 2-20 mC per pod, mem ~100 MiB — modest
+overhead. See the `add-log-aggregation-loki` OpenSpec change for
+context (archived under `openspec/changes/archive/2026-08-23-…`).
 
 ### Added
 
