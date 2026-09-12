@@ -1,0 +1,50 @@
+"""Telegram inline-keyboard helper for the "copy trace ID" button.
+
+Turns an OTel trace_id (32-char lowercase hex) into a Telegram Bot API
+`inline_keyboard` payload with a single `copy_text` button. Tapping
+that button on a modern Telegram client (>= 11.0) copies the trace ID
+to the operator's clipboard so they can paste it into Grafana → Tempo
+→ Search by Trace ID and see the full lifespan of the event that
+generated the alert.
+
+Kept private to the notifications package (leading underscore) —
+callers use `TelegramNotifier` for delivery, not this helper directly.
+"""
+
+from __future__ import annotations
+
+_TRACE_ID_HEX_LEN = 32
+_ZERO_TRACE_ID = "0" * _TRACE_ID_HEX_LEN
+_BUTTON_LABEL = "📋 Copy trace ID"
+
+
+def build_trace_copy_markup(trace_id: str | None) -> dict | None:
+    """Return a Telegram `reply_markup` dict, or None if trace_id is unusable.
+
+    Returns None (caller sends the message without a button) when:
+    - `trace_id` is None / empty.
+    - `trace_id` is the all-zero sentinel (NoOpTracerProvider returns
+      this when `OTEL_ENABLED=0` or no active span).
+    - `trace_id` is not exactly 32 lowercase-hex chars (malformed input,
+      never expected in practice; guard so callers don't need to).
+    """
+    if not trace_id or len(trace_id) != _TRACE_ID_HEX_LEN:
+        return None
+    if trace_id == _ZERO_TRACE_ID:
+        return None
+    try:
+        int(trace_id, 16)
+    except ValueError:
+        return None
+    if trace_id != trace_id.lower():
+        return None
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": _BUTTON_LABEL,
+                    "copy_text": {"text": trace_id},
+                }
+            ]
+        ]
+    }

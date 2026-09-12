@@ -388,6 +388,18 @@ code。
 
 ---
 
+## Telegram「Copy trace ID」按鈕(v1.3+)
+
+每則 Telegram 通知只要是從有 active trace context 的地方發出來的,
+都會附一個 inline **📋 Copy trace ID** 按鈕。點下去 → 32-hex 的
+`trace_id` 就被複製到剪貼簿 → 貼到 Grafana → Tempo → **Search by
+Trace ID** → 一次看到那個 alert 對應的完整 `POST /poll → tick_once
+→ …` span tree。
+
+沒有 active trace 就不顯示按鈕(訊息文字照發)—— bootstrap 通知、
+`OTEL_ENABLED=0`、或沒裝 OTel SDK 都算。舊版 Telegram client(11.0
+以下)會把按鈕標成「不支援」,但 alert 內文照送,bot 端不需要 fallback。
+
 ## JSON log 格式
 
 用 `LOG_FORMAT=json` 開啟。每行一個 JSON object(NDJSON)。契約:
