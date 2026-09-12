@@ -5,7 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.3.0] — 2026-09-12
+
+Adds a **📋 Copy trace ID** inline button to every Telegram
+notification fired from inside an active OTel trace context. Tap
+the button on any alert → the 32-hex trace_id copies to the
+operator's clipboard → paste into Grafana → Tempo → Search by Trace
+ID and see the full `POST /poll → tick_once → …` span tree that
+generated the alert. One tap instead of hunting by timestamp.
+
+Uses Telegram Bot API 8.0's `copy_text` button (client-side
+clipboard, no bot polling/webhook needed). Falls back to text-only
+when no trace context is active — no notification ever drops
+because of a missing button.
+
+Live-validated on k3s (nttu-gpu-lab): app-side pipeline works
+end-to-end (metric `telegram_send_total{outcome="success"}` +
+Grafana Tempo receives spans). See the `add-notify-trace-id-copy-button`
+OpenSpec change for context (archived at
+`openspec/changes/archive/2026-09-12-add-notify-trace-id-copy-button/`).
+Introduces the `notifications` OpenSpec capability — first
+spec-level treatment of the telegram sink.
 
 ### Added
 
