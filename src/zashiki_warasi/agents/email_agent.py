@@ -38,6 +38,7 @@ from zashiki_warasi.core.schemas import (
     coerce_importance,
 )
 from zashiki_warasi.gmail.client import GmailClient
+from zashiki_warasi.notifications._trace_markup import build_trace_copy_markup
 from zashiki_warasi.notifications.notion import NotionExpenseRecorder
 from zashiki_warasi.notifications.telegram import TelegramNotifier
 from zashiki_warasi.observability import (
@@ -51,6 +52,24 @@ from zashiki_warasi.observability.instrumentation import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _current_trace_copy_markup() -> dict | None:
+    """Read the active OTel span's trace_id and build a Telegram copy button.
+
+    Returns None on any failure — no active span, malformed span context,
+    SDK missing — so the notify path can never break on a missing button.
+    Callers pass the result straight to `TelegramNotifier.send_message`'s
+    `reply_markup=` kwarg; None means "no button, plain text."
+    """
+    try:
+        from opentelemetry import trace
+
+        ctx = trace.get_current_span().get_span_context()
+        trace_id_hex = f"{ctx.trace_id:032x}"
+    except Exception:
+        return None
+    return build_trace_copy_markup(trace_id_hex)
 
 
 ANALYZE_SYSTEM_PROMPT = """\
@@ -409,6 +428,7 @@ class EmailAgent:
         with node_trace(log, "notify"):
             analysis = state["analysis"]
             side_effect = state.get("side_effect")
+            markup = _current_trace_copy_markup()
             if analysis is None:
                 # Analyze itself failed — no structured summary to
                 # render. If it left us an AnalysisFailed marker we
@@ -419,13 +439,13 @@ class EmailAgent:
                     text = _format_analysis_failed(
                         state["email"], side_effect
                     )
-                    self._notifier.send_message(text)
+                    self._notifier.send_message(text, reply_markup=markup)
                     log.info("notified user of analyze failure")
                     return {}
                 log.warning("notify: skipping — no analysis")
                 return {}
             text = _format_message(state["email"], analysis, side_effect)
-            self._notifier.send_message(text)
+            self._notifier.send_message(text, reply_markup=markup)
             log.info("notified user")
             return {}
 

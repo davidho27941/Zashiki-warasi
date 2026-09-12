@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Telegram "📋 Copy trace ID" inline button** on every notify
+  message emitted from inside an active OTel trace context. Tapping
+  the button copies the 32-hex trace_id to the operator's clipboard;
+  paste into Grafana → Tempo → Search by Trace ID to see the full
+  `POST /poll → tick_once → …` span tree that generated the alert.
+  One tap instead of hunting by timestamp.
+- New `notifications` OpenSpec capability — first spec-level
+  treatment of the telegram sink; locks the copy-affordance contract
+  so future notify channels (Slack / webhook / …) can inherit the
+  same "expose trace ID for copy" intent.
+
+### Changed
+
+- `TelegramNotifier.send_message()` gains a keyword-only optional
+  `reply_markup: dict | None` parameter — passthrough to Telegram
+  Bot API `sendMessage`. Existing positional-only call form
+  (`send_message(text)`) unchanged; fully additive.
+- Email agent's `_notify` node reads the active OTel span's
+  trace_id and passes a `📋 Copy trace ID` inline_keyboard via the
+  new kwarg. Safe fallback (no span / SDK missing / malformed) →
+  no button, text unchanged.
+
+### Backward compatibility
+
+- App: existing positional `send_message(text)` still works. Older
+  Telegram clients (<11.0) render the button as "not supported" but
+  still deliver the alert body — no bot-side fallback.
+- Chart / deploy: **zero change**. No new env vars, no new deps,
+  no schema change.
+- Migration: `git pull` + rebuild image (or `helm upgrade` with the
+  new image tag). Button appears on notifies emitted by the new image.
+
 ## [1.2.1] — 2026-08-23
 
 One-line YAML fix. Adds explicit `uid: prometheus` to the compose

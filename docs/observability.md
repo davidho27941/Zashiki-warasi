@@ -407,6 +407,20 @@ Full attribute contract:
 
 ---
 
+## Telegram "Copy trace ID" button (v1.3+)
+
+Every Telegram alert fired from inside an active trace context ships
+with an inline **📋 Copy trace ID** button. Tap it → the 32-hex
+`trace_id` is copied to your clipboard → paste into Grafana → Tempo →
+**Search by Trace ID** → see the full `POST /poll → tick_once → …`
+span tree that generated the alert.
+
+The button is omitted (message text unchanged) when no trace context
+is active — e.g., bootstrap notifications, calls with `OTEL_ENABLED=0`,
+or an environment without the OTel SDK. Telegram clients on versions
+before 11.0 render the button as "not supported" but still deliver
+the alert body — no bot-side fallback needed.
+
 ## JSON log format
 
 Enable with `LOG_FORMAT=json`. Emits one JSON object per line

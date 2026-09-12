@@ -37,13 +37,26 @@ class TelegramNotifier:
                 "TelegramNotifier."
             )
 
-    def send_message(self, text: str, *, parse_mode: str = "HTML") -> None:
+    def send_message(
+        self,
+        text: str,
+        *,
+        parse_mode: str = "HTML",
+        reply_markup: dict | None = None,
+    ) -> None:
         """POST sendMessage; raises TelegramError on non-2xx or ok=false.
 
         Emits `zashiki_telegram_send_total{outcome="success"}` on clean
         return; `outcome="error"` when any TelegramError raises. Wrapped
         in observe_outcome so callers that catch and log the exception
         (email_agent's notify node) still see the counter increment.
+
+        `reply_markup` — optional Telegram Bot API reply_markup dict
+        (e.g. an inline_keyboard with a copy_text button carrying the
+        current trace_id). Passed through unchanged to the API; the
+        sink doesn't validate its shape (that's Telegram's contract).
+        See `_trace_markup.build_trace_copy_markup` for the current
+        producer.
         """
         with zashiki_span(
             "notify.telegram",
@@ -53,12 +66,14 @@ class TelegramNotifier:
                 f"{self._settings.api_base}/bot{self._settings.bot_token}"
                 "/sendMessage"
             )
-            payload = {
+            payload: dict = {
                 "chat_id": self._settings.chat_id,
                 "text": text,
                 "parse_mode": parse_mode,
                 "disable_web_page_preview": True,
             }
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
             try:
                 response = httpx.post(
                     url,
