@@ -65,7 +65,7 @@ def _load_cached(token_path: Path, scopes: Sequence[str]) -> Credentials | None:
     makes google-auth include the requested scopes in the refresh POST;
     Google rejects with `invalid_scope` when the request scope exceeds
     what the token was originally granted. This bit us on v1.3.x → v1.4
-    upgrade — the new `calendar.events` scope in DEFAULT_SCOPES caused
+    upgrade — the new `calendar` scope in DEFAULT_SCOPES caused
     every bootstrap to crash on refresh with `invalid_scope: Bad Request`.
 
     Load whatever scope the token file records; refresh works with the

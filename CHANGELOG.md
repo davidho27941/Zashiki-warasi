@@ -57,7 +57,9 @@ explicit operator-side design constraint.
 ### Changed
 
 - **OAuth scope extended** — `DEFAULT_SCOPES` in `core/config.py`
-  now includes `https://www.googleapis.com/auth/calendar.events`
+  now includes `https://www.googleapis.com/auth/calendar` (full scope
+  — `calendar.events` alone doesn't cover freebusy.query which the
+  vertical needs for conflict detection)
   alongside gmail.readonly. Operators upgrading from v1.3.x MUST run
   `/reauth` once for the new scope to take effect; missing-scope
   403s catch gracefully and log a WARNING once per pod lifetime,
@@ -73,7 +75,7 @@ explicit operator-side design constraint.
 - **Env parity**: `CALENDAR_ENABLED` / `CALENDAR_TIMEZONE` /
   `CALENDAR_PRIMARY_ID` documented in both compose `.env.example`
   and Helm `values.yaml`. `GMAIL_SCOPES` default line updated to
-  include calendar.events.
+  include the full calendar scope.
 
 ### Backward compatibility
 

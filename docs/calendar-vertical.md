@@ -18,8 +18,9 @@ organizer.
   `_CALENDAR_LIKE_CATEGORIES` in `zashiki_warasi/agents/email_agent.py`).
 - Kill switch: `CALENDAR_ENABLED=0` in `.env` skips the vertical
   entirely — same behavior as v1.3.
-- OAuth: needs `https://www.googleapis.com/auth/calendar.events`
-  scope on the same credential Gmail uses.
+- OAuth: needs `https://www.googleapis.com/auth/calendar` scope on
+  the same credential Gmail uses. (Not the narrower `calendar.events`
+  — `freebusy.query` for conflict detection requires the full scope.)
 
 ## Upgrading from v1.3.x
 
@@ -143,7 +144,7 @@ Two paths:
 
 - **Temporarily**: `CALENDAR_ENABLED=0` in `.env` + restart pod. No
   events created; calendar-worthy categories go to notify.
-- **Permanently**: revoke the calendar.events scope via Google Account
+- **Permanently**: revoke the calendar scope via Google Account
   → Security → Third-party apps. The vertical catches 403 and
   degrades gracefully (WARNING logged once per pod).
 

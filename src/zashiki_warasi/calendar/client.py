@@ -48,7 +48,7 @@ class CalendarError(Exception):
 
 
 class CalendarScopeNotGranted(CalendarError):
-    """403 from the API — the OAuth credential lacks calendar.events.
+    """403 from the API — the OAuth credential lacks the calendar scope (full).
 
     Raised by any read/write call. Caller (calendar_sg) catches this
     once per pod lifetime, logs at WARNING, and degrades to notify.
@@ -281,7 +281,7 @@ class GoogleCalendarClient:
         if status == 403:
             return CalendarScopeNotGranted(
                 "Google Calendar API returned 403 — the OAuth credential "
-                "lacks the calendar.events scope. Reauth via /reauth to "
+                "lacks the calendar scope (full). Reauth via /reauth to "
                 "grant it (see docs/calendar-vertical.md)."
             )
         if status == 409:

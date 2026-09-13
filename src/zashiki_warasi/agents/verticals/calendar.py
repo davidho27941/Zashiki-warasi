@@ -365,14 +365,14 @@ class CalendarSubgraph:
             log.warning(
                 f"calendar: OAuth scope not granted ({message}); "
                 "degrading to notify-only for the rest of this subgraph's "
-                "lifetime. Reauth via /reauth to grant the calendar.events "
-                "scope."
+                "lifetime. Reauth via /reauth to grant the calendar "
+                "scope (full)."
             )
             self._scope_missing_logged = True
         return {
             "side_effect": CalendarSkipped(
                 reason="scope_missing",
-                detail="calendar.events scope not granted; run /reauth",
+                detail="calendar scope not granted; run /reauth",
             ),
         }
 

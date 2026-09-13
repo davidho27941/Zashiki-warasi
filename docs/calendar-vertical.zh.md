@@ -15,8 +15,9 @@
 - Category: `會議邀請` 或 `講座資訊`(模組常數
   `_CALENDAR_LIKE_CATEGORIES`,在 `zashiki_warasi/agents/email_agent.py`)
 - Kill switch:`.env` 設 `CALENDAR_ENABLED=0` 完全停用 —— 行為與 v1.3 一致
-- OAuth:需要 `https://www.googleapis.com/auth/calendar.events` scope,
-  和 Gmail 共用同一個 credential
+- OAuth:需要 `https://www.googleapis.com/auth/calendar` scope(完整),和
+  Gmail 共用同一個 credential(不是較窄的 `calendar.events` —— `freebusy.query`
+  衝突偵測需要 full scope)
 
 ## 從 v1.3.x 升級
 
@@ -134,7 +135,7 @@ Search by Trace ID → 看完整流程 Gmail history 事件 → analyze → rout
 - **暫時停:** `.env` 設 `CALENDAR_ENABLED=0` + 重啟 pod。不建事件;
   calendar-worthy category 走 notify
 - **永久停:** 到 Google 帳號 → 安全性 → 第三方 apps 撤銷
-  calendar.events scope。Vertical catch 403 優雅降級
+  calendar scope。Vertical catch 403 優雅降級
   (每個 pod lifetime 記一次 WARNING)
 
 兩條路都不會動你行事曆已存在的 tentative 事件;如果要就到 Calendar UI
