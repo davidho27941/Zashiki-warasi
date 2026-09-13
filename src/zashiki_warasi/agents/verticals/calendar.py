@@ -55,12 +55,6 @@ from zashiki_warasi.observability.instrumentation import (
 logger = logging.getLogger(__name__)
 
 
-# Per-pod-lifetime flag: we log the "calendar scope not granted"
-# WARNING exactly once to avoid flooding logs when every subsequent
-# calendar-worthy email hits the same 403.
-_SCOPE_MISSING_LOGGED = False
-
-
 CALENDAR_ICS_MIME = "text/calendar"
 
 
@@ -133,6 +127,12 @@ class CalendarSubgraph:
         self._structured_model = model.with_structured_output(CalendarEventDraft)
         self._llm_model_name = llm_model_name
         self._llm_system = llm_system
+        # Per-instance latch: we log the "calendar scope not granted"
+        # WARNING exactly ONCE for this subgraph's lifetime to avoid
+        # flooding logs when every subsequent calendar-worthy email
+        # hits the same 403. Instance attribute (not module-global)
+        # per v1.1 D25 pattern — see docs/v1.1-implementation-notes.md.
+        self._scope_missing_logged = False
         self.graph = self._build_graph(checkpointer)
 
     def _build_graph(self, checkpointer: PostgresSaver | None):
@@ -298,7 +298,7 @@ class CalendarSubgraph:
                     ]
                     log.info(f"calendar: {len(conflicts)} time conflict(s)")
             except CalendarScopeNotGranted as exc:
-                return _degrade_scope_missing(log, str(exc))
+                return self._degrade_scope_missing(log, str(exc))
             except CalendarError as exc:
                 log.warning(
                     f"calendar: free/busy check failed ({exc}); "
@@ -322,7 +322,7 @@ class CalendarSubgraph:
                     "side_effect": CalendarDuplicate(ical_uid=ical_uid),
                 }
             except CalendarScopeNotGranted as exc:
-                return _degrade_scope_missing(log, str(exc))
+                return self._degrade_scope_missing(log, str(exc))
             except CalendarError as exc:
                 log.warning(f"calendar: insert failed ({exc})")
                 return {
@@ -347,6 +347,34 @@ class CalendarSubgraph:
                     conflicts=conflicts,
                 ),
             }
+
+    # ----- helpers -----
+
+    def _degrade_scope_missing(self, log, message: str) -> dict:
+        """Log ONCE per subgraph instance lifetime, degrade to skipped.
+
+        Instance-latch (`self._scope_missing_logged`) instead of a
+        module-global — test isolation is automatic (each test builds
+        a fresh subgraph), no shared mutable state across pods with
+        multiple subgraphs, and no need for a `monkeypatch` fixture
+        to reset a module var between tests. Matches v1.1 D25's move
+        away from `global _FACTORY_INSTALLED` toward attribute-based
+        sentinels.
+        """
+        if not self._scope_missing_logged:
+            log.warning(
+                f"calendar: OAuth scope not granted ({message}); "
+                "degrading to notify-only for the rest of this subgraph's "
+                "lifetime. Reauth via /reauth to grant the calendar.events "
+                "scope."
+            )
+            self._scope_missing_logged = True
+        return {
+            "side_effect": CalendarSkipped(
+                reason="scope_missing",
+                detail="calendar.events scope not granted; run /reauth",
+            ),
+        }
 
 
 # ---- Module helpers -----------------------------------------------------
@@ -424,21 +452,3 @@ def _build_insert_payload(
     if draft.location:
         payload["location"] = draft.location
     return payload
-
-
-def _degrade_scope_missing(log, message: str) -> dict:
-    """Log ONCE per pod lifetime, degrade to skipped."""
-    global _SCOPE_MISSING_LOGGED
-    if not _SCOPE_MISSING_LOGGED:
-        log.warning(
-            f"calendar: OAuth scope not granted ({message}); "
-            "degrading to notify-only for the rest of this pod's lifetime. "
-            "Reauth via /reauth to grant the calendar.events scope."
-        )
-        _SCOPE_MISSING_LOGGED = True
-    return {
-        "side_effect": CalendarSkipped(
-            reason="scope_missing",
-            detail="calendar.events scope not granted; run /reauth",
-        ),
-    }

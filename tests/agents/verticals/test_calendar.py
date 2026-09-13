@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import zashiki_warasi.agents.verticals.calendar as calendar_module
 from zashiki_warasi.agents.verticals.calendar import CalendarSubgraph
 from zashiki_warasi.calendar.client import (
     BusySlot,
@@ -28,13 +27,10 @@ from zashiki_warasi.core.schemas import (
 
 
 # ---------- fixtures ----------
-
-
-@pytest.fixture(autouse=True)
-def _reset_scope_flag(monkeypatch):
-    """Isolation: the pod-lifetime "logged 403 already" flag would
-    leak across tests if we didn't reset it."""
-    monkeypatch.setattr(calendar_module, "_SCOPE_MISSING_LOGGED", False)
+#
+# NOTE: no `_reset_scope_flag` fixture needed — the "logged 403 once"
+# latch is now an instance attribute on `CalendarSubgraph`, so each
+# `_sg(...)` call in these tests gets a fresh, un-tripped latch.
 
 
 @pytest.fixture
