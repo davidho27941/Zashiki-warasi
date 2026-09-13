@@ -59,9 +59,39 @@ def _refresh_error_message(token_path: Path, exc: RefreshError) -> str:
 
 
 def _load_cached(token_path: Path, scopes: Sequence[str]) -> Credentials | None:
+    """Load token.json using ITS OWN granted scope, not settings.scopes.
+
+    Passing `settings.scopes` (a superset) to `from_authorized_user_file`
+    makes google-auth include the requested scopes in the refresh POST;
+    Google rejects with `invalid_scope` when the request scope exceeds
+    what the token was originally granted. This bit us on v1.3.x → v1.4
+    upgrade — the new `calendar.events` scope in DEFAULT_SCOPES caused
+    every bootstrap to crash on refresh with `invalid_scope: Bad Request`.
+
+    Load whatever scope the token file records; refresh works with the
+    granted scope. Downstream API calls needing a broader scope (v1.4
+    Calendar API) return 403 and are handled by the vertical's
+    graceful-degrade path (see `calendar_sg._degrade_scope_missing`).
+
+    `settings.scopes` is still used for `_run_installed_flow` — a fresh
+    consent screen requests the full v1.4 scope list.
+    """
     if not token_path.exists():
         return None
-    return Credentials.from_authorized_user_file(str(token_path), list(scopes))
+    creds = Credentials.from_authorized_user_file(str(token_path))
+    # Nudge: if settings expects broader scope than the token grants,
+    # log INFO once so operators know reauth is needed for the missing
+    # capability. Not an error — degrade path handles it at call time.
+    granted = set(creds.scopes or ())
+    expected = set(scopes)
+    missing = expected - granted
+    if missing:
+        logger.info(
+            f"token grants {sorted(granted)}; settings expect additional "
+            f"{sorted(missing)} — verticals requiring the missing scopes "
+            "will degrade gracefully. Run /reauth to grant the full set."
+        )
+    return creds
 
 
 def _run_installed_flow(
