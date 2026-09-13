@@ -112,6 +112,15 @@ Gmail API ◀──────▶│ GmailClient (auth, fetch, history)   │
   on. **Web application** type works too but requires you to register
   the redirect URI in the console. See [`docs/oauth-redirect-uri.md`](docs/oauth-redirect-uri.md).
 
+### Optional (v1.4 calendar vertical)
+
+- **Google Calendar `calendar.events` OAuth scope** — required only
+  if you want meeting/event invitations to auto-create tentative
+  Google Calendar entries with conflict detection. Enabled by default
+  (`CALENDAR_ENABLED=1`); v1.3.x → v1.4 needs one-time `/reauth`
+  to grant the scope. Missing-scope 403 degrades gracefully to
+  notify-only. See [`docs/calendar-vertical.md`](docs/calendar-vertical.md).
+
 ### Optional (v1.1 + v1.2 observability)
 
 - **Prometheus + Grafana** — if you want to scrape the `/metrics`

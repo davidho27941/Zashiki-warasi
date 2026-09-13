@@ -10,8 +10,17 @@ from typing import Annotated, Literal
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+# Google OAuth scopes granted at auth time. Historically Gmail-only
+# (hence the `GMAIL_SCOPES` env var name), but v1.4's calendar-vertical
+# needs `calendar.events` too. Both scopes travel on the same OAuth
+# credential — Google's consent screen shows them together at
+# reauth time. Operators upgrading from v1.3.x → v1.4 MUST run
+# `/reauth` once for the new scope to take effect; missing-scope
+# 403s on Calendar API calls degrade gracefully to notify-only (see
+# `zashiki_warasi.agents.verticals.calendar` for the fallback path).
 DEFAULT_SCOPES: list[str] = [
     "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
 ]
 
 
@@ -244,6 +253,44 @@ class TelegramSettings(BaseSettings):
         description="Override only for testing or self-hosted bridges.",
     )
     timeout_seconds: float = 10.0
+
+
+class CalendarSettings(BaseSettings):
+    """v1.4 calendar-vertical knobs.
+
+    All three are env-tunable; defaults suit a single-operator homelab
+    on the operator's own Google account (primary calendar, TW timezone).
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="CALENDAR_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Kill switch. `0`/false = calendar-worthy categories route to "
+            "notify instead of `calendar_sg`. Existing tentative events "
+            "in Google Calendar untouched."
+        ),
+    )
+    timezone: str = Field(
+        default="Asia/Taipei",
+        description=(
+            "Default timezone for events with floating time (no TZID in "
+            ".ics, or LLM extraction with no explicit tz)."
+        ),
+    )
+    primary_calendar_id: str = Field(
+        default="primary",
+        description=(
+            "Google Calendar id for free/busy check and event insert. "
+            "`primary` = the auth'd account's primary calendar."
+        ),
+    )
 
 
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
