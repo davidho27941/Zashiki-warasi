@@ -357,3 +357,56 @@ class TestInsertPayload:
         ]
         payload = _build_insert_payload(_draft(), "msg-3", "uid-3", conflicts)
         assert "and 2 more" in payload["description"]
+
+    def test_tz_aware_utc_draft_rebased_to_default_taipei(self):
+        """UTC-aware draft times get astimezoned to Asia/Taipei
+        (default) and emitted naive so Google honors `timeZone`
+        rather than the offset — prevents LLM stray-Z bug."""
+        from zashiki_warasi.agents.verticals.calendar import _build_insert_payload
+
+        draft = CalendarEventDraft(
+            title="test",
+            start=datetime(2026, 9, 17, 11, 30, tzinfo=timezone.utc),
+            end=datetime(2026, 9, 17, 13, 30, tzinfo=timezone.utc),
+        )
+        payload = _build_insert_payload(draft, "m", "u", [])
+        # 11:30 UTC = 19:30 Asia/Taipei; emitted naive; timeZone hint set.
+        assert payload["start"]["dateTime"] == "2026-09-17T19:30:00"
+        assert payload["start"]["timeZone"] == "Asia/Taipei"
+        assert payload["end"]["dateTime"] == "2026-09-17T21:30:00"
+        assert payload["end"]["timeZone"] == "Asia/Taipei"
+        # dateTime must NOT carry an offset — Google would prefer it
+        # over `timeZone` and mis-place the event.
+        assert "+" not in payload["start"]["dateTime"]
+        assert "Z" not in payload["start"]["dateTime"]
+
+    def test_naive_draft_left_naive_with_timezone_hint(self):
+        """Naive draft (LLM prompt path when the LLM follows instructions)
+        keeps its wall-clock time; the hint's TZ is what Google places
+        it in."""
+        from zashiki_warasi.agents.verticals.calendar import _build_insert_payload
+
+        draft = CalendarEventDraft(
+            title="test",
+            start=datetime(2026, 9, 17, 19, 30),  # naive
+            end=datetime(2026, 9, 17, 21, 30),
+            timezone_hint="Asia/Taipei",
+        )
+        payload = _build_insert_payload(draft, "m", "u", [])
+        assert payload["start"]["dateTime"] == "2026-09-17T19:30:00"
+        assert payload["start"]["timeZone"] == "Asia/Taipei"
+
+    def test_timezone_hint_overrides_default(self):
+        """When the .ics parser recovered a non-default timezone (e.g.
+        Asia/Tokyo), it lands in the payload's `timeZone` field."""
+        from zashiki_warasi.agents.verticals.calendar import _build_insert_payload
+
+        draft = CalendarEventDraft(
+            title="test",
+            start=datetime(2026, 9, 17, 19, 30),
+            end=datetime(2026, 9, 17, 21, 30),
+            timezone_hint="Asia/Tokyo",
+        )
+        payload = _build_insert_payload(draft, "m", "u", [])
+        assert payload["start"]["timeZone"] == "Asia/Tokyo"
+        assert payload["start"]["dateTime"] == "2026-09-17T19:30:00"

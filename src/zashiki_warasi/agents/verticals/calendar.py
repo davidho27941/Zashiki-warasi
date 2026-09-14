@@ -19,7 +19,9 @@ degrades gracefully to notify (design D4).
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import TypedDict
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -69,8 +71,9 @@ CALENDAR_EXTRACT_SYSTEM_PROMPT = """\
 
 2. **必填欄位**(缺任一 → 全部回 null,不猜):
    - `title` 事件名稱 (30 字內中文簡短描述)
-   - `start` 開始時間,ISO 8601 (YYYY-MM-DD HH:MM:SS)
-   - `end` 結束時間,ISO 8601 (YYYY-MM-DD HH:MM:SS)
+   - `start` 開始時間,**只包含日期時間、不含時區**:
+     `YYYY-MM-DDTHH:MM:SS`(切勿加 `Z`、`+08:00` 或任何 offset 後綴)
+   - `end` 結束時間,同 `start` 格式(不含時區)
 
 3. 選填欄位(信件未明確提及請回 null):
    - `location` 實體地點 (e.g.「台北市信義區信義路五段 7 號」、
@@ -78,10 +81,13 @@ CALENDAR_EXTRACT_SYSTEM_PROMPT = """\
    - `description` 事件說明 / 議程,原信摘要即可,50-200 字
    - `attendee_names` 出席者姓名陣列 (**只**擷取名字,不要 email)
 
-4. **時區判斷**:
-   - 信件明確標示時區(JST、UTC+9、Asia/Tokyo)→ 據此
-   - 信件無時區線索 → 假設為 `Asia/Taipei` (系統預設)
-   - 時區從 header 或 signature 推斷 → 直接放到 timezone_hint
+4. **時區判斷**(絕對別把 offset 混進 `start`/`end`):
+   - `start` / `end` 一律是 naive wall-clock time,對應在該事件當地時區
+   - 信件明確標示時區(JST、UTC+9、Asia/Tokyo)→ 放 `timezone_hint`
+     (IANA 名稱如 `Asia/Tokyo`),`start`/`end` 用該時區當地時間
+   - 信件無時區線索 → `timezone_hint` 空著,系統套用 `Asia/Taipei`
+   - 若信中時間是「當地時間 19:30 台北」→ start = `2026-09-17T19:30:00`,
+     timezone_hint = `Asia/Taipei`
 
 5. **反幻想極重要**:
    - 若信件只是「未來會有活動,細節後續通知」→ 全部回 null
@@ -409,8 +415,19 @@ def _build_insert_payload(
     Always includes `status: "tentative"` (design D2). Description
     embeds any conflict summary (design D3). extendedProperties keep
     the source message_id for post-hoc traceability (design D5).
+
+    Timezone handling: Google Calendar's `dateTime` with a UTC offset
+    (e.g. `+00:00`, `Z`) OVERRIDES the `timeZone` field for placement.
+    Any tz-aware draft datetime is first converted to the target zone
+    (`timezone_hint` or `Asia/Taipei`), then stripped of tzinfo so
+    the emitted `dateTime` is a naive wall-clock string — Google then
+    honors `timeZone` for placement. This makes the payload robust to
+    LLM outputs that stray a `Z` onto the datetime string.
     """
-    tz = draft.timezone_hint or "Asia/Taipei"
+    tz_name = draft.timezone_hint or "Asia/Taipei"
+    tz = _load_zone(tz_name)
+    start_iso = _naive_iso_in_tz(draft.start, tz)
+    end_iso = _naive_iso_in_tz(draft.end, tz)
     description_parts: list[str] = []
     if draft.description:
         description_parts.append(draft.description)
@@ -435,12 +452,12 @@ def _build_insert_payload(
         "status": "tentative",
         "iCalUID": ical_uid,
         "start": {
-            "dateTime": draft.start.isoformat(),
-            "timeZone": tz,
+            "dateTime": start_iso,
+            "timeZone": tz_name,
         },
         "end": {
-            "dateTime": draft.end.isoformat(),
-            "timeZone": tz,
+            "dateTime": end_iso,
+            "timeZone": tz_name,
         },
         "description": description,
         "extendedProperties": {
@@ -452,3 +469,26 @@ def _build_insert_payload(
     if draft.location:
         payload["location"] = draft.location
     return payload
+
+
+def _load_zone(name: str) -> ZoneInfo:
+    try:
+        return ZoneInfo(name)
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            f"calendar: unknown timezone {name!r}, falling back to Asia/Taipei"
+        )
+        return ZoneInfo("Asia/Taipei")
+
+
+def _naive_iso_in_tz(dt: datetime, tz: ZoneInfo) -> str:
+    """Emit an offset-free ISO 8601 string in the target zone.
+
+    If `dt` is tz-aware it is first converted to `tz`; either way the
+    output has no offset so Google honors the payload's `timeZone`
+    field for placement (design: dateTime-with-offset overrides
+    timeZone; strip the offset to prevent LLM-stray-Z bugs).
+    """
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(tz)
+    return dt.replace(tzinfo=None).isoformat()
