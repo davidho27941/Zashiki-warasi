@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.4.0] — 2026-09-14
 
 Adds the **calendar vertical** — a fourth LangGraph subgraph
 (mirroring the expense pattern) that auto-creates **tentative**
@@ -50,9 +50,26 @@ explicit operator-side design constraint.
   `CALENDAR_ENABLED` (kill switch, default `1`), `CALENDAR_TIMEZONE`
   (default `Asia/Taipei`), `CALENDAR_PRIMARY_ID` (default `primary`).
 - **`docs/calendar-vertical.md`** (+ `.zh.md`) — operator guide.
-- **44 new unit tests** covering `.ics` parser, `GoogleCalendarClient`
-  (mocked API), `CalendarSubgraph` nodes, and inline keyboard
-  composition. Full suite: 757 passed (was 713 pre-v1.4).
+- **Timezone discipline** — three-layered defense against tz mishaps
+  discovered during v1.4 shakedown against real invites (see the
+  archived openspec change's `spec.md` scenarios for the concrete
+  contract, and `tasks.md` §8.5-8.8 for the bug-hunt narrative):
+  (1) `events.insert` payload NEVER embeds a UTC offset in `dateTime`
+  — the sibling `timeZone` field is the placement authority;
+  (2) LLM-emitted `timezone_hint` values in `{UTC, Etc/UTC, GMT, Z}`
+  are rejected and fall back to the operator default (WARN logged)
+  — these are empirically LLM mislabeling of Taipei-local wall-clock
+  as UTC; (3) LLM-path drafts are force-stripped to naive (Pydantic
+  coerces trailing `Z` to UTC-aware, but the offset is a coercion
+  artifact, not a cross-zone signal). `.ics` path keeps tz-aware
+  datetimes since VTIMEZONE data is real. Every `events.insert`
+  now logs an INFO line with `iCalUID / summary / start.dateTime /
+  end.dateTime / timeZone` for future tz-mishap diagnosis without
+  re-probing Google.
+- **63 new unit tests** covering `.ics` parser, `GoogleCalendarClient`
+  (mocked API), `CalendarSubgraph` nodes, inline keyboard
+  composition, and the tz sanitizer + naive-force pipeline. Full
+  suite: 776 passed (was 713 pre-v1.4).
 
 ### Changed
 
