@@ -85,7 +85,10 @@ CALENDAR_EXTRACT_SYSTEM_PROMPT = """\
    - `start` / `end` 一律是 naive wall-clock time,對應在該事件當地時區
    - 信件明確標示時區(JST、UTC+9、Asia/Tokyo)→ 放 `timezone_hint`
      (IANA 名稱如 `Asia/Tokyo`),`start`/`end` 用該時區當地時間
-   - 信件無時區線索 → `timezone_hint` 空著,系統套用 `Asia/Taipei`
+   - 信件無時區線索 → `timezone_hint` **必須留 null**,由系統套 `Asia/Taipei`
+   - **`timezone_hint` 絕對不可寫 `UTC` / `Etc/UTC` / `GMT` / `Z`** ——
+     這些值幾乎百分之百是誤判(信中時間看似 19:30,你以為是 UTC,
+     但其實是台北當地時間)。寧可留 null 讓系統套 Asia/Taipei。
    - 若信中時間是「當地時間 19:30 台北」→ start = `2026-09-17T19:30:00`,
      timezone_hint = `Asia/Taipei`
 
@@ -317,6 +320,14 @@ class CalendarSubgraph:
             )
 
             # ---- Insert ----
+            log.info(
+                "calendar: inserting event "
+                f"iCalUID={payload['iCalUID']!r} "
+                f"summary={payload['summary']!r} "
+                f"start.dateTime={payload['start']['dateTime']!r} "
+                f"end.dateTime={payload['end']['dateTime']!r} "
+                f"timeZone={payload['start']['timeZone']!r}"
+            )
             try:
                 inserted = self._calendar_client.insert_event(payload)
             except iCalUidExists:
@@ -424,7 +435,7 @@ def _build_insert_payload(
     honors `timeZone` for placement. This makes the payload robust to
     LLM outputs that stray a `Z` onto the datetime string.
     """
-    tz_name = draft.timezone_hint or "Asia/Taipei"
+    tz_name = _sanitize_tz_hint(draft.timezone_hint, default="Asia/Taipei")
     tz = _load_zone(tz_name)
     start_iso = _naive_iso_in_tz(draft.start, tz)
     end_iso = _naive_iso_in_tz(draft.end, tz)
@@ -469,6 +480,32 @@ def _build_insert_payload(
     if draft.location:
         payload["location"] = draft.location
     return payload
+
+
+_UTC_LIKE_HINTS = frozenset({"utc", "etc/utc", "gmt", "z", ""})
+
+
+def _sanitize_tz_hint(hint: str | None, *, default: str) -> str:
+    """Reject UTC-like hints as LLM mislabeling; fall back to `default`.
+
+    Empirical failure mode: the extractor LLM sees a wall-clock time
+    like "19:30" in a Taipei-authored email and stamps `timezone_hint`
+    as `"UTC"`, sending Google `timeZone: "UTC"` and placing the event
+    at UTC 19:30 (= 03:30 next day Taipei / 04:30 next day JST). We
+    reject the LLM-guess variants and let the operator's default apply
+    (`.ics` VTIMEZONE-derived UTC would be legitimate but rare enough
+    that reject-and-warn is safer than trust — spec covers this in
+    "LLM-emitted UTC-like hint is rejected").
+    """
+    if hint is None or hint.strip().lower() in _UTC_LIKE_HINTS:
+        if hint:
+            logger.warning(
+                f"calendar: rejecting UTC-like timezone_hint {hint!r}; "
+                f"falling back to operator default {default!r} "
+                "(LLM tz guess is untrusted for UTC/Etc/UTC/GMT/Z)"
+            )
+        return default
+    return hint
 
 
 def _load_zone(name: str) -> ZoneInfo:

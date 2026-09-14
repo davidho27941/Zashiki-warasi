@@ -410,3 +410,67 @@ class TestInsertPayload:
         payload = _build_insert_payload(draft, "m", "u", [])
         assert payload["start"]["timeZone"] == "Asia/Tokyo"
         assert payload["start"]["dateTime"] == "2026-09-17T19:30:00"
+
+
+class TestSanitizeTzHint:
+    @pytest.mark.parametrize(
+        "bad_hint",
+        ["UTC", "utc", "Etc/UTC", "etc/utc", "GMT", "gmt", "Z", "z", ""],
+    )
+    def test_utc_like_hints_fall_back_to_default(self, bad_hint, caplog):
+        """LLM mislabeling a Taipei-local time as UTC would place the
+        event at 03:30/04:30 next day. Sanitizer intercepts."""
+        import logging
+
+        from zashiki_warasi.agents.verticals.calendar import _sanitize_tz_hint
+
+        with caplog.at_level(logging.WARNING):
+            out = _sanitize_tz_hint(bad_hint, default="Asia/Taipei")
+
+        assert out == "Asia/Taipei"
+        # Non-empty bad values also trigger a WARN log carrying the
+        # discarded value; empty string is silent (no LLM output).
+        if bad_hint:
+            assert any(
+                "rejecting UTC-like timezone_hint" in rec.message
+                and repr(bad_hint) in rec.message
+                for rec in caplog.records
+            )
+
+    def test_real_zones_pass_through(self):
+        from zashiki_warasi.agents.verticals.calendar import _sanitize_tz_hint
+
+        assert _sanitize_tz_hint("Asia/Tokyo", default="Asia/Taipei") == "Asia/Tokyo"
+        assert _sanitize_tz_hint("Asia/Taipei", default="Asia/Taipei") == "Asia/Taipei"
+        assert _sanitize_tz_hint("America/New_York", default="Asia/Taipei") == "America/New_York"
+
+    def test_none_falls_back_silently(self, caplog):
+        import logging
+
+        from zashiki_warasi.agents.verticals.calendar import _sanitize_tz_hint
+
+        with caplog.at_level(logging.WARNING):
+            out = _sanitize_tz_hint(None, default="Asia/Taipei")
+
+        assert out == "Asia/Taipei"
+        # None is the normal "LLM omitted the field" case — no warn.
+        assert not any(
+            "rejecting UTC-like" in rec.message for rec in caplog.records
+        )
+
+    def test_end_to_end_llm_utc_hint_rejected_in_payload(self):
+        """The bug we're fixing: LLM sets timezone_hint='UTC' + naive
+        start='19:30'. Sanitizer overrides so Google places it in
+        Asia/Taipei, not UTC."""
+        from zashiki_warasi.agents.verticals.calendar import _build_insert_payload
+
+        draft = CalendarEventDraft(
+            title="GDG",
+            start=datetime(2026, 9, 17, 19, 30),
+            end=datetime(2026, 9, 17, 21, 30),
+            timezone_hint="UTC",
+        )
+        payload = _build_insert_payload(draft, "m", "u", [])
+        assert payload["start"]["timeZone"] == "Asia/Taipei"
+        assert payload["start"]["dateTime"] == "2026-09-17T19:30:00"
+        assert payload["end"]["timeZone"] == "Asia/Taipei"
