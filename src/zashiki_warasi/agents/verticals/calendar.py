@@ -264,6 +264,28 @@ class CalendarSubgraph:
                     ),
                 }
 
+            # LLM output paths often stamp UTC onto naive-intent times
+            # (Pydantic coerces a trailing `Z` to `timezone.utc`). The
+            # offset here is a coercion artifact, not a genuine
+            # cross-zone signal — strip it so the payload builder
+            # treats the datetime as wall-clock in the sanitized hint
+            # (or the operator default). Cross-zone conversion lives
+            # in the `.ics` path only. See 8.7 tasks + spec scenario
+            # "LLM-emitted tz-aware datetimes are forced to naive".
+            if draft.start.tzinfo is not None or draft.end.tzinfo is not None:
+                log.info(
+                    f"calendar: LLM emitted tz-aware start "
+                    f"({draft.start.isoformat()}); stripping tzinfo — "
+                    "the offset is a Pydantic coercion artifact, not "
+                    "a cross-zone signal from the LLM"
+                )
+                draft = draft.model_copy(
+                    update={
+                        "start": draft.start.replace(tzinfo=None),
+                        "end": draft.end.replace(tzinfo=None),
+                    }
+                )
+
             log.info(
                 f"calendar: LLM extracted title={draft.title!r} "
                 f"start={draft.start.isoformat()}"

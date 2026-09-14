@@ -185,6 +185,53 @@ END:VCALENDAR
         assert out["extracted"] is None
         assert isinstance(out["side_effect"], CalendarSkipped)
 
+    def test_llm_utc_aware_draft_forced_to_naive(self, fake_email):
+        """LLM emits `Z` on a wall-clock Taipei time → Pydantic makes
+        it UTC-aware → our step MUST strip tzinfo so the payload
+        builder treats it as wall-clock in the sanitized hint tz."""
+        utc_aware_draft = CalendarEventDraft(
+            title="GDG",
+            start=datetime(2026, 9, 17, 19, 30, tzinfo=timezone.utc),
+            end=datetime(2026, 9, 17, 21, 30, tzinfo=timezone.utc),
+        )
+        model = _build_model_returning(utc_aware_draft)
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        out = sg._extract_node({"email": fake_email, "analysis": None, "side_effect": None, "extracted": None})
+        extracted = out["extracted"]
+        assert extracted is not None
+        assert extracted.start.tzinfo is None
+        assert extracted.end.tzinfo is None
+        assert extracted.start == datetime(2026, 9, 17, 19, 30)
+        assert extracted.end == datetime(2026, 9, 17, 21, 30)
+
+    def test_ics_path_datetime_stays_tz_aware(self, fake_email_with_ics):
+        """`.ics` path returns tz-aware datetimes with genuine
+        VTIMEZONE data — MUST NOT be stripped; the payload builder
+        will `astimezone` them to the hint tz for cross-zone cases."""
+        # A minimal .ics with an explicit UTC time — the ics parser
+        # will yield a UTC-aware datetime (real VTIMEZONE / trailing Z).
+        ics = (
+            b"BEGIN:VCALENDAR\r\n"
+            b"VERSION:2.0\r\n"
+            b"BEGIN:VEVENT\r\n"
+            b"UID:real-utc@example.com\r\n"
+            b"SUMMARY:Cross-zone Event\r\n"
+            b"DTSTART:20260917T113000Z\r\n"
+            b"DTEND:20260917T133000Z\r\n"
+            b"END:VEVENT\r\n"
+            b"END:VCALENDAR\r\n"
+        )
+        model = _build_model_returning(None)
+        sg = _sg(model, _mock_gmail_client_returning_ics(ics), _mock_calendar_client())
+
+        out = sg._extract_node({"email": fake_email_with_ics, "analysis": None, "side_effect": None, "extracted": None})
+        extracted = out["extracted"]
+        assert extracted is not None
+        # `.ics` path preserves tz-aware — the payload builder handles
+        # the cross-zone astimezone at insert time.
+        assert extracted.start.tzinfo is not None
+
 
 # ---------- _create_node ------------------------------------------------
 
