@@ -258,6 +258,36 @@ class TestCreate:
         # Free/busy called with tentative time window
         calendar_client.check_free_busy.assert_called_once()
 
+    def test_naive_draft_gets_aware_before_freebusy(self, fake_email):
+        """LLM-path 8.7 fix produces naive datetimes; `_create_node`
+        MUST attach the effective tz before calling freebusy, else
+        `GoogleCalendarClient._iso` raises ValueError. Regression
+        seen live at commit f8931397."""
+        naive_draft = CalendarEventDraft(
+            title="test",
+            start=datetime(2026, 9, 17, 19, 30),  # naive
+            end=datetime(2026, 9, 17, 21, 30),
+        )
+        calendar_client = _mock_calendar_client(
+            busy=[],
+            insert_result=InsertedEvent(
+                id="gcal-new",
+                ical_uid="uid",
+                view_url="https://calendar.google.com/xxx",
+            ),
+        )
+        sg = _sg(_build_model_returning(None), MagicMock(), calendar_client)
+
+        out = sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": naive_draft,
+        })
+        assert isinstance(out["side_effect"], CalendarCreated)
+        # freebusy was called with tz-aware arguments — extract them
+        args = calendar_client.check_free_busy.call_args.args
+        assert args[0].tzinfo is not None
+        assert args[1].tzinfo is not None
+
     def test_conflicts_included_in_side_effect(self, fake_email):
         conflict = ExistingEvent(
             id="existing",

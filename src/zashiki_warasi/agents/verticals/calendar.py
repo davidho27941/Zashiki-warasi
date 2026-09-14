@@ -311,15 +311,33 @@ class CalendarSubgraph:
             email = state["email"]
             ical_uid = draft.ical_uid or _synthesize_ical_uid(email.id)
 
+            # `_extract_node` strips tzinfo on the LLM path (see 8.7);
+            # `_ics_parser._resolve_datetime` returns tz-aware. The
+            # Google client's freebusy call requires aware inputs, so
+            # attach the effective operator timezone (sanitized hint or
+            # the CalendarSubgraph default) to any naive draft times.
+            # This is a local view for API calls only — the draft
+            # stored in state is untouched so payload composition
+            # decides its own emission format.
+            freebusy_tz = _load_zone(
+                _sanitize_tz_hint(
+                    draft.timezone_hint, default=self._default_timezone
+                )
+            )
+            fb_start = (
+                draft.start if draft.start.tzinfo else draft.start.replace(tzinfo=freebusy_tz)
+            )
+            fb_end = (
+                draft.end if draft.end.tzinfo else draft.end.replace(tzinfo=freebusy_tz)
+            )
+
             # ---- Free/busy check ----
             conflicts: list[CalendarConflict] = []
             try:
-                busy = self._calendar_client.check_free_busy(
-                    draft.start, draft.end
-                )
+                busy = self._calendar_client.check_free_busy(fb_start, fb_end)
                 if busy:
                     events = self._calendar_client.list_events_in_window(
-                        draft.start, draft.end
+                        fb_start, fb_end
                     )
                     conflicts = [
                         CalendarConflict(
