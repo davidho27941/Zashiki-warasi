@@ -406,12 +406,22 @@ class CalendarSkipped(BaseModel):
     - extraction_failed: neither .ics nor LLM produced a usable
       {title, start, end}. Better a missed event than a garbage one.
     - disabled: CALENDAR_ENABLED=0 kill switch.
+    - no_event_signal: pre-flight regex found no date/time pattern in
+      the body — extract short-circuited BEFORE invoking the LLM to
+      save the call on obvious non-events (Coursera promos, MOOC
+      recommendations, etc.). Second line of defense behind the
+      classifier's `講座資訊` boundary.
     """
 
     model_config = ConfigDict(frozen=True)
 
     kind: Literal["calendar_skipped"] = "calendar_skipped"
-    reason: Literal["scope_missing", "extraction_failed", "disabled"]
+    reason: Literal[
+        "scope_missing",
+        "extraction_failed",
+        "disabled",
+        "no_event_signal",
+    ]
     detail: str | None = None
 
 

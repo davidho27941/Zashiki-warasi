@@ -14,6 +14,17 @@
 
 - Category: `會議邀請` 或 `講座資訊`(模組常數
   `_CALENDAR_LIKE_CATEGORIES`,在 `zashiki_warasi/agents/email_agent.py`)
+- **`講座資訊` 邊界(v1.4.1 精修):** 必須**同時**具備具體活動日期/時間
+  AND 特定地點或線上會議連結。課程推薦(Coursera、Udemy、MOOC 電子報)
+  沒有明確 cohort 日期 → 分「廣告」,而非「講座資訊」。反例清單見
+  analyze system prompt。
+- **Extract short-circuit(v1.4.1 第二道防線):** 就算被誤分為
+  `講座資訊`,extract 節點呼叫 LLM 前會先用輕量 regex 掃過
+  `subject + body`。若**沒有任何日期/時間 pattern**(`YYYY-MM-DD`、
+  `M/D`、`HH:MM`、中英星期等)→ 短路,回傳
+  `CalendarSkipped(reason="no_event_signal")`,Telegram 顯示
+  `📅 行事曆事件未建立: 內文無明確活動時間`,LLM 不會被呼叫。
+  `.ics` 附件永遠繞過 short-circuit(結構化資料本身就是活動訊號)。
 - Kill switch:`.env` 設 `CALENDAR_ENABLED=0` 完全停用 —— 行為與 v1.3 一致
 - OAuth:需要 `https://www.googleapis.com/auth/calendar` scope(完整),和
   Gmail 共用同一個 credential(不是較窄的 `calendar.events` —— `freebusy.query`

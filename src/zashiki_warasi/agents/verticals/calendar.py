@@ -19,6 +19,7 @@ degrades gracefully to notify (design D4).
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import TypedDict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -58,6 +59,54 @@ logger = logging.getLogger(__name__)
 
 
 CALENDAR_ICS_MIME = "text/calendar"
+
+
+# Second line of defense behind the classifier's `講座資訊` definition:
+# if the concatenated subject+body carries NONE of these patterns, the
+# email almost certainly has no concrete event to extract, and the LLM
+# call is wasted. See `_looks_like_event_body`.
+#
+# Deliberately conservative — an email with a stray date phrase (policy
+# expiry, "for the year 2026", etc.) still passes through to LLM,
+# keeping legit event invitations reachable. Missing on the short-circuit
+# is preferable to false-negatives on real invites.
+_EVENT_SIGNAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Numeric dates: 2026-09-17, 2026/9/17, 2026年9月17日, 9/17, 9-17
+    re.compile(r"\d{4}[-/年]\s?\d{1,2}[-/月]\s?\d{1,2}"),
+    re.compile(r"\d{1,2}[月/-]\s?\d{1,2}[日號]"),
+    re.compile(r"\d{4}-\d{2}-\d{2}"),
+    # English month names (Jan-Dec) and weekday names.
+    re.compile(
+        r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
+        r"(uary|ruary|ch|il|e|y|ust|tember|ober|ember)?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
+        r"(day|sday|nesday|rsday|urday)?\b",
+        re.IGNORECASE,
+    ),
+    # Chinese weekday: 星期一~日, 週一~日
+    re.compile(r"(星期|週)[一二三四五六日天]"),
+    # Time-of-day: 19:30, 19:30, 7pm, 7:00 AM
+    re.compile(r"\d{1,2}[:：]\d{2}"),
+    re.compile(r"\d{1,2}\s?(am|pm|AM|PM|a\.m\.|p\.m\.)", re.IGNORECASE),
+    # Chinese time markers: 上午/下午/早上/晚上/中午 + digit
+    re.compile(r"(上午|下午|早上|晚上|中午)\s?\d{1,2}"),
+)
+
+
+def _looks_like_event_body(subject: str, body: str) -> bool:
+    """True if any date/time pattern matches subject+body; False otherwise.
+
+    Case-insensitive per each pattern's own flags. Used by the
+    extract-node short-circuit — a False here means "skip the LLM
+    call, no concrete event here." Missing legit invitations is
+    acceptable (fallback still routes to notify); false positives
+    are cheap (just an extra LLM call).
+    """
+    haystack = f"{subject}\n{body}"
+    return any(p.search(haystack) for p in _EVENT_SIGNAL_PATTERNS)
 
 
 CALENDAR_EXTRACT_SYSTEM_PROMPT = """\
@@ -207,6 +256,23 @@ class CalendarSubgraph:
                     ),
                 }
 
+            # Pre-flight: if the concatenated subject+body carries no
+            # date/time signal, this is almost certainly a course promo,
+            # MOOC newsletter, or marketing email that miscategorized
+            # into 講座資訊. Skip the LLM call, save the round-trip and
+            # its associated error surface. See design D2.
+            if not _looks_like_event_body(email.subject, body):
+                log.info(
+                    "calendar: no event-signal in body, skipping LLM extraction"
+                )
+                return {
+                    "extracted": None,
+                    "side_effect": CalendarSkipped(
+                        reason="no_event_signal",
+                        detail="body has no date/time patterns",
+                    ),
+                }
+
             user_prompt = (
                 f"From: {email.from_address}\n"
                 f"Subject: {email.subject}\n"
@@ -236,15 +302,21 @@ class CalendarSubgraph:
                         )
                     )
                 except Exception as exc:  # noqa: BLE001 - defensive
-                    log.warning(
-                        f"calendar: LLM extraction failed ({exc}); "
-                        "falling through to no event"
-                    )
+                    # Truncate exc body at 512 chars — long enough for
+                    # OpenAI/llama.cpp BadRequest bodies (context-length
+                    # overflow, malformed prompt) but bounded against a
+                    # rogue traceback fragment. Class name kept as the
+                    # leading token for grep-ability and metric labels.
+                    exc_body = str(exc)
+                    if len(exc_body) > 512:
+                        exc_body = exc_body[:512] + "…"
+                    short = f"llm error: {exc.__class__.__name__}: {exc_body}"
+                    log.warning(f"calendar: LLM extraction failed ({short})")
                     return {
                         "extracted": None,
                         "side_effect": CalendarSkipped(
                             reason="extraction_failed",
-                            detail=f"llm error: {exc.__class__.__name__}",
+                            detail=short,
                         ),
                     }
                 set_gen_ai_attributes(

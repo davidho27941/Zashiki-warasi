@@ -16,6 +16,20 @@ organizer.
 
 - Category: `會議邀請` or `講座資訊` (module constant
   `_CALENDAR_LIKE_CATEGORIES` in `zashiki_warasi/agents/email_agent.py`).
+- **`講座資訊` boundary (v1.4.1 refinement):** requires BOTH a
+  concrete event date/time AND a specific place / online-meeting
+  link. Course recommendations (Coursera, Udemy, MOOC newsletters)
+  without cohort dates route to `廣告`, NOT `講座資訊`. See the
+  analyze system prompt for the anti-example list.
+- **Extract short-circuit (v1.4.1 second line of defense):** even
+  when a message miscategorizes into `講座資訊`, the extract node
+  runs a lightweight regex pre-flight on `subject + body` before
+  invoking the LLM. If NO date/time pattern matches
+  (`YYYY-MM-DD`, `M/D`, `HH:MM`, weekday names in en/zh, etc.),
+  extraction short-circuits with `CalendarSkipped(reason="no_event_signal")`
+  — the Telegram alert reads `📅 行事曆事件未建立: 內文無明確活動時間`
+  and no LLM call is made. `.ics` attachments always bypass the
+  short-circuit (structured data is inherently event-signaled).
 - Kill switch: `CALENDAR_ENABLED=0` in `.env` skips the vertical
   entirely — same behavior as v1.3.
 - OAuth: needs `https://www.googleapis.com/auth/calendar` scope on
