@@ -328,6 +328,13 @@ class TestLoadCached:
         token_path = tmp_path / "token.json"
         token_path.write_text("{}")
         expected = _fake_creds(valid=True)
+        # v1.4: _load_cached NO LONGER passes settings.scopes to
+        # from_authorized_user_file — passing a superset scope makes
+        # google-auth include scope in the refresh POST and Google
+        # rejects with invalid_scope when the token's granted scope
+        # is narrower. Load the token with its own granted scope; the
+        # nudge-log about missing scope is emitted separately.
+        expected.scopes = ["scope1"]  # match settings.scopes → no nudge
         load_mock = MagicMock(return_value=expected)
         monkeypatch.setattr(
             "zashiki_warasi.gmail.auth.Credentials.from_authorized_user_file",
@@ -336,8 +343,33 @@ class TestLoadCached:
 
         result = auth._load_cached(token_path, scopes=["scope1"])
 
-        load_mock.assert_called_once_with(str(token_path), ["scope1"])
+        load_mock.assert_called_once_with(str(token_path))
         assert result is expected
+
+    def test_logs_nudge_when_settings_expects_broader_scope(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        """v1.4 upgrade path: token grants gmail only, settings expect
+        gmail + calendar → we log an INFO nudge (not error) telling
+        operator reauth is needed for the missing scope."""
+        import logging as _logging
+
+        token_path = tmp_path / "token.json"
+        token_path.write_text("{}")
+        creds = _fake_creds(valid=True)
+        creds.scopes = ["gmail.readonly"]
+        monkeypatch.setattr(
+            "zashiki_warasi.gmail.auth.Credentials.from_authorized_user_file",
+            MagicMock(return_value=creds),
+        )
+
+        with caplog.at_level(_logging.INFO, logger="zashiki_warasi.gmail.auth"):
+            auth._load_cached(
+                token_path,
+                scopes=["gmail.readonly", "calendar.events"],
+            )
+
+        assert any("reauth" in msg.lower() for msg in caplog.messages)
 
 
 # --- default settings (None passed) ---

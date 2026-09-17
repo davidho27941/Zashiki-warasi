@@ -23,13 +23,19 @@ from openai import BadRequestError, LengthFinishReasonError
 from sqlalchemy.orm import sessionmaker
 
 from zashiki_warasi.agents.llm import get_chat_model
+from zashiki_warasi.agents.verticals.calendar import CalendarSubgraph
 from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
+from zashiki_warasi.calendar.client import GoogleCalendarClient
+from zashiki_warasi.core.config import CalendarSettings
 from zashiki_warasi.agents.verticals.html_text import html_to_text
 from zashiki_warasi.core.config import LLMSettings
 from zashiki_warasi.core.logging import bind_message_context, node_trace
 from zashiki_warasi.core.models import EmailAnalysis as EmailAnalysisORM
 from zashiki_warasi.core.schemas import (
     AnalysisFailed,
+    CalendarCreated,
+    CalendarDuplicate,
+    CalendarSkipped,
     EmailAnalysis,
     EmailMessage,
     ExpenseLogged,
@@ -38,7 +44,10 @@ from zashiki_warasi.core.schemas import (
     coerce_importance,
 )
 from zashiki_warasi.gmail.client import GmailClient
-from zashiki_warasi.notifications._trace_markup import build_trace_copy_markup
+from zashiki_warasi.notifications._trace_markup import (
+    build_notify_markup,
+    build_trace_copy_markup,
+)
 from zashiki_warasi.notifications.notion import NotionExpenseRecorder
 from zashiki_warasi.notifications.telegram import TelegramNotifier
 from zashiki_warasi.observability import (
@@ -54,22 +63,29 @@ from zashiki_warasi.observability.instrumentation import (
 logger = logging.getLogger(__name__)
 
 
-def _current_trace_copy_markup() -> dict | None:
-    """Read the active OTel span's trace_id and build a Telegram copy button.
+def _current_trace_id_hex() -> str | None:
+    """Read the active OTel span's trace_id as 32-char lowercase hex.
 
     Returns None on any failure — no active span, malformed span context,
-    SDK missing — so the notify path can never break on a missing button.
-    Callers pass the result straight to `TelegramNotifier.send_message`'s
-    `reply_markup=` kwarg; None means "no button, plain text."
+    SDK missing — so the notify path can never break on this read.
     """
     try:
         from opentelemetry import trace
 
         ctx = trace.get_current_span().get_span_context()
-        trace_id_hex = f"{ctx.trace_id:032x}"
+        return f"{ctx.trace_id:032x}"
     except Exception:
         return None
-    return build_trace_copy_markup(trace_id_hex)
+
+
+def _current_trace_copy_markup() -> dict | None:
+    """v1.3 legacy: build a copy-trace-id-only markup.
+
+    Kept for the AnalysisFailed / no-analysis notify path which has no
+    calendar side-effect (single button is fine). Newer paths use
+    `build_notify_markup` directly to compose calendar + trace buttons.
+    """
+    return build_trace_copy_markup(_current_trace_id_hex())
 
 
 ANALYZE_SYSTEM_PROMPT = """\
@@ -247,6 +263,8 @@ class EmailAgent:
         notifier: TelegramNotifier,
         client: GmailClient,
         notion: NotionExpenseRecorder | None = None,
+        calendar_client: GoogleCalendarClient | None = None,
+        calendar_settings: CalendarSettings | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._notifier = notifier
@@ -280,6 +298,25 @@ class EmailAgent:
             llm_model_name=self._llm_model_name,
             llm_system=self._llm_system,
         )
+
+        # v1.4 calendar vertical (opt-in via CalendarSettings.enabled).
+        # When disabled OR when construction fails (e.g. calendar_client
+        # not passed by caller for backward compat), the vertical is
+        # None and _route_by_category routes calendar-worthy categories
+        # to notify instead — same as v1.3 behavior.
+        self._calendar_settings = calendar_settings or CalendarSettings()
+        self._calendar_subgraph: CalendarSubgraph | None = None
+        if self._calendar_settings.enabled and calendar_client is not None:
+            self._calendar_subgraph = CalendarSubgraph(
+                checkpointer=checkpointer,
+                client=client,
+                calendar_client=calendar_client,
+                model=extract_chat_model,
+                default_timezone=self._calendar_settings.timezone,
+                llm_model_name=self._llm_model_name,
+                llm_system=self._llm_system,
+            )
+
         self._graph = self._build_graph(checkpointer)
 
     def _build_graph(self, checkpointer: PostgresSaver):
@@ -288,11 +325,20 @@ class EmailAgent:
         builder.add_node("expense_sg", self._expense_subgraph.graph)
         builder.add_node("notify", self._notify)
 
+        # Calendar node only when the subgraph was constructed.
+        # `_route_by_category` returns "calendar" iff self._calendar_subgraph
+        # is set AND the category matches.
+        routes = {"expense": "expense_sg", "notify": "notify"}
+        if self._calendar_subgraph is not None:
+            builder.add_node("calendar_sg", self._calendar_subgraph.graph)
+            builder.add_edge("calendar_sg", "notify")
+            routes["calendar"] = "calendar_sg"
+
         builder.add_edge(START, "analyze")
         builder.add_conditional_edges(
             "analyze",
             self._route_by_category,
-            {"expense": "expense_sg", "notify": "notify"},
+            routes,
         )
         builder.add_edge("expense_sg", "notify")
         builder.add_edge("notify", END)
@@ -409,19 +455,33 @@ class EmailAgent:
     # is a one-line change.
     _EXPENSE_LIKE_CATEGORIES = ("消費支出", "帳單通知")
 
+    # v1.4 — categories that trigger the calendar_sg vertical when
+    # enabled + a Google Calendar client is configured. Frozen for
+    # symmetry with _EXPENSE_LIKE_CATEGORIES.
+    _CALENDAR_LIKE_CATEGORIES = ("會議邀請", "講座資訊")
+
     def _route_by_category(self, state: AgentState) -> str:
         log = self._log(state)
         analysis = state.get("analysis")
         if analysis is None:
             log.info("routing to notify (no analysis)")
             return "notify"
-        target = (
-            "expense"
-            if analysis.category in self._EXPENSE_LIKE_CATEGORIES
-            else "notify"
-        )
-        log.info(f"routing to {target} (category={analysis.category})")
-        return target
+        if analysis.category in self._EXPENSE_LIKE_CATEGORIES:
+            log.info(f"routing to expense (category={analysis.category})")
+            return "expense"
+        # `getattr` defensive: unit tests exercise `_route_by_category`
+        # by constructing agents via `__new__` (no `__init__`), so
+        # `_calendar_subgraph` may not exist. Route calendar-worthy
+        # categories to notify in that case (v1.3 behavior).
+        calendar_sg = getattr(self, "_calendar_subgraph", None)
+        if (
+            calendar_sg is not None
+            and analysis.category in self._CALENDAR_LIKE_CATEGORIES
+        ):
+            log.info(f"routing to calendar (category={analysis.category})")
+            return "calendar"
+        log.info(f"routing to notify (category={analysis.category})")
+        return "notify"
 
     def _notify(self, state: AgentState) -> dict:
         log = self._log(state)
@@ -445,6 +505,14 @@ class EmailAgent:
                 log.warning("notify: skipping — no analysis")
                 return {}
             text = _format_message(state["email"], analysis, side_effect)
+            # v1.4: when the side_effect is a CalendarCreated, add a
+            # "View in Calendar" URL button alongside the trace-copy
+            # button. Non-calendar paths reuse the trace-only markup.
+            if isinstance(side_effect, CalendarCreated):
+                markup = build_notify_markup(
+                    trace_id=_current_trace_id_hex(),
+                    calendar_url=side_effect.view_url,
+                )
             self._notifier.send_message(text, reply_markup=markup)
             log.info("notified user")
             return {}
@@ -560,6 +628,12 @@ def _format_message(
             parts.append(_format_expense_logged(side_effect))
         elif side_effect.kind == "expense_needs_review":
             parts.append(_format_expense_needs_review(side_effect))
+        elif side_effect.kind == "calendar_created":
+            parts.append(_format_calendar_created(side_effect))
+        elif side_effect.kind == "calendar_duplicate":
+            parts.append(_format_calendar_duplicate(side_effect))
+        elif side_effect.kind == "calendar_skipped":
+            parts.append(_format_calendar_skipped(side_effect))
 
     if analysis.keywords:
         parts.append("")
@@ -679,4 +753,54 @@ def _format_expense_needs_review(effect: ExpenseNeedsReview) -> str:
     elif effect.reason == "extraction_yielded_nulls":
         lines.append("信件內容不足以擷取明確支付資訊。")
     lines.append("→ 請打開原信手動處理。")
+    return "\n".join(lines)
+
+
+# ----- v1.4 calendar-vertical formatters -----
+
+
+def _format_calendar_created(effect: CalendarCreated) -> str:
+    """Render the created tentative event + any conflict summary.
+
+    The `🔗 View in Calendar` URL button is added as a `reply_markup`
+    on the send, NOT rendered as a link here — buttons are more
+    tappable than inline links on mobile Telegram.
+    """
+    lines = [
+        f"📅 <b>事件已建立 (tentative):</b> {html.escape(effect.title)}",
+        f"  時間: {effect.start:%Y-%m-%d %H:%M} – {effect.end:%H:%M}",
+    ]
+    if effect.location:
+        lines.append(f"  📍 {html.escape(effect.location)}")
+
+    if effect.conflicts:
+        lines.append("")
+        lines.append("⚠️ <b>該時段已有事件:</b>")
+        for c in effect.conflicts[:3]:
+            lines.append(
+                f"  • {c.start:%H:%M}-{c.end:%H:%M} {html.escape(c.title)}"
+            )
+        remaining = len(effect.conflicts) - 3
+        if remaining > 0:
+            lines.append(f"  • …還有 {remaining} 個事件")
+
+    return "\n".join(lines)
+
+
+def _format_calendar_duplicate(effect: CalendarDuplicate) -> str:
+    return (
+        "📅 <b>事件已存在:</b> 這封信對應的行事曆事件已於稍早建立,"
+        "略過重複建立。"
+    )
+
+
+def _format_calendar_skipped(effect: CalendarSkipped) -> str:
+    reason_zh = {
+        "scope_missing": "尚未授權 Google Calendar (請 /reauth)",
+        "extraction_failed": "無法擷取完整事件資訊",
+        "disabled": "行事曆整合已停用 (CALENDAR_ENABLED=0)",
+    }.get(effect.reason, effect.reason)
+    lines = [f"📅 <b>行事曆事件未建立:</b> {reason_zh}"]
+    if effect.detail:
+        lines.append(f"  說明: {html.escape(effect.detail)}")
     return "\n".join(lines)

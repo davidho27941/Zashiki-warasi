@@ -314,7 +314,113 @@ class AnalysisFailed(BaseModel):
     detail: str | None = None
 
 
+# ----- Calendar vertical (v1.4) -----
+
+
+class CalendarEventDraft(BaseModel):
+    """Extraction result for a calendar-worthy email.
+
+    Produced by either .ics parsing (deterministic, RFC 5545) or LLM
+    fallback (best-effort). `title`, `start`, `end` are required —
+    the vertical skips event creation if any are None. Optional fields
+    are for enrichment.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    title: str
+    start: datetime
+    end: datetime
+    location: str | None = None
+    description: str | None = None
+    ical_uid: str | None = Field(
+        default=None,
+        description=(
+            "iCalUID from the .ics UID field when present. Absent = "
+            "LLM extraction path; the subgraph synthesizes a UID from "
+            "message_id in that case."
+        ),
+    )
+    attendee_names: list[str] = Field(default_factory=list)
+    timezone_hint: str | None = Field(
+        default=None,
+        description=(
+            "Timezone recovered from .ics VTIMEZONE or LLM guess. "
+            "Callers may override with the operator's default when null."
+        ),
+    )
+    has_rrule: bool = Field(
+        default=False,
+        description=(
+            "True if the .ics carried a RRULE — v1.4 handles only the "
+            "first occurrence; a WARNING is logged when this fires."
+        ),
+    )
+
+
+class CalendarConflict(BaseModel):
+    """One overlapping event found during freebusy check."""
+
+    model_config = ConfigDict(frozen=True)
+
+    title: str
+    start: datetime
+    end: datetime
+
+
+class CalendarCreated(BaseModel):
+    """SideEffect payload when calendar_sg successfully created a tentative event."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["calendar_created"] = "calendar_created"
+    event_id: str
+    view_url: str
+    title: str
+    start: datetime
+    end: datetime
+    location: str | None = None
+    conflicts: list[CalendarConflict] = Field(default_factory=list)
+
+
+class CalendarDuplicate(BaseModel):
+    """SideEffect payload for iCalUID collision (idempotent no-op).
+
+    Google returned 409 because an event with this UID already exists.
+    Not an error — the tentative is already on the operator's calendar
+    from a previous processing of the same (or related) email.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["calendar_duplicate"] = "calendar_duplicate"
+    ical_uid: str
+
+
+class CalendarSkipped(BaseModel):
+    """SideEffect payload when calendar_sg did NOT create an event.
+
+    Distinct reasons drive different notify wording:
+    - scope_missing: OAuth calendar scope not granted (403); operator
+      needs to reauth. Logged once per pod lifetime.
+    - extraction_failed: neither .ics nor LLM produced a usable
+      {title, start, end}. Better a missed event than a garbage one.
+    - disabled: CALENDAR_ENABLED=0 kill switch.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["calendar_skipped"] = "calendar_skipped"
+    reason: Literal["scope_missing", "extraction_failed", "disabled"]
+    detail: str | None = None
+
+
 SideEffect = Annotated[
-    ExpenseLogged | ExpenseNeedsReview | AnalysisFailed,
+    ExpenseLogged
+    | ExpenseNeedsReview
+    | AnalysisFailed
+    | CalendarCreated
+    | CalendarDuplicate
+    | CalendarSkipped,
     Field(discriminator="kind"),
 ]

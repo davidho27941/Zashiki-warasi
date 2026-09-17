@@ -48,3 +48,34 @@ def build_trace_copy_markup(trace_id: str | None) -> dict | None:
             ]
         ]
     }
+
+
+_CALENDAR_BUTTON_LABEL = "🔗 View in Calendar"
+
+
+def build_notify_markup(
+    trace_id: str | None,
+    calendar_url: str | None = None,
+) -> dict | None:
+    """Compose the full inline_keyboard for a notify message.
+
+    v1.4 addition: when the notify follows a `calendar_sg` create, an
+    extra URL button jumps straight to the Google Calendar UI for that
+    event. The `📋 Copy trace ID` button (v1.3) sits **below** the
+    calendar button so the calendar-specific action is closer to the
+    thumb on mobile (per notifications spec).
+
+    Returns None only when BOTH buttons are unavailable (no trace + no
+    calendar url) — text-only message.
+    """
+    rows: list[list[dict]] = []
+    if calendar_url:
+        rows.append([{"text": _CALENDAR_BUTTON_LABEL, "url": calendar_url}])
+    trace_markup = build_trace_copy_markup(trace_id)
+    if trace_markup is not None:
+        # trace_markup itself is {"inline_keyboard": [[...]]} — grab
+        # its single row and append to ours to keep one flat list.
+        rows.extend(trace_markup["inline_keyboard"])
+    if not rows:
+        return None
+    return {"inline_keyboard": rows}

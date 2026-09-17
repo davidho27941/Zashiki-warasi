@@ -5,6 +5,119 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] — 2026-09-14
+
+Adds the **calendar vertical** — a fourth LangGraph subgraph
+(mirroring the expense pattern) that auto-creates **tentative**
+Google Calendar events when the classifier catches a meeting or
+event invitation (`會議邀請` / `講座資訊`). The Telegram alert
+gains a `🔗 View in Calendar` URL button alongside the v1.3
+`📋 Copy trace ID` button, and surfaces any time-slot conflicts
+found against the operator's primary calendar.
+
+**Never auto-RSVP.** All events created as `tentative` —
+operator confirms/declines in Google Calendar UI. This was an
+explicit operator-side design constraint.
+
+### Added
+
+- **`calendar-vertical` capability** — new `zashiki_warasi/agents/verticals/calendar.py`
+  subgraph (`CalendarSubgraph`) mirroring `ExpenseSubgraph`. Two-node
+  graph: `extract` → `create`. Triggered when `category ∈ {"會議邀請", "講座資訊"}`.
+- **`.ics`-first extraction** — `_ics_parser.py` uses the `icalendar`
+  Python library (RFC 5545 compliant) for deterministic parsing when
+  the email carries a `text/calendar` attachment. LLM fallback only
+  when no `.ics` present. Matches the anti-hallucination discipline
+  of the expense vertical: if `{title, start, end}` incomplete →
+  skip creation, log WARNING.
+- **`GoogleCalendarClient`** (`zashiki_warasi/calendar/client.py`)
+  wrapping Google Calendar API v3: `check_free_busy`,
+  `list_events_in_window`, `insert_event`. Error mapping to
+  `CalendarScopeNotGranted` (403), `iCalUidExists` (409, idempotent
+  no-op), `CalendarError` (other).
+- **Conflict detection** via `freebusy.query` before insert. Overlapping
+  events surface in **both** the Telegram alert body and the created
+  event's description — decision at both push-time and later Calendar
+  review time.
+- **`🔗 View in Calendar` URL button** — inline_keyboard row above
+  the v1.3 `📋 Copy trace ID` button, opens the tentative event in
+  Google Calendar UI for one-tap accept/decline.
+- **Idempotency via `iCalUID`** — dedup by `.ics` UID when present;
+  synthesized `zashiki-{message_id}@zashiki-warasi.local` otherwise.
+  Google returns 409 on duplicate → treated as no-op. Cross-email
+  dedup for free on forwarded/CC'd invites.
+- **`CalendarSettings`** — env-driven config with three keys:
+  `CALENDAR_ENABLED` (kill switch, default `1`), `CALENDAR_TIMEZONE`
+  (default `Asia/Taipei`), `CALENDAR_PRIMARY_ID` (default `primary`).
+- **`docs/calendar-vertical.md`** (+ `.zh.md`) — operator guide.
+- **Timezone discipline** — three-layered defense against tz mishaps
+  discovered during v1.4 shakedown against real invites (see the
+  archived openspec change's `spec.md` scenarios for the concrete
+  contract, and `tasks.md` §8.5-8.8 for the bug-hunt narrative):
+  (1) `events.insert` payload NEVER embeds a UTC offset in `dateTime`
+  — the sibling `timeZone` field is the placement authority;
+  (2) LLM-emitted `timezone_hint` values in `{UTC, Etc/UTC, GMT, Z}`
+  are rejected and fall back to the operator default (WARN logged)
+  — these are empirically LLM mislabeling of Taipei-local wall-clock
+  as UTC; (3) LLM-path drafts are force-stripped to naive (Pydantic
+  coerces trailing `Z` to UTC-aware, but the offset is a coercion
+  artifact, not a cross-zone signal). `.ics` path keeps tz-aware
+  datetimes since VTIMEZONE data is real. Every `events.insert`
+  now logs an INFO line with `iCalUID / summary / start.dateTime /
+  end.dateTime / timeZone` for future tz-mishap diagnosis without
+  re-probing Google.
+- **63 new unit tests** covering `.ics` parser, `GoogleCalendarClient`
+  (mocked API), `CalendarSubgraph` nodes, inline keyboard
+  composition, and the tz sanitizer + naive-force pipeline. Full
+  suite: 776 passed (was 713 pre-v1.4).
+
+### Changed
+
+- **OAuth scope extended** — `DEFAULT_SCOPES` in `core/config.py`
+  now includes `https://www.googleapis.com/auth/calendar` (full scope
+  — `calendar.events` alone doesn't cover freebusy.query which the
+  vertical needs for conflict detection)
+  alongside gmail.readonly. Operators upgrading from v1.3.x MUST run
+  `/reauth` once for the new scope to take effect; missing-scope
+  403s catch gracefully and log a WARNING once per pod lifetime,
+  degrading to v1.3 behavior (notify-only).
+- **Telegram notify template** — new `SideEffect` variants
+  (`CalendarCreated`, `CalendarDuplicate`, `CalendarSkipped`) get
+  their own formatter blocks; existing expense/analysis formatters
+  untouched.
+- **`build_notify_markup(trace_id, calendar_url)`** in
+  `notifications/_trace_markup.py` — v1.4 composer producing multi-row
+  `inline_keyboard`. `build_trace_copy_markup` (v1.3) still works,
+  used by the analysis-failed fallback path.
+- **Env parity**: `CALENDAR_ENABLED` / `CALENDAR_TIMEZONE` /
+  `CALENDAR_PRIMARY_ID` documented in both compose `.env.example`
+  and Helm `values.yaml`. `GMAIL_SCOPES` default line updated to
+  include the full calendar scope.
+
+### Backward compatibility
+
+- **App**: `CALENDAR_ENABLED=0` skips the vertical entirely →
+  identical v1.3 behavior. Even with the vertical on, missing
+  OAuth scope (unauth'd operator) degrades gracefully.
+- **Chart / deploy**: additive env keys, no template changes.
+- **Migration**: bump image tag → operator does one-time `/reauth`
+  → new calendar-worthy emails auto-create tentatives. Zero data
+  migration.
+
+### Dependencies
+
+- New: `icalendar>=6.0,<7`
+- Existing `google-api-python-client` reused for Calendar API v3.
+
+### Non-goals
+
+- Auto-RSVP (accept/decline via Telegram callback) — requires bot
+  polling/webhook, deferred.
+- Recurring event support beyond first occurrence.
+- Multi-calendar conflict check (primary only).
+- Attendee auto-invite as organizer.
+- Update-on-invitation-revision.
+
 ## [1.3.0] — 2026-09-12
 
 Adds a **📋 Copy trace ID** inline button to every Telegram

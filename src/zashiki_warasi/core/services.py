@@ -31,7 +31,9 @@ from zashiki_warasi.coordination.oauth_flow_store import (
     OAuthFlowStore,
     ensure_oauth_flows_table,
 )
+from zashiki_warasi.calendar.client import GoogleCalendarClient
 from zashiki_warasi.core.config import (
+    CalendarSettings,
     DatabaseSettings,
     GmailSettings,
     HttpSettings,
@@ -212,12 +214,35 @@ def build_services(
     )
 
     notion = _build_notion(notion_settings)
+
+    # v1.4 calendar-vertical: build the Google Calendar client if the
+    # kill switch is on (default). Uses the same OAuth credential as
+    # Gmail (both scopes live on one token; operator reauth'd once for
+    # both at v1.4 upgrade time). If construction fails for any reason
+    # (unlikely — same creds path as Gmail), the agent falls back to
+    # notify-only for calendar categories.
+    calendar_settings = CalendarSettings()
+    calendar_client: GoogleCalendarClient | None = None
+    if calendar_settings.enabled:
+        try:
+            calendar_client = GoogleCalendarClient(
+                credentials,
+                primary_calendar_id=calendar_settings.primary_calendar_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - defensive
+            logger.warning(
+                f"calendar client construction failed ({exc}); "
+                "calendar-vertical disabled for this session"
+            )
+
     agent = EmailAgent(
         checkpointer=checkpointer,
         session_factory=session_factory,
         notifier=notifier,
         client=gmail_client,
         notion=notion,
+        calendar_client=calendar_client,
+        calendar_settings=calendar_settings,
     )
     poller = Poller(
         client=gmail_client,

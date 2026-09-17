@@ -76,11 +76,22 @@ env:
   # Notion (leave commented to disable)
   # NOTION_TIMEOUT_SECONDS: "10"
   # NOTION_SYNC_INTERVAL_SECONDS: "300"
+  # Calendar vertical (v1.4). Requires reauth after v1.3.x upgrade to
+  # grant the calendar scope; missing-scope 403s degrade
+  # gracefully to notify-only. `CALENDAR_ENABLED=0` skips the vertical
+  # entirely (v1.3 behavior).
+  # CALENDAR_ENABLED: "1"
+  # CALENDAR_TIMEZONE: "Asia/Taipei"
+  # CALENDAR_PRIMARY_ID: "primary"
   # Gmail scopes / paths / tuning (all read via GmailSettings env_prefix=GMAIL_)
   GMAIL_CREDENTIALS_PATH: "/secrets/credentials.json"
   GMAIL_TOKEN_PATH: "/data/token.json"
   # GMAIL_HTTP_TIMEOUT_SECONDS: "60"
-  # GMAIL_SCOPES: "https://www.googleapis.com/auth/gmail.readonly"
+  # v1.4: `GMAIL_SCOPES` now includes the full `calendar` scope for
+  # the calendar-vertical (freebusy.query needs it — `calendar.events`
+  # alone doesn't cover freebusy). Operator MUST reauth via /reauth
+  # after v1.3.x → v1.4 upgrade to grant the new scope.
+  # GMAIL_SCOPES: "https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/calendar"
   # Checkpointer pool tuning (see db-connection-resilience spec).
   # Defaults are sized for a single-threaded homelab poller; raise
   # max_size for a chattier deployment.
