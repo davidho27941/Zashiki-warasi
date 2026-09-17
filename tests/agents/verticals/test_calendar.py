@@ -185,6 +185,60 @@ END:VCALENDAR
         assert out["extracted"] is None
         assert isinstance(out["side_effect"], CalendarSkipped)
 
+    def test_llm_stringified_null_title_skips_event(self, fake_email):
+        """LLM emits `"title": "null"` (str, not JSON null); Pydantic
+        accepts. Without coercion the payload's `summary` becomes
+        literal 'null' and Google either 400s or creates a trash
+        event named 'null'. Sanitizer must treat null-ish strings
+        as missing and skip."""
+        bad_draft = CalendarEventDraft(
+            title="null",
+            start=datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 9, 29, 13, 0, tzinfo=timezone.utc),
+            location="null",
+            ical_uid="null",
+            timezone_hint="null",
+        )
+        model = _build_model_returning(bad_draft)
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        out = sg._extract_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        assert out["extracted"] is None
+        assert isinstance(out["side_effect"], CalendarSkipped)
+        assert out["side_effect"].reason == "extraction_failed"
+        assert "null-ish title" in out["side_effect"].detail
+
+    def test_llm_null_optional_fields_coerced_to_none(self, fake_email):
+        """title populated but optional fields are literal `"null"` —
+        those should be coerced to real None so downstream payload
+        composition sees clean data."""
+        draft = CalendarEventDraft(
+            title="Real Talk",
+            start=datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 9, 29, 13, 0, tzinfo=timezone.utc),
+            location="null",
+            description="None",
+            ical_uid="undefined",
+            timezone_hint="null",
+        )
+        model = _build_model_returning(draft)
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        out = sg._extract_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        extracted = out["extracted"]
+        assert extracted is not None
+        assert extracted.title == "Real Talk"
+        assert extracted.location is None
+        assert extracted.description is None
+        assert extracted.ical_uid is None
+        assert extracted.timezone_hint is None
+
     def test_llm_utc_aware_draft_forced_to_naive(self, fake_email):
         """LLM emits `Z` on a wall-clock Taipei time → Pydantic makes
         it UTC-aware → our step MUST strip tzinfo so the payload
@@ -697,7 +751,7 @@ class TestSanitizeTzHint:
         # discarded value; empty string is silent (no LLM output).
         if bad_hint:
             assert any(
-                "rejecting UTC-like timezone_hint" in rec.message
+                "rejecting untrusted timezone_hint" in rec.message
                 and repr(bad_hint) in rec.message
                 for rec in caplog.records
             )
@@ -720,7 +774,31 @@ class TestSanitizeTzHint:
         assert out == "Asia/Taipei"
         # None is the normal "LLM omitted the field" case — no warn.
         assert not any(
-            "rejecting UTC-like" in rec.message for rec in caplog.records
+            "rejecting untrusted" in rec.message for rec in caplog.records
+        )
+
+    @pytest.mark.parametrize("bad_hint", ["null", "None", "NIL", "undefined", ""])
+    def test_llm_stringified_null_hints_fall_back(self, bad_hint, caplog):
+        """LLM emits literal `"null"` (str, not JSON null); Pydantic
+        accepts as str; without validation Google 400s with 'Invalid
+        time zone definition for start time.' Observed on the
+        Bio-protocol T-cell webinar smoke."""
+        import logging as _logging
+
+        from zashiki_warasi.agents.verticals.calendar import _sanitize_tz_hint
+
+        with caplog.at_level(_logging.WARNING):
+            out = _sanitize_tz_hint(bad_hint, default="Asia/Taipei")
+        assert out == "Asia/Taipei"
+
+    def test_unresolvable_zoneinfo_falls_back(self):
+        """A syntactically-valid but non-existent zone (`Middle-earth/Shire`)
+        must fall back — otherwise Google 400s on the payload."""
+        from zashiki_warasi.agents.verticals.calendar import _sanitize_tz_hint
+
+        assert (
+            _sanitize_tz_hint("Middle-earth/Shire", default="Asia/Taipei")
+            == "Asia/Taipei"
         )
 
     def test_end_to_end_llm_utc_hint_rejected_in_payload(self):

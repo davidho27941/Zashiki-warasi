@@ -358,6 +358,38 @@ class CalendarSubgraph:
                     }
                 )
 
+            # LLM sometimes emits literal `"null"` strings for optional
+            # fields (Pydantic accepts them; downstream `title == "null"`
+            # or `iCalUID == "null"` sinks into Google's payload).
+            # Coerce these to real None for optional fields; treat as
+            # extraction failure if the REQUIRED title is null-ish
+            # (start/end are datetime so this doesn't apply there).
+            title_coerced = _coerce_llm_nullish(draft.title)
+            if title_coerced is None:
+                log.warning(
+                    f"calendar: LLM returned null-ish title "
+                    f"({draft.title!r}); skipping event creation"
+                )
+                return {
+                    "extracted": None,
+                    "side_effect": CalendarSkipped(
+                        reason="extraction_failed",
+                        detail=(
+                            "LLM returned null-ish title "
+                            f"({draft.title!r})"
+                        ),
+                    ),
+                }
+            draft = draft.model_copy(
+                update={
+                    "title": title_coerced,
+                    "location": _coerce_llm_nullish(draft.location),
+                    "description": _coerce_llm_nullish(draft.description),
+                    "ical_uid": _coerce_llm_nullish(draft.ical_uid),
+                    "timezone_hint": _coerce_llm_nullish(draft.timezone_hint),
+                }
+            )
+
             log.info(
                 f"calendar: LLM extracted title={draft.title!r} "
                 f"start={draft.start.isoformat()}"
@@ -603,29 +635,56 @@ def _build_insert_payload(
 
 
 _UTC_LIKE_HINTS = frozenset({"utc", "etc/utc", "gmt", "z", ""})
+_LLM_NULLISH_STRINGS = frozenset({"null", "none", "nil", "undefined", ""})
 
 
 def _sanitize_tz_hint(hint: str | None, *, default: str) -> str:
-    """Reject UTC-like hints as LLM mislabeling; fall back to `default`.
+    """Return a VALIDATED IANA zone name; fall back on any of:
 
-    Empirical failure mode: the extractor LLM sees a wall-clock time
-    like "19:30" in a Taipei-authored email and stamps `timezone_hint`
-    as `"UTC"`, sending Google `timeZone: "UTC"` and placing the event
-    at UTC 19:30 (= 03:30 next day Taipei / 04:30 next day JST). We
-    reject the LLM-guess variants and let the operator's default apply
-    (`.ics` VTIMEZONE-derived UTC would be legitimate but rare enough
-    that reject-and-warn is safer than trust — spec covers this in
-    "LLM-emitted UTC-like hint is rejected").
+    - UTC-like guesses (`UTC`, `Etc/UTC`, `GMT`, `Z`) — see original
+      §8.6 rationale: LLMs mislabel Taipei-local wall-clock as UTC.
+    - LLM null-ish stringifications (`"null"`, `"None"`, `"nil"`,
+      `"undefined"`) — Pydantic accepts literal `"null"` as a str
+      when the LLM emits JSON `"timezone_hint": "null"` instead of
+      real JSON `null`; without validation this string reaches
+      Google's payload and 400s with "Invalid time zone definition".
+    - Unresolvable IANA names — `ZoneInfo(hint)` raises → fall back
+      rather than emit an invalid `timeZone` field.
+
+    Returns a string that ALWAYS parses as a `ZoneInfo`.
     """
-    if hint is None or hint.strip().lower() in _UTC_LIKE_HINTS:
-        if hint:
-            logger.warning(
-                f"calendar: rejecting UTC-like timezone_hint {hint!r}; "
-                f"falling back to operator default {default!r} "
-                "(LLM tz guess is untrusted for UTC/Etc/UTC/GMT/Z)"
-            )
+    if hint is None:
         return default
-    return hint
+    stripped = hint.strip()
+    lower = stripped.lower()
+    if lower in _UTC_LIKE_HINTS or lower in _LLM_NULLISH_STRINGS:
+        logger.warning(
+            f"calendar: rejecting untrusted timezone_hint {hint!r}; "
+            f"falling back to operator default {default!r} "
+            "(LLM-guess UTC-like or null-ish string)"
+        )
+        return default
+    try:
+        ZoneInfo(stripped)
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            f"calendar: unresolvable timezone_hint {hint!r}; "
+            f"falling back to operator default {default!r}"
+        )
+        return default
+    return stripped
+
+
+def _coerce_llm_nullish(value: str | None) -> str | None:
+    """LLM-string-null → real None. Pydantic accepts literal `"null"`
+    as a str; without this coercion those bogus values flow into
+    payload fields (title, summary, iCalUID) and either 400 at Google
+    or produce trash events named "null"."""
+    if value is None:
+        return None
+    if value.strip().lower() in _LLM_NULLISH_STRINGS:
+        return None
+    return value
 
 
 def _load_zone(name: str) -> ZoneInfo:
