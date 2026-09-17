@@ -69,3 +69,10 @@ scripts/
 # real values files live under deploy/ and are not affected.
 /alloy.yaml
 /loki.yaml
+
+# Helm deploy — cluster-specific overrides. Real cluster values (LAN IPs,
+# registry hostname, tokens) stay local; only `.example` templates ship
+# in git so operators can see the shape without leaking topology.
+deploy/helm/exports/
+deploy/helm/values.*.yaml
+!deploy/helm/values.*.yaml.example

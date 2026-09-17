@@ -1,0 +1,83 @@
+# values.<cluster>.yaml — template for a cluster-specific overrides file.
+#
+# **Copy me** to `deploy/helm/values.<cluster>.yaml` (e.g. `values.homelab.yaml`)
+# and fill in your topology. The real file is gitignored via
+# `deploy/helm/values.*.yaml` (with `!*.yaml.example` negation for this template);
+# secrets belong in a sibling `values.<cluster>.secrets.yaml` (also gitignored).
+#
+# Deploy:
+#
+#   helm upgrade zashiki -n zashiki deploy/helm/zashiki-warasi \
+#     -f deploy/helm/values.<cluster>.yaml \
+#     -f deploy/helm/values.<cluster>.secrets.yaml \
+#     --set image.tag=<semver-or-8char-sha>
+#
+# Fields NOT set here (kept at chart default; see deploy/helm/zashiki-warasi/values.yaml):
+#   image.pullPolicy: IfNotPresent
+#   persistence.enabled: true / size: 100Mi
+#   replicaCount: 1
+#   observability.dashboards.overview.enabled: true (once dashboards.enabled=true)
+#   observability.prometheusRule.alerts.*.enabled: true (starter bundle)
+
+# ---------- Non-secret env overrides ----------
+env:
+  # Local / self-hosted LLM (llama.cpp / vLLM / Ollama) reachable from the cluster.
+  # Example: http://192.168.x.x:8000/v1  OR  http://llama.svc.cluster.local:8000/v1
+  LLM_BASE_URL: http://<llm-host>:<llm-port>/v1
+
+  # JSON logs unlock trace_id / span_id → Grafana log→trace jump (v1.2+).
+  LOG_FORMAT: json
+
+  # Operator port-forwards svc/... 8080:8080 for OAuth callback; 127.0.0.1 is
+  # the standard here — no cluster specifics.
+  OAUTH_REDIRECT_URI: http://127.0.0.1:8080/auth/callback
+
+  # OTel exporter — direct-to-Tempo (no collector), per v1.1 D25.
+  # Adjust the service name / namespace if you deploy Tempo elsewhere.
+  OTEL_ENABLED: "1"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo.<observability-ns>.svc:4317
+
+# ---------- Image ----------
+image:
+  # Where the CI pushes the built image. GitLab built-in registry runs on
+  # port 5050 by default. For GHCR/Harbor/ECR/etc., use their conventional
+  # host + path shape.
+  repository: <registry-host>/<project-path>/zashiki-warasi
+  # image.tag is NOT set here — pass via `--set image.tag=<sha-or-semver>`
+  # at deploy time so a values-file change never becomes a deploy trigger.
+
+imagePullSecrets:
+  # Name of the k8s docker-registry Secret already created in the target
+  # namespace. See deploy/helm/zashiki-warasi/values.yaml for the
+  # `kubectl create secret docker-registry` recipe.
+  - name: <registry-pull-secret-name>
+
+# ---------- Observability opt-in ----------
+# Chart defaults are all OFF; flip on when kube-prometheus-stack (or the
+# Prometheus Operator + Grafana sidecar) is already installed in the cluster.
+observability:
+  serviceMonitor:
+    enabled: true
+    # If Prometheus is in a different namespace and its serviceMonitorSelector
+    # requires a specific `release` label:
+    # additionalLabels:
+    #   release: kube-prometheus-stack
+  prometheusRule:
+    enabled: true
+    # Same story — match your Prometheus CR's ruleSelector labels if needed.
+  dashboards:
+    enabled: true
+    # Grafana sidecar label if your kube-prom-stack uses a non-default one:
+    # sidecarLabel:
+    #   key: grafana_dashboard
+    #   value: "1"
+
+# ---------- Persistence ----------
+# Only set what you're overriding vs. the chart default (ReadWriteOnce,
+# empty storageClass, 100Mi). Uncomment as needed.
+persistence:
+  # Required if you want replicaCount > 1 spanning nodes (chart default
+  # RWO can only attach to one node at a time).
+  accessMode: ReadWriteMany
+  # Your cluster's RWX-capable storage class (Longhorn, NFS, CephFS, EFS...).
+  storageClass: <storage-class-name>
