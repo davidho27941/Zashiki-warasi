@@ -123,6 +123,16 @@ CALENDAR_EXTRACT_SYSTEM_PROMPT = """\
    - `start` 開始時間,**只包含日期時間、不含時區**:
      `YYYY-MM-DDTHH:MM:SS`(切勿加 `Z`、`+08:00` 或任何 offset 後綴)
    - `end` 結束時間,同 `start` 格式(不含時區)
+   - **關鍵反幻覺**:`end` **只能從信件實際文字提取** ——
+     信件必須明確提到結束時間 (e.g. "19:30-21:30")、時長 (e.g.
+     "for 60 minutes"、"90 分鐘會議") 或明確的活動類型時長描述。
+     **絕對不能**用先驗(「webinar 通常 1 小時」、「會議大概 30 分」、
+     「活動 2 小時」)幫忙湊 end。**只寫開始時間、沒寫結束/時長的
+     信件 → end 必回 null → 全部欄位回 null → 本封 skip**。
+     寧可漏建一個 event,不要建一個時長是猜的 event(operator
+     還是會收到 notify 通知,可以在 calendar UI 手動建立)。
+   - 反例:Bio-protocol T-cell webinar 信只寫 "9:00 AM PT starts" →
+     沒 end、沒時長 → 全欄位 null → skip;不要自作聰明填 10:00 AM PT。
 
 3. 選填欄位(信件未明確提及請回 null):
    - `location` 實體地點 (e.g.「台北市信義區信義路五段 7 號」、
