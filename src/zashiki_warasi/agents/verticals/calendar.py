@@ -453,11 +453,19 @@ class CalendarSubgraph:
             except CalendarScopeNotGranted as exc:
                 return self._degrade_scope_missing(log, str(exc))
             except CalendarError as exc:
-                log.warning(f"calendar: insert failed ({exc})")
+                # Same discipline as the LLM error path (§8.6): carry
+                # the underlying exception body so Google API responses
+                # (400/5xx bodies with reason strings) are diagnosable
+                # from pod logs + Telegram detail without re-running.
+                exc_body = str(exc)
+                if len(exc_body) > 512:
+                    exc_body = exc_body[:512] + "…"
+                short = f"insert error: {exc.__class__.__name__}: {exc_body}"
+                log.warning(f"calendar: insert failed ({short})")
                 return {
                     "side_effect": CalendarSkipped(
                         reason="extraction_failed",
-                        detail=f"insert error: {exc.__class__.__name__}",
+                        detail=short,
                     ),
                 }
 
