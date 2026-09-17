@@ -302,21 +302,23 @@ class CalendarSubgraph:
                         )
                     )
                 except Exception as exc:  # noqa: BLE001 - defensive
-                    # Truncate exc body at 512 chars — long enough for
-                    # OpenAI/llama.cpp BadRequest bodies (context-length
-                    # overflow, malformed prompt) but bounded against a
-                    # rogue traceback fragment. Class name kept as the
-                    # leading token for grep-ability and metric labels.
-                    exc_body = str(exc)
-                    if len(exc_body) > 512:
-                        exc_body = exc_body[:512] + "…"
-                    short = f"llm error: {exc.__class__.__name__}: {exc_body}"
-                    log.warning(f"calendar: LLM extraction failed ({short})")
+                    # Log gets the full exception body (bounded at 512
+                    # chars) for pod-log diagnosis; Telegram detail
+                    # gets a compact summary via `_summarize_exception`
+                    # so operators don't see Pydantic URLs / [type=...]
+                    # noise in their notifications.
+                    log_body = str(exc)
+                    if len(log_body) > 512:
+                        log_body = log_body[:512] + "…"
+                    log.warning(
+                        "calendar: LLM extraction failed "
+                        f"({exc.__class__.__name__}: {log_body})"
+                    )
                     return {
                         "extracted": None,
                         "side_effect": CalendarSkipped(
                             reason="extraction_failed",
-                            detail=short,
+                            detail=f"llm error: {_summarize_exception(exc)}",
                         ),
                     }
                 set_gen_ai_attributes(
@@ -485,19 +487,21 @@ class CalendarSubgraph:
             except CalendarScopeNotGranted as exc:
                 return self._degrade_scope_missing(log, str(exc))
             except CalendarError as exc:
-                # Same discipline as the LLM error path (§8.6): carry
-                # the underlying exception body so Google API responses
-                # (400/5xx bodies with reason strings) are diagnosable
-                # from pod logs + Telegram detail without re-running.
-                exc_body = str(exc)
-                if len(exc_body) > 512:
-                    exc_body = exc_body[:512] + "…"
-                short = f"insert error: {exc.__class__.__name__}: {exc_body}"
-                log.warning(f"calendar: insert failed ({short})")
+                # Log gets the full API response body (bounded 512
+                # chars); Telegram detail gets a compact summary so
+                # multi-line Google `errors[]` JSON doesn't crowd the
+                # notification.
+                log_body = str(exc)
+                if len(log_body) > 512:
+                    log_body = log_body[:512] + "…"
+                log.warning(
+                    "calendar: insert failed "
+                    f"({exc.__class__.__name__}: {log_body})"
+                )
                 return {
                     "side_effect": CalendarSkipped(
                         reason="extraction_failed",
-                        detail=short,
+                        detail=f"insert error: {_summarize_exception(exc)}",
                     ),
                 }
 
@@ -673,6 +677,44 @@ def _sanitize_tz_hint(hint: str | None, *, default: str) -> str:
         )
         return default
     return stripped
+
+
+def _summarize_exception(exc: Exception, *, limit: int = 200) -> str:
+    """Compact one-liner for Telegram-facing `CalendarSkipped.detail`.
+
+    The full `str(exc)` still lands in the pod log (bounded at 512
+    chars) for diagnosis. This helper trims it to a form fit for
+    a chat message:
+
+    - Pydantic `ValidationError` → `"<field-path>: <first-error-msg>
+      (and N more)"` — one line, no URLs, no `[type=...]` tags.
+    - Everything else → `str(exc)` with `"For further information
+      visit ..."` lines stripped and whitespace collapsed.
+
+    Always prefixed with `{exc.__class__.__name__}: ` so grep against
+    the type still works.
+    """
+    from pydantic import ValidationError as _PyDValErr  # local import — pydantic is already a hard dep
+
+    class_name = exc.__class__.__name__
+    if isinstance(exc, _PyDValErr):
+        errs = exc.errors()
+        if errs:
+            first = errs[0]
+            loc = ".".join(str(x) for x in first.get("loc", ()))
+            msg = first.get("msg", "").strip()
+            n = len(errs)
+            more = f" (and {n - 1} more)" if n > 1 else ""
+            summary = f"{loc}: {msg}{more}" if loc else f"{msg}{more}"
+        else:
+            summary = str(exc)
+    else:
+        summary = str(exc)
+    summary = re.sub(r"\s*For further information visit https?://\S+\s*", " ", summary)
+    summary = " ".join(summary.split())
+    if len(summary) > limit:
+        summary = summary[:limit] + "…"
+    return f"{class_name}: {summary}"
 
 
 def _coerce_llm_nullish(value: str | None) -> str | None:

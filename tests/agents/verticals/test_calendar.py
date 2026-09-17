@@ -452,6 +452,37 @@ class TestExtractLLMErrorSurface:
             for r in warn
         )
 
+    def test_pydantic_validation_error_summarized_cleanly(self):
+        """Real-world Bio-protocol shakedown surfaced a Pydantic
+        ValidationError with URL + [type=...] + newlines dumped into
+        Telegram. Summarizer must give a compact `loc: msg (and N more)`
+        form, no Pydantic doc URL, no whitespace churn."""
+        from pydantic import BaseModel
+        from pydantic import ValidationError
+
+        from zashiki_warasi.agents.verticals.calendar import (
+            _summarize_exception,
+        )
+
+        class _M(BaseModel):
+            start: datetime
+            end: datetime
+
+        try:
+            _M(start="0000-01-01T00:00:00-00:00", end="0000-01-01T00:00:00-00:00")
+        except ValidationError as exc:
+            summary = _summarize_exception(exc)
+
+        assert "ValidationError:" in summary
+        assert "start:" in summary
+        assert "year 0" in summary
+        assert "and 1 more" in summary  # 2 errors → and 1 more
+        # Cleanup expectations
+        assert "https://" not in summary
+        assert "\n" not in summary
+        assert "For further information" not in summary
+        assert len(summary) < 260
+
     def test_llm_exception_body_truncated_at_512(self):
         class FakeExc(Exception):
             pass
