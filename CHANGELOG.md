@@ -7,14 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] — 2026-09-23
+
 Follow-up refinement to v1.4's calendar vertical after real-world
 traffic showed the `講座資訊` classifier boundary was too broad —
 Coursera / Udemy / MOOC promos were routing into `calendar_sg` and
 wasting an LLM extraction call on bodies with no concrete event.
 Two-layer fix: tighten the classifier prompt (date+venue required),
 add a regex short-circuit in the extract node as a second line of
-defense. Also enriches the LLM-extraction-error log so future
-BadRequestErrors are diagnosable from pod logs alone.
+defense. Post-smoke rounds against a Bio-protocol T-cell webinar
+re-forward surfaced four more LLM-side blind spots (unsurfaced
+`insert error` bodies, stringified `"null"` fields reaching Google,
+noisy multi-line ValidationError dumps in Telegram, and duration
+hallucinations); each got its own commit within the same release.
 
 ### Changed
 
@@ -42,6 +47,42 @@ BadRequestErrors are diagnosable from pod logs alone.
 - **`no_event_signal` variant on `CalendarSkipped.reason`** — new
   literal for the pre-flight-skipped path; distinct notify wording
   (`內文無明確活動時間`) so operators can tell it from LLM-error skips.
+- **`_create_node` insert-error body enriched** — same discipline as
+  the extract-node path: the `except CalendarError` handler on
+  `events.insert` now surfaces `str(exc)[:512]` into both the log
+  and `CalendarSkipped.detail`, so `HttpError` bodies from Google
+  (400 "Invalid conference type", 400 "Invalid time zone definition",
+  5xx service messages) surface to operators without pod-log
+  archaeology.
+- **LLM stringified `"null"` handled + IANA name validated** — the
+  extractor now coerces literal string `"null"` / `"None"` / `"nil"`
+  / `"undefined"` / `""` from optional fields (`location`,
+  `description`, `ical_uid`, `timezone_hint`) to real `None` before
+  the draft leaves `_extract_node`. `_sanitize_tz_hint` additionally
+  rejects the null-ish set alongside the UTC-like family and
+  validates the hint via `ZoneInfo(hint)` — unresolvable IANA names
+  (e.g. `Middle-earth/Shire`) fall back to the operator default
+  instead of shipping to Google as `timeZone: "..."` and getting a
+  400 back. Null-ish `title` triggers a clean skip
+  (`extraction_failed`), matching the anti-hallucination discipline.
+- **Compact `_summarize_exception` for Telegram-facing detail** —
+  the pod log continues to carry the full 512-char body for
+  diagnosis, but `CalendarSkipped.detail` now routes through a
+  summarizer: Pydantic `ValidationError` renders as
+  `"<field-path>: <first-error-msg> (and N more)"` via `.errors()`;
+  generic exceptions get URL-stripped + whitespace-collapsed +
+  capped at 200 chars. No more `"For further information visit
+  https://errors.pydantic.dev/..."` boilerplate leaking into
+  Telegram alerts.
+- **LLM prompt guardrail: MUST NOT invent event duration** — the
+  `CALENDAR_EXTRACT_SYSTEM_PROMPT` § 2 now explicitly forbids
+  inferring duration from priors like `"webinar 通常 1 小時"` /
+  `"會議大概 30 分"`. An `end` value MUST come from actual body text
+  (`19:30-21:30`, `for 60 minutes`, `90 分鐘會議`); otherwise return
+  `null`, which cascades to full-null and a clean skip. Bio-protocol
+  webinar (`"9:00 AM PT starts"` alone) added as an explicit
+  anti-example after production traffic showed the model was
+  fabricating a 1-hour tail.
 
 ### Backward compatibility
 
