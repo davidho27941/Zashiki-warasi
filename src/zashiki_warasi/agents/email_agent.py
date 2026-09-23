@@ -51,6 +51,7 @@ from zashiki_warasi.notifications._trace_markup import (
 from zashiki_warasi.notifications.notion import NotionExpenseRecorder
 from zashiki_warasi.notifications.telegram import TelegramNotifier
 from zashiki_warasi.observability import (
+    graph_span,
     llm_calls_total,
     llm_latency_seconds,
 )
@@ -381,7 +382,7 @@ class EmailAgent:
 
     def _analyze(self, state: AgentState) -> dict:
         log = self._log(state)
-        with node_trace(log, "analyze"):
+        with node_trace(log, "analyze"), graph_span("analyze", "email") as gs:
             email = state["email"]
             # Body fallback chain: text/plain → HTML converted on
             # demand → Gmail snippet. Covers HTML-only mails (modern
@@ -435,6 +436,7 @@ class EmailAgent:
                     f"completion={usage.completion_tokens}"
                 )
                 log.warning(f"analyze: LLM hit token limit ({detail})")
+                gs.outcome = "error"
                 return {
                     "analysis": None,
                     "side_effect": AnalysisFailed(
@@ -453,6 +455,7 @@ class EmailAgent:
                 # Cheap forensics: raw error body at DEBUG so post-
                 # incident triage has the server's own wording.
                 log.debug(f"analyze: 400 body = {getattr(exc, 'body', None)}")
+                gs.outcome = "error"
                 return {
                     "analysis": None,
                     "side_effect": AnalysisFailed(
@@ -500,7 +503,7 @@ class EmailAgent:
 
     def _notify(self, state: AgentState) -> dict:
         log = self._log(state)
-        with node_trace(log, "notify"):
+        with node_trace(log, "notify"), graph_span("notify", "email") as gs:
             analysis = state["analysis"]
             side_effect = state.get("side_effect")
             markup = _current_trace_copy_markup()
@@ -518,6 +521,7 @@ class EmailAgent:
                     log.info("notified user of analyze failure")
                     return {}
                 log.warning("notify: skipping — no analysis")
+                gs.outcome = "skipped"
                 return {}
             text = _format_message(state["email"], analysis, side_effect)
             # v1.4: when the side_effect is a CalendarCreated, add a
