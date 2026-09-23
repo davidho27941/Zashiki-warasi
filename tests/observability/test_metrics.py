@@ -46,6 +46,11 @@ class TestContract:
         "zashiki_oauth_token_expires_in_seconds",
         "zashiki_healthz_status",
         "zashiki_traces_dropped",
+        # v1.5.0 graph-node latency families
+        "zashiki_graph_node_duration_seconds",
+        "zashiki_llm_call_duration_seconds",
+        "zashiki_external_api_duration_seconds",
+        "zashiki_email_end_to_end_duration_seconds",
     }
 
     def test_all_contracted_zashiki_families_present(self):
@@ -100,7 +105,18 @@ class TestForbiddenLabelGuard:
         # Explicit allow-list of labels we DO use in the contract.
         _assert_no_forbidden_labels(
             "zashiki_ok",
-            ("operation", "outcome", "node", "reason"),
+            (
+                "operation",
+                "outcome",
+                "node",
+                "reason",
+                # v1.5.0 additions
+                "vertical",
+                "service",
+                "purpose",
+                "category",
+                "model",
+            ),
         )
 
 

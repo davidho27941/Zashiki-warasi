@@ -95,10 +95,28 @@ def _gauge(name: str, doc: str, labelnames: tuple[str, ...] = ()) -> Gauge:
 
 
 def _histogram(
-    name: str, doc: str, labelnames: tuple[str, ...] = ()
+    name: str,
+    doc: str,
+    labelnames: tuple[str, ...] = (),
+    *,
+    buckets: tuple[float, ...] | None = None,
 ) -> Histogram:
     _assert_no_forbidden_labels(name, labelnames)
-    return Histogram(name, doc, labelnames=labelnames, registry=REGISTRY)
+    kwargs: dict = {"labelnames": labelnames, "registry": REGISTRY}
+    if buckets is not None:
+        kwargs["buckets"] = buckets
+    return Histogram(name, doc, **kwargs)
+
+
+# Wide-range buckets for graph-node / LLM / external-API / end-to-end
+# latency families (v1.5.0 add-graph-node-latency-observability). The
+# range covers node-level fast paths (sub-100ms skips), slow LLM calls
+# (10s+), and end-to-end latency including poll-interval contribution
+# (up to 5 minutes). Bucket set is PINNED by spec — changing it is a
+# breaking change for downstream dashboards that use `histogram_quantile`.
+_GRAPH_LATENCY_BUCKETS: tuple[float, ...] = (
+    0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 300.0,
+)
 
 
 # --- Business metrics contract (see specs/observability/spec.md) ---
@@ -201,6 +219,63 @@ traces_dropped_total: Counter = _counter(
     "Cumulative count of spans the OTel BatchSpanProcessor could not "
     "export. Non-zero indicates trace data loss.",
     labelnames=("reason",),
+)
+
+
+# --- Graph-node latency contract (v1.5.0 add-graph-node-latency-observability) ---
+#
+# One observation per LangGraph node execution + one per LLM invocation
+# + one per outbound Google/Telegram HTTP call + one per completed
+# email pipeline at _notify. Bucket set is the pinned wide-range set
+# above. Label vocabularies are BOUNDED — see the observability spec
+# for the enumerated values. Emission is via the `graph_span` /
+# `llm_call` / `api_call` context managers in `observability/spans.py`;
+# call sites SHOULD NOT `.labels(...).observe(...)` these directly.
+
+graph_node_duration_seconds: Histogram = _histogram(
+    "zashiki_graph_node_duration_seconds",
+    "Wall-clock time spent inside one LangGraph node execution. "
+    "`node` ∈ {analyze, extract, freebusy, create, dedup_check, notify, "
+    "persist}; `vertical` ∈ {email, calendar_sg, expense_sg, notify_only}; "
+    "`outcome` ∈ {success, skipped, error}.",
+    labelnames=("node", "vertical", "outcome"),
+    buckets=_GRAPH_LATENCY_BUCKETS,
+)
+
+llm_call_duration_seconds: Histogram = _histogram(
+    "zashiki_llm_call_duration_seconds",
+    "Wall-clock time of a single LLM invocation, split by usage "
+    "purpose so contention across concurrent verticals is visible. "
+    "`purpose` ∈ {classify, calendar_extract, expense_extract, "
+    "subject_translation, body_summary}; `model` is the enumerated "
+    "LLM_MODEL_ID at boot. Parallel to the older node-labelled "
+    "`zashiki_llm_latency_seconds` — that one stays for pre-v1.5.0 "
+    "dashboards; this one is the v1.5.0 breakdown.",
+    labelnames=("purpose", "model"),
+    buckets=_GRAPH_LATENCY_BUCKETS,
+)
+
+external_api_duration_seconds: Histogram = _histogram(
+    "zashiki_external_api_duration_seconds",
+    "Wall-clock time of one outbound Google / Telegram HTTP call. "
+    "`service` ∈ {gmail, calendar, telegram}; `operation` is the API "
+    "method name (list, get, insert, patch, send_message, ...). "
+    "Separated from `zashiki_llm_call_duration_seconds` so the API "
+    "budget vs the LLM budget can be tracked independently.",
+    labelnames=("service", "operation"),
+    buckets=_GRAPH_LATENCY_BUCKETS,
+)
+
+email_end_to_end_duration_seconds: Histogram = _histogram(
+    "zashiki_email_end_to_end_duration_seconds",
+    "Wall-clock latency from Gmail `internalDate` to Telegram-send "
+    "completion, observed once per email at `_notify` completion. "
+    "Includes poll-interval contribution — this is the "
+    "operator-visible latency, not the processing-only slice. "
+    "`category` is the analyze result's category (or `unknown` when "
+    "analyze failed); `outcome` ∈ {success, skipped, error}.",
+    labelnames=("category", "outcome"),
+    buckets=_GRAPH_LATENCY_BUCKETS,
 )
 
 
