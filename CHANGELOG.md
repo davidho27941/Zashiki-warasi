@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Follow-up refinement to v1.4's calendar vertical after real-world
+traffic showed the `講座資訊` classifier boundary was too broad —
+Coursera / Udemy / MOOC promos were routing into `calendar_sg` and
+wasting an LLM extraction call on bodies with no concrete event.
+Two-layer fix: tighten the classifier prompt (date+venue required),
+add a regex short-circuit in the extract node as a second line of
+defense. Also enriches the LLM-extraction-error log so future
+BadRequestErrors are diagnosable from pod logs alone.
+
+### Changed
+
+- **`講座資訊` classifier boundary tightened** — the analyze system
+  prompt's category rules now require BOTH a concrete event date/time
+  AND a specific place or online-meeting link for `講座資訊`. Course
+  recommendations (Coursera / Udemy / MOOC newsletters) without cohort
+  dates route to `廣告` instead. Positive example (GDG monthly event
+  with date + venue) + negative example (Coursera "Recommended: ..."
+  promo) added to the prompt as anchors.
+- **`calendar_sg` extract short-circuit** — even when routing
+  miscategorizes, the extract node runs a lightweight regex pre-flight
+  on `subject + body` before invoking the LLM. Bodies with no date/time
+  pattern (`YYYY-MM-DD`, `M/D`, `HH:MM`, weekday names in en/zh,
+  Chinese time markers 上午/下午/晚上) return
+  `CalendarSkipped(reason="no_event_signal")` immediately — no LLM
+  call, no red-herring "行事曆事件未建立" pipeline. `.ics` attachments
+  bypass the short-circuit (structured data is inherently event-signaled).
+- **LLM extraction error surface** — `_extract_node`'s exception log
+  now includes `str(exc)[:512]` alongside the class name, so
+  BadRequestError et al. reveal their underlying cause (context-length
+  overflow, malformed prompt, upstream outage) without needing to
+  reproduce. `CalendarSkipped(reason="extraction_failed").detail`
+  carries the same short-form body for downstream visibility.
+- **`no_event_signal` variant on `CalendarSkipped.reason`** — new
+  literal for the pre-flight-skipped path; distinct notify wording
+  (`內文無明確活動時間`) so operators can tell it from LLM-error skips.
+
+### Backward compatibility
+
+- App: pure prompt / code refinement. No env, schema, or OAuth changes.
+- No migration needed — the classifier's new boundary takes effect
+  on the next image bump; already-created tentative events are
+  untouched.
+
 ## [1.4.0] — 2026-09-14
 
 Adds the **calendar vertical** — a fourth LangGraph subgraph

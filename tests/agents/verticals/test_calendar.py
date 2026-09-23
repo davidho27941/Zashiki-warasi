@@ -55,7 +55,7 @@ def fake_email_with_ics() -> EmailMessage:
         history_id=100,
         from_address="invite@example.com",
         subject="會議邀請",
-        body_plain="See attached invite.",
+        body_plain="See attached invite for 2026-09-15 14:00.",
         received_at=datetime(2026, 9, 12, 10, 0, tzinfo=timezone.utc),
         attachments=[
             AttachmentMeta(
@@ -185,6 +185,60 @@ END:VCALENDAR
         assert out["extracted"] is None
         assert isinstance(out["side_effect"], CalendarSkipped)
 
+    def test_llm_stringified_null_title_skips_event(self, fake_email):
+        """LLM emits `"title": "null"` (str, not JSON null); Pydantic
+        accepts. Without coercion the payload's `summary` becomes
+        literal 'null' and Google either 400s or creates a trash
+        event named 'null'. Sanitizer must treat null-ish strings
+        as missing and skip."""
+        bad_draft = CalendarEventDraft(
+            title="null",
+            start=datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 9, 29, 13, 0, tzinfo=timezone.utc),
+            location="null",
+            ical_uid="null",
+            timezone_hint="null",
+        )
+        model = _build_model_returning(bad_draft)
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        out = sg._extract_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        assert out["extracted"] is None
+        assert isinstance(out["side_effect"], CalendarSkipped)
+        assert out["side_effect"].reason == "extraction_failed"
+        assert "null-ish title" in out["side_effect"].detail
+
+    def test_llm_null_optional_fields_coerced_to_none(self, fake_email):
+        """title populated but optional fields are literal `"null"` —
+        those should be coerced to real None so downstream payload
+        composition sees clean data."""
+        draft = CalendarEventDraft(
+            title="Real Talk",
+            start=datetime(2026, 9, 29, 12, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 9, 29, 13, 0, tzinfo=timezone.utc),
+            location="null",
+            description="None",
+            ical_uid="undefined",
+            timezone_hint="null",
+        )
+        model = _build_model_returning(draft)
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        out = sg._extract_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        extracted = out["extracted"]
+        assert extracted is not None
+        assert extracted.title == "Real Talk"
+        assert extracted.location is None
+        assert extracted.description is None
+        assert extracted.ical_uid is None
+        assert extracted.timezone_hint is None
+
     def test_llm_utc_aware_draft_forced_to_naive(self, fake_email):
         """LLM emits `Z` on a wall-clock Taipei time → Pydantic makes
         it UTC-aware → our step MUST strip tzinfo so the payload
@@ -231,6 +285,225 @@ END:VCALENDAR
         # `.ics` path preserves tz-aware — the payload builder handles
         # the cross-zone astimezone at insert time.
         assert extracted.start.tzinfo is not None
+
+
+# ---------- _extract_node short-circuit + LLM error surfacing -----------
+
+
+class TestExtractShortCircuit:
+    """§8.6 / v1.4.1: pre-LLM guard when body has no date/time signal.
+
+    Second line of defense behind the classifier's `講座資訊` boundary —
+    catches residual noise (Coursera promos, MOOC recommendations)
+    without paying for an LLM call.
+    """
+
+    def _coursera_email(self) -> EmailMessage:
+        return EmailMessage(
+            id="msg-coursera",
+            thread_id="t",
+            history_id=101,
+            from_address="Coursera@m.learn.coursera.org",
+            subject="Recommended: Build Batch Data Pipelines on Google Cloud",
+            body_plain=(
+                "Explore courses recommended for you. Dataflow, Kafka, "
+                "Databricks and IBM ETL fundamentals — all self-paced. "
+                "Enroll anytime; no cohort dates."
+            ),
+            received_at=datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc),
+            attachments=[],
+        )
+
+    def _email_with(self, body: str, subject: str = "邀請") -> EmailMessage:
+        return EmailMessage(
+            id="msg-x",
+            thread_id="t",
+            history_id=102,
+            from_address="x@example.com",
+            subject=subject,
+            body_plain=body,
+            received_at=datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc),
+            attachments=[],
+        )
+
+    def test_no_date_signal_short_circuits_llm_not_called(self):
+        model = _build_model_returning(_draft())
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        out = sg._extract_node({
+            "email": self._coursera_email(),
+            "analysis": None,
+            "side_effect": None,
+            "extracted": None,
+        })
+        assert out["extracted"] is None
+        assert isinstance(out["side_effect"], CalendarSkipped)
+        assert out["side_effect"].reason == "no_event_signal"
+        model.with_structured_output.return_value.invoke.assert_not_called()
+
+    def test_numeric_date_9_17_passes_through_to_llm(self):
+        model = _build_model_returning(_draft())
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        email = self._email_with("邀請你來活動,9/17 19:30 見。")
+        out = sg._extract_node({
+            "email": email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        assert out["extracted"] is not None
+        model.with_structured_output.return_value.invoke.assert_called_once()
+
+    def test_english_weekday_time_passes_through_to_llm(self):
+        model = _build_model_returning(_draft())
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        email = self._email_with("Talk on Friday 2:00pm at HQ")
+        out = sg._extract_node({
+            "email": email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        assert out["extracted"] is not None
+        model.with_structured_output.return_value.invoke.assert_called_once()
+
+    def test_chinese_weekday_passes_through_to_llm(self):
+        model = _build_model_returning(_draft())
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        email = self._email_with("週三下午 3 點在會議室 A 見。")
+        out = sg._extract_node({
+            "email": email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        assert out["extracted"] is not None
+        model.with_structured_output.return_value.invoke.assert_called_once()
+
+    def test_ics_bypasses_short_circuit(self, fake_email_with_ics):
+        """.ics attachment always wins — no short-circuit consideration."""
+        ics_bytes = (
+            b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\n"
+            b"UID:ics-real@example.com\r\n"
+            b"DTSTART;TZID=Asia/Taipei:20260915T140000\r\n"
+            b"DTEND;TZID=Asia/Taipei:20260915T150000\r\n"
+            b"SUMMARY:Real Meeting\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+        )
+        # Override body_plain to have NO date signal — ics should still win.
+        email = fake_email_with_ics.model_copy(
+            update={"body_plain": "See attached."}
+        )
+        model = _build_model_returning(None)
+        sg = _sg(model, _mock_gmail_client_returning_ics(ics_bytes), _mock_calendar_client())
+
+        out = sg._extract_node({
+            "email": email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        assert out["extracted"] is not None
+        assert out["extracted"].title == "Real Meeting"
+        model.with_structured_output.return_value.invoke.assert_not_called()
+
+
+class TestExtractLLMErrorSurface:
+    """§8.6 / v1.4.1: LLM extraction failure logs carry `str(exc)`,
+    not just the class name — makes BadRequestError diagnosable from
+    pod logs without re-running.
+    """
+
+    def _email_with_date(self) -> EmailMessage:
+        return EmailMessage(
+            id="msg-llmerr",
+            thread_id="t",
+            history_id=103,
+            from_address="x@example.com",
+            subject="邀請",
+            body_plain="2026-09-17 19:30 在會場 A。",
+            received_at=datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc),
+            attachments=[],
+        )
+
+    def test_llm_exception_body_lands_in_log_and_detail(self, caplog):
+        import logging as _logging
+
+        class FakeBadRequest(Exception):
+            pass
+
+        model = MagicMock(name="chat_model")
+        structured = MagicMock(name="structured")
+        structured.invoke.side_effect = FakeBadRequest(
+            "context length exceeded: 8192 > 4096 tokens"
+        )
+        model.with_structured_output.return_value = structured
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        with caplog.at_level(_logging.WARNING):
+            out = sg._extract_node({
+                "email": self._email_with_date(),
+                "analysis": None, "side_effect": None, "extracted": None,
+            })
+
+        assert isinstance(out["side_effect"], CalendarSkipped)
+        assert out["side_effect"].reason == "extraction_failed"
+        # Class name AND body BOTH present in detail
+        assert "FakeBadRequest" in out["side_effect"].detail
+        assert "context length exceeded" in out["side_effect"].detail
+        # WARNING log carries the same
+        warn = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "FakeBadRequest" in r.message and "context length" in r.message
+            for r in warn
+        )
+
+    def test_pydantic_validation_error_summarized_cleanly(self):
+        """Real-world Bio-protocol shakedown surfaced a Pydantic
+        ValidationError with URL + [type=...] + newlines dumped into
+        Telegram. Summarizer must give a compact `loc: msg (and N more)`
+        form, no Pydantic doc URL, no whitespace churn."""
+        from pydantic import BaseModel
+        from pydantic import ValidationError
+
+        from zashiki_warasi.agents.verticals.calendar import (
+            _summarize_exception,
+        )
+
+        class _M(BaseModel):
+            start: datetime
+            end: datetime
+
+        try:
+            _M(start="0000-01-01T00:00:00-00:00", end="0000-01-01T00:00:00-00:00")
+        except ValidationError as exc:
+            summary = _summarize_exception(exc)
+
+        assert "ValidationError:" in summary
+        assert "start:" in summary
+        assert "year 0" in summary
+        assert "and 1 more" in summary  # 2 errors → and 1 more
+        # Cleanup expectations
+        assert "https://" not in summary
+        assert "\n" not in summary
+        assert "For further information" not in summary
+        assert len(summary) < 260
+
+    def test_llm_exception_body_truncated_at_512(self):
+        class FakeExc(Exception):
+            pass
+
+        long_msg = "x" * 1000  # 1000 > 512
+        model = MagicMock(name="chat_model")
+        structured = MagicMock(name="structured")
+        structured.invoke.side_effect = FakeExc(long_msg)
+        model.with_structured_output.return_value = structured
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        out = sg._extract_node({
+            "email": self._email_with_date(),
+            "analysis": None, "side_effect": None, "extracted": None,
+        })
+        detail = out["side_effect"].detail
+        assert detail.endswith("…")
+        # Class-name prefix + truncated body + ellipsis marker; length
+        # bounded (well under original 1000).
+        assert len(detail) < 600
+        assert "FakeExc" in detail
 
 
 # ---------- _create_node ------------------------------------------------
@@ -509,7 +782,7 @@ class TestSanitizeTzHint:
         # discarded value; empty string is silent (no LLM output).
         if bad_hint:
             assert any(
-                "rejecting UTC-like timezone_hint" in rec.message
+                "rejecting untrusted timezone_hint" in rec.message
                 and repr(bad_hint) in rec.message
                 for rec in caplog.records
             )
@@ -532,7 +805,31 @@ class TestSanitizeTzHint:
         assert out == "Asia/Taipei"
         # None is the normal "LLM omitted the field" case — no warn.
         assert not any(
-            "rejecting UTC-like" in rec.message for rec in caplog.records
+            "rejecting untrusted" in rec.message for rec in caplog.records
+        )
+
+    @pytest.mark.parametrize("bad_hint", ["null", "None", "NIL", "undefined", ""])
+    def test_llm_stringified_null_hints_fall_back(self, bad_hint, caplog):
+        """LLM emits literal `"null"` (str, not JSON null); Pydantic
+        accepts as str; without validation Google 400s with 'Invalid
+        time zone definition for start time.' Observed on the
+        Bio-protocol T-cell webinar smoke."""
+        import logging as _logging
+
+        from zashiki_warasi.agents.verticals.calendar import _sanitize_tz_hint
+
+        with caplog.at_level(_logging.WARNING):
+            out = _sanitize_tz_hint(bad_hint, default="Asia/Taipei")
+        assert out == "Asia/Taipei"
+
+    def test_unresolvable_zoneinfo_falls_back(self):
+        """A syntactically-valid but non-existent zone (`Middle-earth/Shire`)
+        must fall back — otherwise Google 400s on the payload."""
+        from zashiki_warasi.agents.verticals.calendar import _sanitize_tz_hint
+
+        assert (
+            _sanitize_tz_hint("Middle-earth/Shire", default="Asia/Taipei")
+            == "Asia/Taipei"
         )
 
     def test_end_to_end_llm_utc_hint_rejected_in_payload(self):

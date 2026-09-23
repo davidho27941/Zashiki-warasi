@@ -19,6 +19,7 @@ degrades gracefully to notify (design D4).
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import TypedDict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -60,6 +61,54 @@ logger = logging.getLogger(__name__)
 CALENDAR_ICS_MIME = "text/calendar"
 
 
+# Second line of defense behind the classifier's `講座資訊` definition:
+# if the concatenated subject+body carries NONE of these patterns, the
+# email almost certainly has no concrete event to extract, and the LLM
+# call is wasted. See `_looks_like_event_body`.
+#
+# Deliberately conservative — an email with a stray date phrase (policy
+# expiry, "for the year 2026", etc.) still passes through to LLM,
+# keeping legit event invitations reachable. Missing on the short-circuit
+# is preferable to false-negatives on real invites.
+_EVENT_SIGNAL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Numeric dates: 2026-09-17, 2026/9/17, 2026年9月17日, 9/17, 9-17
+    re.compile(r"\d{4}[-/年]\s?\d{1,2}[-/月]\s?\d{1,2}"),
+    re.compile(r"\d{1,2}[月/-]\s?\d{1,2}[日號]"),
+    re.compile(r"\d{4}-\d{2}-\d{2}"),
+    # English month names (Jan-Dec) and weekday names.
+    re.compile(
+        r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
+        r"(uary|ruary|ch|il|e|y|ust|tember|ober|ember)?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
+        r"(day|sday|nesday|rsday|urday)?\b",
+        re.IGNORECASE,
+    ),
+    # Chinese weekday: 星期一~日, 週一~日
+    re.compile(r"(星期|週)[一二三四五六日天]"),
+    # Time-of-day: 19:30, 19:30, 7pm, 7:00 AM
+    re.compile(r"\d{1,2}[:：]\d{2}"),
+    re.compile(r"\d{1,2}\s?(am|pm|AM|PM|a\.m\.|p\.m\.)", re.IGNORECASE),
+    # Chinese time markers: 上午/下午/早上/晚上/中午 + digit
+    re.compile(r"(上午|下午|早上|晚上|中午)\s?\d{1,2}"),
+)
+
+
+def _looks_like_event_body(subject: str, body: str) -> bool:
+    """True if any date/time pattern matches subject+body; False otherwise.
+
+    Case-insensitive per each pattern's own flags. Used by the
+    extract-node short-circuit — a False here means "skip the LLM
+    call, no concrete event here." Missing legit invitations is
+    acceptable (fallback still routes to notify); false positives
+    are cheap (just an extra LLM call).
+    """
+    haystack = f"{subject}\n{body}"
+    return any(p.search(haystack) for p in _EVENT_SIGNAL_PATTERNS)
+
+
 CALENDAR_EXTRACT_SYSTEM_PROMPT = """\
 你是行事曆事件擷取助理。閱讀使用者提供的電子郵件(可能包含會議 /
 講座 / 活動邀請),把結構化欄位輸出出來。若沒有 .ics 附件,你就是
@@ -74,6 +123,16 @@ CALENDAR_EXTRACT_SYSTEM_PROMPT = """\
    - `start` 開始時間,**只包含日期時間、不含時區**:
      `YYYY-MM-DDTHH:MM:SS`(切勿加 `Z`、`+08:00` 或任何 offset 後綴)
    - `end` 結束時間,同 `start` 格式(不含時區)
+   - **關鍵反幻覺**:`end` **只能從信件實際文字提取** ——
+     信件必須明確提到結束時間 (e.g. "19:30-21:30")、時長 (e.g.
+     "for 60 minutes"、"90 分鐘會議") 或明確的活動類型時長描述。
+     **絕對不能**用先驗(「webinar 通常 1 小時」、「會議大概 30 分」、
+     「活動 2 小時」)幫忙湊 end。**只寫開始時間、沒寫結束/時長的
+     信件 → end 必回 null → 全部欄位回 null → 本封 skip**。
+     寧可漏建一個 event,不要建一個時長是猜的 event(operator
+     還是會收到 notify 通知,可以在 calendar UI 手動建立)。
+   - 反例:Bio-protocol T-cell webinar 信只寫 "9:00 AM PT starts" →
+     沒 end、沒時長 → 全欄位 null → skip;不要自作聰明填 10:00 AM PT。
 
 3. 選填欄位(信件未明確提及請回 null):
    - `location` 實體地點 (e.g.「台北市信義區信義路五段 7 號」、
@@ -207,6 +266,23 @@ class CalendarSubgraph:
                     ),
                 }
 
+            # Pre-flight: if the concatenated subject+body carries no
+            # date/time signal, this is almost certainly a course promo,
+            # MOOC newsletter, or marketing email that miscategorized
+            # into 講座資訊. Skip the LLM call, save the round-trip and
+            # its associated error surface. See design D2.
+            if not _looks_like_event_body(email.subject, body):
+                log.info(
+                    "calendar: no event-signal in body, skipping LLM extraction"
+                )
+                return {
+                    "extracted": None,
+                    "side_effect": CalendarSkipped(
+                        reason="no_event_signal",
+                        detail="body has no date/time patterns",
+                    ),
+                }
+
             user_prompt = (
                 f"From: {email.from_address}\n"
                 f"Subject: {email.subject}\n"
@@ -236,15 +312,23 @@ class CalendarSubgraph:
                         )
                     )
                 except Exception as exc:  # noqa: BLE001 - defensive
+                    # Log gets the full exception body (bounded at 512
+                    # chars) for pod-log diagnosis; Telegram detail
+                    # gets a compact summary via `_summarize_exception`
+                    # so operators don't see Pydantic URLs / [type=...]
+                    # noise in their notifications.
+                    log_body = str(exc)
+                    if len(log_body) > 512:
+                        log_body = log_body[:512] + "…"
                     log.warning(
-                        f"calendar: LLM extraction failed ({exc}); "
-                        "falling through to no event"
+                        "calendar: LLM extraction failed "
+                        f"({exc.__class__.__name__}: {log_body})"
                     )
                     return {
                         "extracted": None,
                         "side_effect": CalendarSkipped(
                             reason="extraction_failed",
-                            detail=f"llm error: {exc.__class__.__name__}",
+                            detail=f"llm error: {_summarize_exception(exc)}",
                         ),
                     }
                 set_gen_ai_attributes(
@@ -285,6 +369,38 @@ class CalendarSubgraph:
                         "end": draft.end.replace(tzinfo=None),
                     }
                 )
+
+            # LLM sometimes emits literal `"null"` strings for optional
+            # fields (Pydantic accepts them; downstream `title == "null"`
+            # or `iCalUID == "null"` sinks into Google's payload).
+            # Coerce these to real None for optional fields; treat as
+            # extraction failure if the REQUIRED title is null-ish
+            # (start/end are datetime so this doesn't apply there).
+            title_coerced = _coerce_llm_nullish(draft.title)
+            if title_coerced is None:
+                log.warning(
+                    f"calendar: LLM returned null-ish title "
+                    f"({draft.title!r}); skipping event creation"
+                )
+                return {
+                    "extracted": None,
+                    "side_effect": CalendarSkipped(
+                        reason="extraction_failed",
+                        detail=(
+                            "LLM returned null-ish title "
+                            f"({draft.title!r})"
+                        ),
+                    ),
+                }
+            draft = draft.model_copy(
+                update={
+                    "title": title_coerced,
+                    "location": _coerce_llm_nullish(draft.location),
+                    "description": _coerce_llm_nullish(draft.description),
+                    "ical_uid": _coerce_llm_nullish(draft.ical_uid),
+                    "timezone_hint": _coerce_llm_nullish(draft.timezone_hint),
+                }
+            )
 
             log.info(
                 f"calendar: LLM extracted title={draft.title!r} "
@@ -381,11 +497,21 @@ class CalendarSubgraph:
             except CalendarScopeNotGranted as exc:
                 return self._degrade_scope_missing(log, str(exc))
             except CalendarError as exc:
-                log.warning(f"calendar: insert failed ({exc})")
+                # Log gets the full API response body (bounded 512
+                # chars); Telegram detail gets a compact summary so
+                # multi-line Google `errors[]` JSON doesn't crowd the
+                # notification.
+                log_body = str(exc)
+                if len(log_body) > 512:
+                    log_body = log_body[:512] + "…"
+                log.warning(
+                    "calendar: insert failed "
+                    f"({exc.__class__.__name__}: {log_body})"
+                )
                 return {
                     "side_effect": CalendarSkipped(
                         reason="extraction_failed",
-                        detail=f"insert error: {exc.__class__.__name__}",
+                        detail=f"insert error: {_summarize_exception(exc)}",
                     ),
                 }
 
@@ -523,29 +649,94 @@ def _build_insert_payload(
 
 
 _UTC_LIKE_HINTS = frozenset({"utc", "etc/utc", "gmt", "z", ""})
+_LLM_NULLISH_STRINGS = frozenset({"null", "none", "nil", "undefined", ""})
 
 
 def _sanitize_tz_hint(hint: str | None, *, default: str) -> str:
-    """Reject UTC-like hints as LLM mislabeling; fall back to `default`.
+    """Return a VALIDATED IANA zone name; fall back on any of:
 
-    Empirical failure mode: the extractor LLM sees a wall-clock time
-    like "19:30" in a Taipei-authored email and stamps `timezone_hint`
-    as `"UTC"`, sending Google `timeZone: "UTC"` and placing the event
-    at UTC 19:30 (= 03:30 next day Taipei / 04:30 next day JST). We
-    reject the LLM-guess variants and let the operator's default apply
-    (`.ics` VTIMEZONE-derived UTC would be legitimate but rare enough
-    that reject-and-warn is safer than trust — spec covers this in
-    "LLM-emitted UTC-like hint is rejected").
+    - UTC-like guesses (`UTC`, `Etc/UTC`, `GMT`, `Z`) — see original
+      §8.6 rationale: LLMs mislabel Taipei-local wall-clock as UTC.
+    - LLM null-ish stringifications (`"null"`, `"None"`, `"nil"`,
+      `"undefined"`) — Pydantic accepts literal `"null"` as a str
+      when the LLM emits JSON `"timezone_hint": "null"` instead of
+      real JSON `null`; without validation this string reaches
+      Google's payload and 400s with "Invalid time zone definition".
+    - Unresolvable IANA names — `ZoneInfo(hint)` raises → fall back
+      rather than emit an invalid `timeZone` field.
+
+    Returns a string that ALWAYS parses as a `ZoneInfo`.
     """
-    if hint is None or hint.strip().lower() in _UTC_LIKE_HINTS:
-        if hint:
-            logger.warning(
-                f"calendar: rejecting UTC-like timezone_hint {hint!r}; "
-                f"falling back to operator default {default!r} "
-                "(LLM tz guess is untrusted for UTC/Etc/UTC/GMT/Z)"
-            )
+    if hint is None:
         return default
-    return hint
+    stripped = hint.strip()
+    lower = stripped.lower()
+    if lower in _UTC_LIKE_HINTS or lower in _LLM_NULLISH_STRINGS:
+        logger.warning(
+            f"calendar: rejecting untrusted timezone_hint {hint!r}; "
+            f"falling back to operator default {default!r} "
+            "(LLM-guess UTC-like or null-ish string)"
+        )
+        return default
+    try:
+        ZoneInfo(stripped)
+    except ZoneInfoNotFoundError:
+        logger.warning(
+            f"calendar: unresolvable timezone_hint {hint!r}; "
+            f"falling back to operator default {default!r}"
+        )
+        return default
+    return stripped
+
+
+def _summarize_exception(exc: Exception, *, limit: int = 200) -> str:
+    """Compact one-liner for Telegram-facing `CalendarSkipped.detail`.
+
+    The full `str(exc)` still lands in the pod log (bounded at 512
+    chars) for diagnosis. This helper trims it to a form fit for
+    a chat message:
+
+    - Pydantic `ValidationError` → `"<field-path>: <first-error-msg>
+      (and N more)"` — one line, no URLs, no `[type=...]` tags.
+    - Everything else → `str(exc)` with `"For further information
+      visit ..."` lines stripped and whitespace collapsed.
+
+    Always prefixed with `{exc.__class__.__name__}: ` so grep against
+    the type still works.
+    """
+    from pydantic import ValidationError as _PyDValErr  # local import — pydantic is already a hard dep
+
+    class_name = exc.__class__.__name__
+    if isinstance(exc, _PyDValErr):
+        errs = exc.errors()
+        if errs:
+            first = errs[0]
+            loc = ".".join(str(x) for x in first.get("loc", ()))
+            msg = first.get("msg", "").strip()
+            n = len(errs)
+            more = f" (and {n - 1} more)" if n > 1 else ""
+            summary = f"{loc}: {msg}{more}" if loc else f"{msg}{more}"
+        else:
+            summary = str(exc)
+    else:
+        summary = str(exc)
+    summary = re.sub(r"\s*For further information visit https?://\S+\s*", " ", summary)
+    summary = " ".join(summary.split())
+    if len(summary) > limit:
+        summary = summary[:limit] + "…"
+    return f"{class_name}: {summary}"
+
+
+def _coerce_llm_nullish(value: str | None) -> str | None:
+    """LLM-string-null → real None. Pydantic accepts literal `"null"`
+    as a str; without this coercion those bogus values flow into
+    payload fields (title, summary, iCalUID) and either 400 at Google
+    or produce trash events named "null"."""
+    if value is None:
+        return None
+    if value.strip().lower() in _LLM_NULLISH_STRINGS:
+        return None
+    return value
 
 
 def _load_zone(name: str) -> ZoneInfo:

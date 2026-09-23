@@ -143,6 +143,21 @@ ANALYZE_SYSTEM_PROMPT = """\
 
 分類規則:
 
+- 「講座資訊」的嚴格定義 — 郵件必須**同時**具備以下兩個條件才能
+  分類為「講座資訊」;缺任一 → 歸類為「廣告」/「促銷」(行銷型)
+  或「其他」(一般通知):
+    (a) 明確的活動**日期或時間** — 例如 `2026-09-17`、`9/17 19:30`、
+        `週四 19:30`、`Thursday 7pm` 等具體 datetime,不是「近期」、
+        「即將推出」、「隨時上課」這類模糊時態。
+    (b) 明確的**地點或線上會議連結** — 例如實體地址、場館名稱、
+        Zoom / Google Meet 網址、或「線上」/「online」字樣。
+  * 正例(講座資訊):`GDG 2026 / 09 月會 - WebMCP` 郵件含
+    `2026-09-17 19:30 + 天瓏書局` → 具備 (a)(b) → 分「講座資訊」。
+  * 反例(廣告):`Recommended: Build Batch Data Pipelines on Google Cloud`
+    (Coursera 課程推薦)—— 只在推薦一堆 MOOC 課程,沒有具體舉辦日期、
+    也不是特定場次 → 不算「講座資訊」→ 分「廣告」。
+  * 反例(廣告):Udemy / Coursera / edX 促銷型郵件即使提到「上課」
+    「講師」「線上學習」,只要沒有明確 cohort 開課日期 → 分「廣告」。
 - 金融產品(基金、ETF、信貸、信用卡帳單分期等)的「推銷」郵件
   一律歸類為「廣告」或「促銷」,不要分到「消費支出」或
   「帳單通知」。
@@ -799,6 +814,7 @@ def _format_calendar_skipped(effect: CalendarSkipped) -> str:
         "scope_missing": "尚未授權 Google Calendar (請 /reauth)",
         "extraction_failed": "無法擷取完整事件資訊",
         "disabled": "行事曆整合已停用 (CALENDAR_ENABLED=0)",
+        "no_event_signal": "內文無明確活動時間",
     }.get(effect.reason, effect.reason)
     lines = [f"📅 <b>行事曆事件未建立:</b> {reason_zh}"]
     if effect.detail:
