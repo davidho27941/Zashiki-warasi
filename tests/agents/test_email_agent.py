@@ -1664,3 +1664,118 @@ class TestExtractContextLengthDetail:
         })
         detail = _extract_context_length_detail(exc)
         assert len(detail) <= 200
+
+
+class TestEndToEndObservation:
+    """§5 (v1.5.0): `_observe_email_e2e` computes duration from Gmail
+    `internalDate` and records into the end-to-end histogram with the
+    correct category + outcome labels."""
+
+    def _make_email(self, received_at: datetime) -> EmailMessage:
+        return EmailMessage(
+            id="msg-e2e-1",
+            thread_id="t-1",
+            history_id=1,
+            from_address="sender@example.com",
+            subject="test",
+            received_at=received_at,
+        )
+
+    def _read_e2e_count(self, category: str, outcome: str) -> float:
+        from prometheus_client import generate_latest
+
+        from zashiki_warasi.observability import REGISTRY
+
+        family = "zashiki_email_end_to_end_duration_seconds_count"
+        selector = f'category="{category}",outcome="{outcome}"'
+        total = 0.0
+        for line in generate_latest(REGISTRY).decode().splitlines():
+            if line.startswith(family) and selector in line:
+                total += float(line.rsplit(" ", 1)[1])
+        return total
+
+    def _read_e2e_sum(self, category: str, outcome: str) -> float:
+        from prometheus_client import generate_latest
+
+        from zashiki_warasi.observability import REGISTRY
+
+        family = "zashiki_email_end_to_end_duration_seconds_sum"
+        selector = f'category="{category}",outcome="{outcome}"'
+        total = 0.0
+        for line in generate_latest(REGISTRY).decode().splitlines():
+            if line.startswith(family) and selector in line:
+                total += float(line.rsplit(" ", 1)[1])
+        return total
+
+    def test_positive_duration_recorded_from_internal_date(self):
+        from datetime import timedelta
+
+        from zashiki_warasi.agents.email_agent import _observe_email_e2e
+
+        past = datetime.now(tz=timezone.utc) - timedelta(seconds=30)
+        email = self._make_email(past)
+        before_count = self._read_e2e_count("廣告", "success")
+        before_sum = self._read_e2e_sum("廣告", "success")
+
+        _observe_email_e2e(email, "廣告", "success")
+
+        after_count = self._read_e2e_count("廣告", "success")
+        after_sum = self._read_e2e_sum("廣告", "success")
+        assert after_count == before_count + 1.0
+        # ~30s elapsed; allow some slack for test scheduler variance
+        assert 29.0 < (after_sum - before_sum) < 35.0
+
+    def test_negative_duration_clamped_to_zero(self):
+        """Clock skew guard: if Gmail's clock ran ahead of ours,
+        received_at may be in the future. The observation is clamped
+        to 0 rather than injecting a negative bucket that would break
+        histogram invariants."""
+        from datetime import timedelta
+
+        from zashiki_warasi.agents.email_agent import _observe_email_e2e
+
+        future = datetime.now(tz=timezone.utc) + timedelta(seconds=60)
+        email = self._make_email(future)
+        before_count = self._read_e2e_count("其他", "success")
+        before_sum = self._read_e2e_sum("其他", "success")
+
+        _observe_email_e2e(email, "其他", "success")
+
+        after_count = self._read_e2e_count("其他", "success")
+        after_sum = self._read_e2e_sum("其他", "success")
+        assert after_count == before_count + 1.0
+        # Duration clamped to 0 — sum should not increase
+        assert after_sum == pytest.approx(before_sum)
+
+    def test_naive_received_at_treated_as_utc(self):
+        """Defensive: if a checkpointer round-trip strips tzinfo, the
+        helper treats the value as UTC rather than raising TypeError
+        on the aware-minus-naive subtraction."""
+        from datetime import timedelta
+
+        from zashiki_warasi.agents.email_agent import _observe_email_e2e
+
+        naive_past = (
+            datetime.now(tz=timezone.utc) - timedelta(seconds=10)
+        ).replace(tzinfo=None)
+        email = self._make_email(naive_past)
+        before_count = self._read_e2e_count("技術文章", "success")
+
+        _observe_email_e2e(email, "技術文章", "success")
+
+        after_count = self._read_e2e_count("技術文章", "success")
+        assert after_count == before_count + 1.0
+
+    def test_unknown_category_and_error_outcome_pair(self):
+        """When analyze fails outright, notify records
+        category='unknown', outcome='error'."""
+        from datetime import timedelta
+
+        from zashiki_warasi.agents.email_agent import _observe_email_e2e
+
+        past = datetime.now(tz=timezone.utc) - timedelta(seconds=5)
+        email = self._make_email(past)
+        before = self._read_e2e_count("unknown", "error")
+        _observe_email_e2e(email, "unknown", "error")
+        after = self._read_e2e_count("unknown", "error")
+        assert after == before + 1.0

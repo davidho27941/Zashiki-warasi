@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import html
 import logging
+from datetime import datetime, timezone
 from typing import TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -54,6 +55,7 @@ from zashiki_warasi.observability import (
     graph_span,
     llm_calls_total,
     llm_latency_seconds,
+    observe_email_end_to_end,
 )
 from zashiki_warasi.observability.instrumentation import (
     record_call,
@@ -262,6 +264,28 @@ def _extract_context_length_detail(exc: BadRequestError) -> str:
         if message:
             return message[:200]
     return str(exc)[:200]
+
+
+def _observe_email_e2e(
+    email: EmailMessage, category: str, outcome: str
+) -> None:
+    """Emit one observation into `zashiki_email_end_to_end_duration_seconds`.
+
+    Computed at `_notify` completion as `now - email.received_at`, where
+    `received_at` is Gmail's `internalDate` (already UTC-aware — see
+    `gmail/client.py`). Naive-datetime guard is defensive: PostgresSaver
+    round-trips may strip tzinfo depending on serializer, so we
+    treat any naive value as UTC. Clock-skew guard clamps a negative
+    delta to 0 rather than corrupting the histogram bucket boundaries.
+    """
+    now = datetime.now(tz=timezone.utc)
+    received = email.received_at
+    if received.tzinfo is None:
+        received = received.replace(tzinfo=timezone.utc)
+    duration = (now - received).total_seconds()
+    if duration < 0:
+        duration = 0.0
+    observe_email_end_to_end(category, outcome, duration)
 
 
 class AgentState(TypedDict):
@@ -507,6 +531,7 @@ class EmailAgent:
             analysis = state["analysis"]
             side_effect = state.get("side_effect")
             markup = _current_trace_copy_markup()
+            email = state["email"]
             if analysis is None:
                 # Analyze itself failed — no structured summary to
                 # render. If it left us an AnalysisFailed marker we
@@ -515,15 +540,17 @@ class EmailAgent:
                 # else went off-script.
                 if isinstance(side_effect, AnalysisFailed):
                     text = _format_analysis_failed(
-                        state["email"], side_effect
+                        email, side_effect
                     )
                     self._notifier.send_message(text, reply_markup=markup)
                     log.info("notified user of analyze failure")
+                    _observe_email_e2e(email, "unknown", "error")
                     return {}
                 log.warning("notify: skipping — no analysis")
                 gs.outcome = "skipped"
+                _observe_email_e2e(email, "unknown", "skipped")
                 return {}
-            text = _format_message(state["email"], analysis, side_effect)
+            text = _format_message(email, analysis, side_effect)
             # v1.4: when the side_effect is a CalendarCreated, add a
             # "View in Calendar" URL button alongside the trace-copy
             # button. Non-calendar paths reuse the trace-only markup.
@@ -534,6 +561,7 @@ class EmailAgent:
                 )
             self._notifier.send_message(text, reply_markup=markup)
             log.info("notified user")
+            _observe_email_e2e(email, analysis.category, "success")
             return {}
 
     # ----- entry point -----
