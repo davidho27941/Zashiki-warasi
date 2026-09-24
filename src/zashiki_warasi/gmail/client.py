@@ -28,6 +28,7 @@ from zashiki_warasi.gmail.exceptions import (
     MessageNotFoundError,
 )
 from zashiki_warasi.observability import (
+    api_call,
     gmail_api_calls_total,
     gmail_api_latency_seconds,
 )
@@ -134,13 +135,14 @@ class GmailClient:
                 histogram=gmail_api_latency_seconds,
                 counter_labels={"operation": _OP_MESSAGE_GET},
                 histogram_labels={"operation": _OP_MESSAGE_GET},
-            ):
+            ), api_call("gmail", "message_get") as _ac:
                 raw = (
                     self._service.users()
                     .messages()
                     .get(userId=self._user_id, id=message_id, format="full")
                     .execute()
                 )
+                _ac.status_code = 200
         except HttpError as exc:
             if exc.resp.status == 404:
                 raise MessageNotFoundError(message_id) from exc
@@ -167,7 +169,7 @@ class GmailClient:
             histogram=gmail_api_latency_seconds,
             counter_labels={"operation": _OP_ATTACHMENT_GET},
             histogram_labels={"operation": _OP_ATTACHMENT_GET},
-        ):
+        ), api_call("gmail", "attachment_get") as _ac:
             raw = (
                 self._service.users()
                 .messages()
@@ -179,6 +181,7 @@ class GmailClient:
                 )
                 .execute()
             )
+            _ac.status_code = 200
         return base64.urlsafe_b64decode(raw["data"] + "==")
 
     # ---------- Infrastructure (used by poller) ----------
@@ -193,12 +196,13 @@ class GmailClient:
             histogram=gmail_api_latency_seconds,
             counter_labels={"operation": _OP_PROFILE},
             histogram_labels={"operation": _OP_PROFILE},
-        ):
+        ), api_call("gmail", "profile") as _ac:
             raw = (
                 self._service.users()
                 .getProfile(userId=self._user_id)
                 .execute()
             )
+            _ac.status_code = 200
         return ProfileInfo(
             email=raw["emailAddress"],
             history_id=int(raw["historyId"]),
@@ -246,8 +250,9 @@ class GmailClient:
                     histogram=gmail_api_latency_seconds,
                     counter_labels={"operation": _OP_HISTORY},
                     histogram_labels={"operation": _OP_HISTORY},
-                ):
+                ), api_call("gmail", "history") as _ac:
                     response = history_api.list(**kwargs).execute()
+                    _ac.status_code = 200
             except HttpError as exc:
                 if exc.resp.status == 404:
                     raise HistoryExpiredError(start_history_id) from exc

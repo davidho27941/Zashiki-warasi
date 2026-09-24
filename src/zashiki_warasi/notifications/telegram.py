@@ -12,7 +12,7 @@ from __future__ import annotations
 import httpx
 
 from zashiki_warasi.core.config import TelegramSettings
-from zashiki_warasi.observability import telegram_send_total
+from zashiki_warasi.observability import api_call, telegram_send_total
 from zashiki_warasi.observability.instrumentation import (
     observe_outcome,
     zashiki_span,
@@ -61,7 +61,9 @@ class TelegramNotifier:
         with zashiki_span(
             "notify.telegram",
             attributes={"messaging.system": "telegram"},
-        ), observe_outcome(counter=telegram_send_total):
+        ), observe_outcome(counter=telegram_send_total), api_call(
+            "telegram", "send_message"
+        ) as _ac:
             url = (
                 f"{self._settings.api_base}/bot{self._settings.bot_token}"
                 "/sendMessage"
@@ -83,6 +85,7 @@ class TelegramNotifier:
             except httpx.HTTPError as exc:
                 raise TelegramError(f"transport error: {exc}") from exc
 
+            _ac.status_code = response.status_code
             if response.status_code >= 400:
                 raise TelegramError(
                     f"HTTP {response.status_code}: {response.text}"
