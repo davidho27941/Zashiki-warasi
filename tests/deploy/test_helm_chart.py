@@ -228,10 +228,33 @@ class TestDashboardConfigMapRender:
         out = _render(**{
             "observability.dashboards.enabled": "true",
             "observability.dashboards.overview.enabled": "false",
+            # v1.5.0 graph-latency dashboard also renders under master
+            # ON; disable it too so this test isolates the "per-dashboard
+            # toggle works" invariant across ALL dashboards.
+            "observability.dashboards.graphLatency.enabled": "false",
         })
-        # Master on, per-dashboard off → no overview CM.
+        # Master on, all per-dashboards off → zero dashboard CMs.
         assert "grafana_dashboard" not in out
         assert "zashiki-warasi-overview.json" not in out
+        assert "zashiki-graph-latency.json" not in out
+
+    def test_graph_latency_dashboard_renders_by_default(self):
+        """v1.5.0 dashboard ships enabled-by-default when master is on."""
+        out = _render(**{
+            "observability.dashboards.enabled": "true",
+        })
+        assert "zashiki-graph-latency.json" in out
+        assert "dashboard-graph-latency" in out
+
+    def test_graph_latency_per_dashboard_toggle(self):
+        """graphLatency=false while overview=true → only overview CM."""
+        out = _render(**{
+            "observability.dashboards.enabled": "true",
+            "observability.dashboards.overview.enabled": "true",
+            "observability.dashboards.graphLatency.enabled": "false",
+        })
+        assert "zashiki-warasi-overview.json" in out
+        assert "zashiki-graph-latency.json" not in out
 
     def test_sidecar_label_customizable(self):
         out = _render(**{

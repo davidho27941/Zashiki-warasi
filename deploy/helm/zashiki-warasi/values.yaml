@@ -272,3 +272,8 @@ observability:
     # reconcile. No manual Grafana UI cleanup needed.
     overview:
       enabled: true
+    # v1.5.0 graph-node latency dashboard: per-node p50/p95/p99, LLM
+    # call breakdown by purpose, external-API by service+operation,
+    # end-to-end by category.
+    graphLatency:
+      enabled: true

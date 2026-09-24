@@ -36,4 +36,18 @@ data:
 {{ .Files.Get "dashboards/zashiki-warasi-overview.json" | indent 4 }}
 {{- end }}
 
+{{- if .Values.observability.dashboards.graphLatency.enabled }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "zashiki-warasi.fullname" . }}-dashboard-graph-latency
+  labels:
+    {{- include "zashiki-warasi.labels" . | nindent 4 }}
+    {{ $sidecarKey }}: {{ $sidecarValue | quote }}
+data:
+  zashiki-graph-latency.json: |
+{{ .Files.Get "dashboards/zashiki-graph-latency.json" | indent 4 }}
+{{- end }}
+
 {{- end }}
