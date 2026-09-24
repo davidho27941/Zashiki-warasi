@@ -848,3 +848,166 @@ class TestSanitizeTzHint:
         assert payload["start"]["timeZone"] == "Asia/Taipei"
         assert payload["start"]["dateTime"] == "2026-09-17T19:30:00"
         assert payload["end"]["timeZone"] == "Asia/Taipei"
+
+
+def _read_graph_count(node: str, vertical: str, outcome: str) -> float:
+    """Read `zashiki_graph_node_duration_seconds_count` for one label
+    combination. Labels render alphabetically in the exposition format
+    (`node`, `outcome`, `vertical`) regardless of declaration order."""
+    from prometheus_client import generate_latest
+
+    from zashiki_warasi.observability import REGISTRY
+
+    family = "zashiki_graph_node_duration_seconds_count"
+    selector = (
+        f'node="{node}",outcome="{outcome}",vertical="{vertical}"'
+    )
+    total = 0.0
+    for line in generate_latest(REGISTRY).decode().splitlines():
+        if line.startswith(family) and selector in line:
+            total += float(line.rsplit(" ", 1)[1])
+    return total
+
+
+class TestExtractGraphSpanOutcomes:
+    """§ 7 (v1.5.0): pin the outcome-label branches at `_extract_node`.
+
+    Each real return path (§ 2's outcome mapping) must land in the
+    expected `zashiki_graph_node_duration_seconds{outcome=…}` bucket
+    so future dashboard queries `sum by (outcome)` stay meaningful.
+    Regression guard against someone removing a `gs.outcome = …`
+    line during a refactor."""
+
+    def test_success_outcome_on_happy_extract(self, fake_email):
+        model = _build_model_returning(_draft())
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        before = _read_graph_count("extract", "calendar_sg", "success")
+        sg._extract_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        after = _read_graph_count("extract", "calendar_sg", "success")
+        assert after == before + 1.0
+
+    def test_skipped_outcome_on_no_event_signal_short_circuit(self):
+        model = _build_model_returning(_draft())
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+        coursera_email = EmailMessage(
+            id="msg-cs",
+            thread_id="t",
+            history_id=200,
+            from_address="promo@example.com",
+            subject="Recommended: MOOC",
+            body_plain=(
+                "Enroll anytime; explore courses recommended for you."
+            ),
+            received_at=datetime(2026, 9, 14, 10, 0, tzinfo=timezone.utc),
+            attachments=[],
+        )
+
+        before = _read_graph_count("extract", "calendar_sg", "skipped")
+        sg._extract_node({
+            "email": coursera_email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        after = _read_graph_count("extract", "calendar_sg", "skipped")
+        assert after == before + 1.0
+
+    def test_error_outcome_on_llm_exception(self, fake_email):
+        class LLMBoom(RuntimeError):
+            pass
+
+        model = MagicMock(name="chat_model")
+        structured = MagicMock(name="structured")
+        structured.invoke.side_effect = LLMBoom("upstream 500")
+        model.with_structured_output.return_value = structured
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        before = _read_graph_count("extract", "calendar_sg", "error")
+        sg._extract_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        after = _read_graph_count("extract", "calendar_sg", "error")
+        assert after == before + 1.0
+
+
+class TestCreateGraphSpanOutcomes:
+    def test_success_outcome_on_clean_insert(self, fake_email):
+        model = _build_model_returning(_draft())
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+        draft = _draft()
+
+        before = _read_graph_count("create", "calendar_sg", "success")
+        sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": draft,
+        })
+        after = _read_graph_count("create", "calendar_sg", "success")
+        assert after == before + 1.0
+
+    def test_skipped_outcome_when_upstream_side_effect_set(self, fake_email):
+        model = _build_model_returning(_draft())
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        before = _read_graph_count("create", "calendar_sg", "skipped")
+        # upstream extract returned a CalendarSkipped — create should
+        # no-op and record outcome=skipped.
+        sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": CalendarSkipped(
+                reason="no_event_signal", detail="nothing to create"
+            ),
+            "extracted": None,
+        })
+        after = _read_graph_count("create", "calendar_sg", "skipped")
+        assert after == before + 1.0
+
+    def test_skipped_outcome_on_ical_uid_collision(self, fake_email):
+        model = _build_model_returning(_draft())
+        cal_client = _mock_calendar_client(
+            insert_result=iCalUidExists("dup")
+        )
+        sg = _sg(model, MagicMock(), cal_client)
+        draft = _draft()
+
+        before = _read_graph_count("create", "calendar_sg", "skipped")
+        sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": draft,
+        })
+        after = _read_graph_count("create", "calendar_sg", "skipped")
+        assert after == before + 1.0
+
+    def test_error_outcome_on_insert_failure(self, fake_email):
+        model = _build_model_returning(_draft())
+        cal_client = _mock_calendar_client(
+            insert_result=CalendarError("HTTP 500 upstream")
+        )
+        sg = _sg(model, MagicMock(), cal_client)
+        draft = _draft()
+
+        before = _read_graph_count("create", "calendar_sg", "error")
+        sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": draft,
+        })
+        after = _read_graph_count("create", "calendar_sg", "error")
+        assert after == before + 1.0
+
+    def test_error_outcome_on_scope_not_granted(self, fake_email):
+        model = _build_model_returning(_draft())
+        cal_client = _mock_calendar_client(
+            insert_result=CalendarScopeNotGranted("403 missing scope")
+        )
+        sg = _sg(model, MagicMock(), cal_client)
+        draft = _draft()
+
+        before = _read_graph_count("create", "calendar_sg", "error")
+        sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": draft,
+        })
+        after = _read_graph_count("create", "calendar_sg", "error")
+        assert after == before + 1.0

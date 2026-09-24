@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import html
 import logging
+from datetime import datetime, timezone
 from typing import TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -51,13 +52,15 @@ from zashiki_warasi.notifications._trace_markup import (
 from zashiki_warasi.notifications.notion import NotionExpenseRecorder
 from zashiki_warasi.notifications.telegram import TelegramNotifier
 from zashiki_warasi.observability import (
+    graph_span,
+    llm_call,
     llm_calls_total,
     llm_latency_seconds,
+    observe_email_end_to_end,
 )
 from zashiki_warasi.observability.instrumentation import (
     record_call,
     set_gen_ai_attributes,
-    zashiki_span,
 )
 
 logger = logging.getLogger(__name__)
@@ -263,6 +266,28 @@ def _extract_context_length_detail(exc: BadRequestError) -> str:
     return str(exc)[:200]
 
 
+def _observe_email_e2e(
+    email: EmailMessage, category: str, outcome: str
+) -> None:
+    """Emit one observation into `zashiki_email_end_to_end_duration_seconds`.
+
+    Computed at `_notify` completion as `now - email.received_at`, where
+    `received_at` is Gmail's `internalDate` (already UTC-aware — see
+    `gmail/client.py`). Naive-datetime guard is defensive: PostgresSaver
+    round-trips may strip tzinfo depending on serializer, so we
+    treat any naive value as UTC. Clock-skew guard clamps a negative
+    delta to 0 rather than corrupting the histogram bucket boundaries.
+    """
+    now = datetime.now(tz=timezone.utc)
+    received = email.received_at
+    if received.tzinfo is None:
+        received = received.replace(tzinfo=timezone.utc)
+    duration = (now - received).total_seconds()
+    if duration < 0:
+        duration = 0.0
+    observe_email_end_to_end(category, outcome, duration)
+
+
 class AgentState(TypedDict):
     email: EmailMessage
     analysis: EmailAnalysis | None
@@ -381,7 +406,7 @@ class EmailAgent:
 
     def _analyze(self, state: AgentState) -> dict:
         log = self._log(state)
-        with node_trace(log, "analyze"):
+        with node_trace(log, "analyze"), graph_span("analyze", "email") as gs:
             email = state["email"]
             # Body fallback chain: text/plain → HTML converted on
             # demand → Gmail snippet. Covers HTML-only mails (modern
@@ -401,14 +426,16 @@ class EmailAgent:
                 f"{body}"
             )
             try:
-                with zashiki_span("llm.chat") as _span, record_call(
+                with llm_call(
+                    "classify", model=self._llm_model_name
+                ) as _lc, record_call(
                     counter=llm_calls_total,
                     histogram=llm_latency_seconds,
                     counter_labels={"node": "analyze"},
                     histogram_labels={"node": "analyze"},
                 ):
                     set_gen_ai_attributes(
-                        _span,
+                        _lc.span,
                         system=self._llm_system,
                         model=self._llm_model_name,
                     )
@@ -423,7 +450,7 @@ class EmailAgent:
                     # is a no-op on absent usage metadata, so this call is
                     # safe even when there's nothing to attach.
                     set_gen_ai_attributes(
-                        _span,
+                        _lc.span,
                         system=self._llm_system,
                         model=self._llm_model_name,
                         response=analysis,
@@ -435,6 +462,7 @@ class EmailAgent:
                     f"completion={usage.completion_tokens}"
                 )
                 log.warning(f"analyze: LLM hit token limit ({detail})")
+                gs.outcome = "error"
                 return {
                     "analysis": None,
                     "side_effect": AnalysisFailed(
@@ -453,6 +481,7 @@ class EmailAgent:
                 # Cheap forensics: raw error body at DEBUG so post-
                 # incident triage has the server's own wording.
                 log.debug(f"analyze: 400 body = {getattr(exc, 'body', None)}")
+                gs.outcome = "error"
                 return {
                     "analysis": None,
                     "side_effect": AnalysisFailed(
@@ -500,10 +529,11 @@ class EmailAgent:
 
     def _notify(self, state: AgentState) -> dict:
         log = self._log(state)
-        with node_trace(log, "notify"):
+        with node_trace(log, "notify"), graph_span("notify", "email") as gs:
             analysis = state["analysis"]
             side_effect = state.get("side_effect")
             markup = _current_trace_copy_markup()
+            email = state["email"]
             if analysis is None:
                 # Analyze itself failed — no structured summary to
                 # render. If it left us an AnalysisFailed marker we
@@ -512,14 +542,17 @@ class EmailAgent:
                 # else went off-script.
                 if isinstance(side_effect, AnalysisFailed):
                     text = _format_analysis_failed(
-                        state["email"], side_effect
+                        email, side_effect
                     )
                     self._notifier.send_message(text, reply_markup=markup)
                     log.info("notified user of analyze failure")
+                    _observe_email_e2e(email, "unknown", "error")
                     return {}
                 log.warning("notify: skipping — no analysis")
+                gs.outcome = "skipped"
+                _observe_email_e2e(email, "unknown", "skipped")
                 return {}
-            text = _format_message(state["email"], analysis, side_effect)
+            text = _format_message(email, analysis, side_effect)
             # v1.4: when the side_effect is a CalendarCreated, add a
             # "View in Calendar" URL button alongside the trace-copy
             # button. Non-calendar paths reuse the trace-only markup.
@@ -530,6 +563,7 @@ class EmailAgent:
                 )
             self._notifier.send_message(text, reply_markup=markup)
             log.info("notified user")
+            _observe_email_e2e(email, analysis.category, "success")
             return {}
 
     # ----- entry point -----

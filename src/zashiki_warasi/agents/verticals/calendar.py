@@ -48,11 +48,15 @@ from zashiki_warasi.core.schemas import (
     SideEffect,
 )
 from zashiki_warasi.gmail.client import GmailClient
-from zashiki_warasi.observability import llm_calls_total, llm_latency_seconds
+from zashiki_warasi.observability import (
+    graph_span,
+    llm_call,
+    llm_calls_total,
+    llm_latency_seconds,
+)
 from zashiki_warasi.observability.instrumentation import (
     record_call,
     set_gen_ai_attributes,
-    zashiki_span,
 )
 
 logger = logging.getLogger(__name__)
@@ -224,7 +228,9 @@ class CalendarSubgraph:
 
     def _extract_node(self, state: CalendarState) -> dict:
         log = self._log(state)
-        with node_trace(log, "calendar.extract"):
+        with node_trace(log, "calendar.extract"), graph_span(
+            "extract", "calendar_sg"
+        ) as gs:
             email = state["email"]
 
             # ---- .ics attachment first (deterministic) ----
@@ -258,6 +264,7 @@ class CalendarSubgraph:
             )
             if not body.strip():
                 log.info("calendar: no body text to extract from → skip")
+                gs.outcome = "skipped"
                 return {
                     "extracted": None,
                     "side_effect": CalendarSkipped(
@@ -275,6 +282,7 @@ class CalendarSubgraph:
                 log.info(
                     "calendar: no event-signal in body, skipping LLM extraction"
                 )
+                gs.outcome = "skipped"
                 return {
                     "extracted": None,
                     "side_effect": CalendarSkipped(
@@ -289,14 +297,16 @@ class CalendarSubgraph:
                 f"Date: {email.received_at.isoformat()}\n\n"
                 f"{body}"
             )
-            with zashiki_span("llm.chat") as _span, record_call(
+            with llm_call(
+                "calendar_extract", model=self._llm_model_name
+            ) as _lc, record_call(
                 counter=llm_calls_total,
                 histogram=llm_latency_seconds,
                 counter_labels={"node": "calendar_extract"},
                 histogram_labels={"node": "calendar_extract"},
             ):
                 set_gen_ai_attributes(
-                    _span,
+                    _lc.span,
                     system=self._llm_system,
                     model=self._llm_model_name,
                 )
@@ -324,6 +334,7 @@ class CalendarSubgraph:
                         "calendar: LLM extraction failed "
                         f"({exc.__class__.__name__}: {log_body})"
                     )
+                    gs.outcome = "error"
                     return {
                         "extracted": None,
                         "side_effect": CalendarSkipped(
@@ -332,7 +343,7 @@ class CalendarSubgraph:
                         ),
                     }
                 set_gen_ai_attributes(
-                    _span,
+                    _lc.span,
                     system=self._llm_system,
                     model=self._llm_model_name,
                     response=draft,
@@ -340,6 +351,7 @@ class CalendarSubgraph:
 
             if draft is None:
                 log.info("calendar: LLM returned no draft → skip")
+                gs.outcome = "skipped"
                 return {
                     "extracted": None,
                     "side_effect": CalendarSkipped(
@@ -382,6 +394,7 @@ class CalendarSubgraph:
                     f"calendar: LLM returned null-ish title "
                     f"({draft.title!r}); skipping event creation"
                 )
+                gs.outcome = "error"
                 return {
                     "extracted": None,
                     "side_effect": CalendarSkipped(
@@ -410,13 +423,17 @@ class CalendarSubgraph:
 
     def _create_node(self, state: CalendarState) -> dict:
         log = self._log(state)
-        with node_trace(log, "calendar.create"):
+        with node_trace(log, "calendar.create"), graph_span(
+            "create", "calendar_sg"
+        ) as gs:
             # Skip if extract already set a terminal side_effect.
             if state.get("side_effect") is not None:
+                gs.outcome = "skipped"
                 return {}
 
             draft = state.get("extracted")
             if draft is None:
+                gs.outcome = "error"
                 return {
                     "side_effect": CalendarSkipped(
                         reason="extraction_failed",
@@ -463,6 +480,7 @@ class CalendarSubgraph:
                     ]
                     log.info(f"calendar: {len(conflicts)} time conflict(s)")
             except CalendarScopeNotGranted as exc:
+                gs.outcome = "error"
                 return self._degrade_scope_missing(log, str(exc))
             except CalendarError as exc:
                 log.warning(
@@ -491,10 +509,12 @@ class CalendarSubgraph:
                     f"calendar: iCalUID {ical_uid!r} already present "
                     "(idempotent no-op)"
                 )
+                gs.outcome = "skipped"
                 return {
                     "side_effect": CalendarDuplicate(ical_uid=ical_uid),
                 }
             except CalendarScopeNotGranted as exc:
+                gs.outcome = "error"
                 return self._degrade_scope_missing(log, str(exc))
             except CalendarError as exc:
                 # Log gets the full API response body (bounded 512
@@ -508,6 +528,7 @@ class CalendarSubgraph:
                     "calendar: insert failed "
                     f"({exc.__class__.__name__}: {log_body})"
                 )
+                gs.outcome = "error"
                 return {
                     "side_effect": CalendarSkipped(
                         reason="extraction_failed",

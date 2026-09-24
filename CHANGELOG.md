@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+New minor: **per-node latency observability**. Adds four Prometheus
+histogram families that cover the LangGraph pipeline end-to-end,
+three matching OpenTelemetry span helpers with shared timestamps,
+and a dedicated Grafana dashboard. No breaking changes — the v1.1
+metric families continue emitting alongside so pre-v1.5.0 dashboards
+keep working.
+
+### Added
+
+- **`zashiki_graph_node_duration_seconds{node, vertical, outcome}`** —
+  one observation per LangGraph node execution. Labels are bounded:
+  `node ∈ {analyze, extract, freebusy, create, dedup_check, notify,
+  persist}`, `vertical ∈ {email, calendar_sg, expense_sg,
+  notify_only}`, `outcome ∈ {success, skipped, error}`. Bucket set
+  `[0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300]` seconds
+  covers fast short-circuits through slow LLM calls up to
+  end-to-end with poll-interval contribution.
+- **`zashiki_llm_call_duration_seconds{purpose, model}`** — one
+  observation per LLM invocation. `purpose ∈ {classify,
+  calendar_extract, expense_extract, subject_translation,
+  body_summary}` — split by usage so contention across concurrent
+  verticals is visible.
+- **`zashiki_external_api_duration_seconds{service, operation}`** —
+  one observation per outbound Google / Telegram HTTP call.
+  `service ∈ {gmail, calendar, telegram}`, `operation` per service.
+- **`zashiki_email_end_to_end_duration_seconds{category, outcome}`** —
+  one observation at `_notify` completion, spanning Gmail
+  `internalDate` to Telegram-send return. The operator-visible
+  latency.
+- **Context-manager helpers** in `observability/spans.py`:
+  `graph_span(node, vertical)`, `llm_call(purpose, model=…)`,
+  `api_call(service, operation)`, plus a one-shot
+  `observe_email_end_to_end(category, outcome, duration)`. Each
+  emits one histogram observation + one OTel span with shared
+  timestamps so "the trace says X but the metric says Y" can never
+  drift. Exceptions auto-flip `outcome` to `error`; callers may
+  set `outcome = "skipped"` for intentional early returns.
+- **Grafana dashboard** `zashiki-graph-latency.json` — 4 rows / 8
+  panels covering end-to-end, per-node, LLM-by-purpose, and
+  external-API-by-service. Opt-in via
+  `observability.dashboards.graphLatency.enabled` (default `true`
+  when parent `dashboards.enabled` is on).
+- **Docs** `docs/observability-graph-latency.md` (+ `.zh.md`) —
+  operator reference: metric contract, label vocabulary, PromQL
+  entry points, dashboard import, log-to-trace jump flow.
+
+### Changed
+
+- **`_analyze` / `_extract_node` / `_create_node` / `_notify` /
+  `_persist_node`** — each LangGraph node body now wraps with
+  `graph_span(...)` alongside the existing `node_trace`. Two OTel
+  spans coexist per execution (`zashiki.node.<name>` + `graph.<
+  vertical>.<node>`); only `graph_span` emits the new histogram.
+- **LLM call sites** in `_analyze` / calendar `_extract_node` /
+  expense `_extract_node` — migrated from `zashiki_span("llm.chat")`
+  to `llm_call("classify")` / `llm_call("calendar_extract")` /
+  `llm_call("expense_extract")`. Existing `record_call(counter=
+  llm_calls_total, histogram=llm_latency_seconds, ...)` retained
+  so v1.1's `zashiki_llm_latency_seconds{node}` keeps feeding
+  pre-v1.5.0 dashboards.
+- **Google Calendar / Gmail / Telegram client boundaries** — 7 API
+  methods wrapped with `api_call(service, operation)` alongside
+  existing v1.1 metric emission. `http.status_code` attached to
+  the OTel span.
+
+### Backward compatibility
+
+- No breaking changes. All v1.1 metric families keep emitting.
+  Pre-v1.5.0 Grafana dashboards continue to work.
+- No env-var change. No OAuth scope change. No DB migration.
+- Two histogram observations per LLM call and per external API
+  call (v1.1 family + v1.5.0 family) is a temporary cost. When
+  operators migrate all dashboards off v1.1 families, the v1.1
+  ones can be retired in a future release.
+
 ## [1.4.1] — 2026-09-23
 
 Follow-up refinement to v1.4's calendar vertical after real-world

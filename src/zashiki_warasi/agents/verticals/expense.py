@@ -32,13 +32,14 @@ from zashiki_warasi.notifications.notion import (
     NotionSyncError,
 )
 from zashiki_warasi.observability import (
+    graph_span,
+    llm_call,
     llm_calls_total,
     llm_latency_seconds,
 )
 from zashiki_warasi.observability.instrumentation import (
     record_call,
     set_gen_ai_attributes,
-    zashiki_span,
 )
 
 logger = logging.getLogger(__name__)
@@ -319,7 +320,9 @@ class ExpenseSubgraph:
 
     def _extract_node(self, state: ExpenseState) -> dict:
         log = self._log(state)
-        with node_trace(log, "expense.extract"):
+        with node_trace(log, "expense.extract"), graph_span(
+            "extract", "expense_sg"
+        ) as gs:
             email = state["email"]
             text, unreadable_pdfs = collect_text(email, self._client)
 
@@ -327,6 +330,7 @@ class ExpenseSubgraph:
             # no signal to extract from; do not hallucinate.
             if not text and unreadable_pdfs:
                 log.info("expense: only unreadable PDFs → needs_review")
+                gs.outcome = "skipped"
                 return {
                     "side_effect": ExpenseNeedsReview(
                         reason="image_pdf_unreadable",
@@ -337,6 +341,7 @@ class ExpenseSubgraph:
 
             if not text:
                 log.info("expense: no text extractable → needs_review")
+                gs.outcome = "skipped"
                 return {
                     "side_effect": ExpenseNeedsReview(
                         reason="extraction_yielded_nulls",
@@ -345,14 +350,16 @@ class ExpenseSubgraph:
                 }
 
             user_prompt = self._build_user_prompt(email, text)
-            with zashiki_span("llm.chat") as _span, record_call(
+            with llm_call(
+                "expense_extract", model=self._llm_model_name
+            ) as _lc, record_call(
                 counter=llm_calls_total,
                 histogram=llm_latency_seconds,
                 counter_labels={"node": "expense_extract"},
                 histogram_labels={"node": "expense_extract"},
             ):
                 set_gen_ai_attributes(
-                    _span,
+                    _lc.span,
                     system=self._llm_system,
                     model=self._llm_model_name,
                 )
@@ -363,7 +370,7 @@ class ExpenseSubgraph:
                     ]
                 )
                 set_gen_ai_attributes(
-                    _span,
+                    _lc.span,
                     system=self._llm_system,
                     model=self._llm_model_name,
                     response=draft,
@@ -376,10 +383,13 @@ class ExpenseSubgraph:
 
     def _persist_node(self, state: ExpenseState) -> dict:
         log = self._log(state)
-        with node_trace(log, "expense.persist"):
+        with node_trace(log, "expense.persist"), graph_span(
+            "persist", "expense_sg"
+        ) as gs:
             # If extract already set a side_effect (needs_review),
             # nothing to persist — pass through.
             if state.get("side_effect") is not None:
+                gs.outcome = "skipped"
                 return {}
 
             draft = state.get("extracted")
@@ -388,6 +398,7 @@ class ExpenseSubgraph:
                     "expense: LLM extraction too sparse "
                     "(no amount & no vendor) → needs_review"
                 )
+                gs.outcome = "skipped"
                 return {
                     "side_effect": ExpenseNeedsReview(
                         reason="extraction_yielded_nulls",

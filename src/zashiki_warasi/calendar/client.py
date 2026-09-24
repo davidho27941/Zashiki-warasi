@@ -40,6 +40,8 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+from zashiki_warasi.observability import api_call
+
 # ---- Exception hierarchy --------------------------------------------------
 
 
@@ -152,7 +154,9 @@ class GoogleCalendarClient:
             "items": [{"id": target}],
         }
         try:
-            response = self._service.freebusy().query(body=body).execute()
+            with api_call("calendar", "freebusy") as _ac:
+                response = self._service.freebusy().query(body=body).execute()
+                _ac.status_code = 200
         except HttpError as exc:
             raise self._map_http_error(exc) from exc
 
@@ -182,18 +186,20 @@ class GoogleCalendarClient:
         """
         target = calendar_id or self._primary_id
         try:
-            response = (
-                self._service.events()
-                .list(
-                    calendarId=target,
-                    timeMin=_iso(start),
-                    timeMax=_iso(end),
-                    singleEvents=True,
-                    orderBy="startTime",
-                    maxResults=25,
+            with api_call("calendar", "list") as _ac:
+                response = (
+                    self._service.events()
+                    .list(
+                        calendarId=target,
+                        timeMin=_iso(start),
+                        timeMax=_iso(end),
+                        singleEvents=True,
+                        orderBy="startTime",
+                        maxResults=25,
+                    )
+                    .execute()
                 )
-                .execute()
-            )
+                _ac.status_code = 200
         except HttpError as exc:
             raise self._map_http_error(exc) from exc
 
@@ -243,16 +249,18 @@ class GoogleCalendarClient:
         # (which lets it dedupe against pre-existing events with the
         # same UID). We ALSO leave it in the body so both paths agree.
         try:
-            response = (
-                self._service.events()
-                .insert(
-                    calendarId=target,
-                    body=payload,
-                    conferenceDataVersion=0,
-                    supportsAttachments=False,
+            with api_call("calendar", "insert") as _ac:
+                response = (
+                    self._service.events()
+                    .insert(
+                        calendarId=target,
+                        body=payload,
+                        conferenceDataVersion=0,
+                        supportsAttachments=False,
+                    )
+                    .execute()
                 )
-                .execute()
-            )
+                _ac.status_code = 200
         except HttpError as exc:
             mapped = self._map_http_error(exc)
             if isinstance(mapped, iCalUidExists):

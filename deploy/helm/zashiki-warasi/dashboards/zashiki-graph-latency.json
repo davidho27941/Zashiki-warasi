@@ -1,0 +1,195 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Zashiki-warasi v1.5.0 graph-node latency: end-to-end, per-node, per-LLM-purpose, per-external-API breakdown. All queries against the Prometheus datasource. See openspec/specs/observability/spec.md for the metric contract.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "id": 100,
+      "panels": [],
+      "title": "End-to-end (operator-visible latency)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Wall-clock from Gmail internalDate → Telegram send return. Includes poll-interval contribution. Split by classifier category.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "pointSize": 5, "showPoints": "auto"},
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {"h": 9, "w": 16, "x": 0, "y": 1},
+      "id": 101,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["last", "mean", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (category, le) (rate(zashiki_email_end_to_end_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{category}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (category, le) (rate(zashiki_email_end_to_end_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{category}}", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (category, le) (rate(zashiki_email_end_to_end_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p99 {{category}}", "refId": "C"}
+      ],
+      "title": "End-to-end latency (p50 / p95 / p99 by category)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Emails processed per hour, by outcome. success = pipeline reached notify; skipped = analyze null / no route; error = AnalysisFailed reached notify.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisPlacement": "auto", "drawStyle": "bars", "fillOpacity": 80, "lineWidth": 1, "stacking": {"mode": "normal", "group": "A"}}, "unit": "short"}},
+      "gridPos": {"h": 9, "w": 8, "x": 16, "y": 1},
+      "id": 102,
+      "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "sum by (outcome) (increase(zashiki_email_end_to_end_duration_seconds_count[1h]))", "legendFormat": "{{outcome}}", "refId": "A"}
+      ],
+      "title": "Email outcomes (per 1h window)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 10},
+      "id": 200,
+      "panels": [],
+      "title": "Graph nodes",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "p95 duration of each LangGraph node execution. High-water for `analyze` typically = LLM classify latency; for `create` = Google Calendar API round-trips.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2}, "unit": "s"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 11},
+      "id": 201,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["last", "mean", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (node, vertical, le) (rate(zashiki_graph_node_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "{{vertical}}.{{node}}", "refId": "A"}
+      ],
+      "title": "Node latency p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Executions per second per node. `analyze` fires once per received email; verticals fire only for eligible categories.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 20, "lineWidth": 2, "stacking": {"mode": "normal", "group": "A"}}, "unit": "reqps"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 11},
+      "id": 202,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["last", "mean", "sum"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "sum by (node, vertical) (rate(zashiki_graph_node_duration_seconds_count[$__rate_interval]))", "legendFormat": "{{vertical}}.{{node}}", "refId": "A"}
+      ],
+      "title": "Node throughput",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Per-node outcome breakdown over 1h. success = happy path; skipped = intentional early-out (no_event_signal, dedup, upstream side_effect); error = LLM/API failure or unhandled exception.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"axisPlacement": "auto", "drawStyle": "bars", "fillOpacity": 80, "lineWidth": 1, "stacking": {"mode": "normal", "group": "A"}}, "unit": "short"}},
+      "gridPos": {"h": 6, "w": 24, "x": 0, "y": 20},
+      "id": 203,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["sum"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "sum by (node, vertical, outcome) (increase(zashiki_graph_node_duration_seconds_count[1h]))", "legendFormat": "{{vertical}}.{{node}} · {{outcome}}", "refId": "A"}
+      ],
+      "title": "Node outcomes (per 1h)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 26},
+      "id": 300,
+      "panels": [],
+      "title": "LLM calls (by purpose)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "p95 LLM call duration split by usage purpose. classify tends to dominate analyze node time. calendar_extract is smaller.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2}, "unit": "s"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 27},
+      "id": 301,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["last", "mean", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, sum by (purpose, le) (rate(zashiki_llm_call_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{purpose}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (purpose, le) (rate(zashiki_llm_call_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{purpose}}", "refId": "B"}
+      ],
+      "title": "LLM latency (p50 / p95 by purpose)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "LLM invocations per second, stacked by purpose. Shows concurrent-call shape across verticals — helps diagnose LLM contention.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 30, "lineWidth": 2, "stacking": {"mode": "normal", "group": "A"}}, "unit": "reqps"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 27},
+      "id": 302,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["last", "mean", "sum"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "sum by (purpose) (rate(zashiki_llm_call_duration_seconds_count[$__rate_interval]))", "legendFormat": "{{purpose}}", "refId": "A"}
+      ],
+      "title": "LLM call rate (by purpose)",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 36},
+      "id": 400,
+      "panels": [],
+      "title": "External APIs (by service + operation)",
+      "type": "row"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "p95 outbound HTTP call duration to Gmail / Google Calendar / Telegram. Separates freebusy vs list vs insert on the Calendar side so the `create` node's time budget is visible.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 10, "lineWidth": 2}, "unit": "s"}},
+      "gridPos": {"h": 9, "w": 12, "x": 0, "y": 37},
+      "id": 401,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["last", "mean", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
+      "targets": [
+        {"expr": "histogram_quantile(0.95, sum by (service, operation, le) (rate(zashiki_external_api_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "{{service}}.{{operation}}", "refId": "A"}
+      ],
+      "title": "External API p95 latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "External-API call rate by {service, operation}. Poller-driven gmail.history + gmail.message_get run every tick; calendar / telegram fire only per email.",
+      "fieldConfig": {"defaults": {"color": {"mode": "palette-classic"}, "custom": {"drawStyle": "line", "fillOpacity": 20, "lineWidth": 2, "stacking": {"mode": "normal", "group": "A"}}, "unit": "reqps"}},
+      "gridPos": {"h": 9, "w": 12, "x": 12, "y": 37},
+      "id": 402,
+      "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["last", "mean", "sum"]}, "tooltip": {"mode": "multi"}},
+      "targets": [
+        {"expr": "sum by (service, operation) (rate(zashiki_external_api_duration_seconds_count[$__rate_interval]))", "legendFormat": "{{service}}.{{operation}}", "refId": "A"}
+      ],
+      "title": "External API call rate",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["zashiki-warasi", "v1.5.0", "graph-latency"],
+  "templating": {"list": []},
+  "time": {"from": "now-6h", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Zashiki-warasi · Graph-node latency (v1.5.0)",
+  "uid": "zashiki-graph-latency",
+  "version": 1,
+  "weekStart": ""
+}
