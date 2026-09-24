@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-09-24
+
 New minor: **per-node latency observability**. Adds four Prometheus
 histogram families that cover the LangGraph pipeline end-to-end,
 three matching OpenTelemetry span helpers with shared timestamps,
