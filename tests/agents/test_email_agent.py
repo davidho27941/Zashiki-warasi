@@ -1779,3 +1779,60 @@ class TestEndToEndObservation:
         _observe_email_e2e(email, "unknown", "error")
         after = self._read_e2e_count("unknown", "error")
         assert after == before + 1.0
+
+
+class TestAnalyzeGraphSpanOutcomes:
+    """§ 7 (v1.5.0): pin the outcome-label branches at `_analyze`.
+
+    Regression guard: if someone removes a `gs.outcome = "error"` in
+    the exception handlers, aggregate dashboards would silently lose
+    the LLM-failure signal for analyze."""
+
+    def _read_analyze_count(self, outcome: str) -> float:
+        from prometheus_client import generate_latest
+
+        from zashiki_warasi.observability import REGISTRY
+
+        family = "zashiki_graph_node_duration_seconds_count"
+        selector = (
+            f'node="analyze",outcome="{outcome}",vertical="email"'
+        )
+        total = 0.0
+        for line in generate_latest(REGISTRY).decode().splitlines():
+            if line.startswith(family) and selector in line:
+                total += float(line.rsplit(" ", 1)[1])
+        return total
+
+    def test_success_outcome_on_happy_analyze(
+        self, agent, fake_email
+    ):
+        before = self._read_analyze_count("success")
+        agent.handle_email(fake_email)
+        after = self._read_analyze_count("success")
+        assert after == before + 1.0
+
+    def test_error_outcome_on_length_finish_error(
+        self,
+        session_factory,
+        mock_chat_model,
+        mock_notifier,
+        mock_client,
+        fake_email,
+    ):
+        # Force the LLM to raise LengthFinishReasonError so the
+        # AnalysisFailed(reason="content_too_long") branch fires,
+        # which sets gs.outcome = "error" per §2.
+        mock_chat_model.structured.invoke.side_effect = (
+            _make_length_finish_error()
+        )
+        agent = EmailAgent(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            notifier=mock_notifier,
+            client=mock_client,
+        )
+
+        before = self._read_analyze_count("error")
+        agent.handle_email(fake_email)
+        after = self._read_analyze_count("error")
+        assert after == before + 1.0
