@@ -53,6 +53,7 @@ from zashiki_warasi.notifications.notion import NotionExpenseRecorder
 from zashiki_warasi.notifications.telegram import TelegramNotifier
 from zashiki_warasi.observability import (
     graph_span,
+    llm_call,
     llm_calls_total,
     llm_latency_seconds,
     observe_email_end_to_end,
@@ -60,7 +61,6 @@ from zashiki_warasi.observability import (
 from zashiki_warasi.observability.instrumentation import (
     record_call,
     set_gen_ai_attributes,
-    zashiki_span,
 )
 
 logger = logging.getLogger(__name__)
@@ -426,14 +426,16 @@ class EmailAgent:
                 f"{body}"
             )
             try:
-                with zashiki_span("llm.chat") as _span, record_call(
+                with llm_call(
+                    "classify", model=self._llm_model_name
+                ) as _lc, record_call(
                     counter=llm_calls_total,
                     histogram=llm_latency_seconds,
                     counter_labels={"node": "analyze"},
                     histogram_labels={"node": "analyze"},
                 ):
                     set_gen_ai_attributes(
-                        _span,
+                        _lc.span,
                         system=self._llm_system,
                         model=self._llm_model_name,
                     )
@@ -448,7 +450,7 @@ class EmailAgent:
                     # is a no-op on absent usage metadata, so this call is
                     # safe even when there's nothing to attach.
                     set_gen_ai_attributes(
-                        _span,
+                        _lc.span,
                         system=self._llm_system,
                         model=self._llm_model_name,
                         response=analysis,

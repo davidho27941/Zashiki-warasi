@@ -54,20 +54,26 @@ class NodeSpanCtx:
     """Handle yielded by `graph_span`. Callers may set `outcome` to
     `"skipped"` before returning from the wrapped block to distinguish
     intentional early-return paths (short-circuit, dedup hit, missing
-    field) from happy-path executions."""
+    field) from happy-path executions. `span` is exposed for callers
+    that want to attach domain-specific attributes."""
 
     outcome: str = "success"
+    span: object | None = None
 
 
 @dataclass
 class LLMCallCtx:
     """Handle yielded by `llm_call`. Callers SHOULD attach token counts
     after the LLM response returns so the OTel span carries them as
-    attributes. Missing counts are silently omitted from the span (they
-    are optional in the response body of some backends)."""
+    `zashiki.llm.*` attributes. Missing counts are silently omitted
+    from the span (they are optional in the response body of some
+    backends). `span` is exposed so callers can pass it to
+    `set_gen_ai_attributes(...)` for the OTel-standard `gen_ai.*`
+    attribute set."""
 
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    span: object | None = None
 
 
 @dataclass
@@ -78,6 +84,7 @@ class APICallCtx:
     `http.status_code`."""
 
     status_code: int | None = None
+    span: object | None = None
 
 
 @contextmanager
@@ -93,6 +100,7 @@ def graph_span(node: str, vertical: str) -> Iterator[NodeSpanCtx]:
     ctx = NodeSpanCtx()
     start = time.monotonic()
     with _TRACER_GRAPH.start_as_current_span(f"graph.{vertical}.{node}") as span:
+        ctx.span = span
         span.set_attribute("zashiki.node", node)
         span.set_attribute("zashiki.vertical", vertical)
         try:
@@ -121,6 +129,7 @@ def llm_call(purpose: str, *, model: str = "unknown") -> Iterator[LLMCallCtx]:
     ctx = LLMCallCtx()
     start = time.monotonic()
     with _TRACER_LLM.start_as_current_span(f"llm.{purpose}") as span:
+        ctx.span = span
         span.set_attribute("zashiki.llm.purpose", purpose)
         span.set_attribute("zashiki.llm.model", model)
         try:
@@ -151,6 +160,7 @@ def api_call(service: str, operation: str) -> Iterator[APICallCtx]:
     ctx = APICallCtx()
     start = time.monotonic()
     with _TRACER_API.start_as_current_span(f"api.{service}.{operation}") as span:
+        ctx.span = span
         span.set_attribute("zashiki.service", service)
         span.set_attribute("zashiki.operation", operation)
         try:

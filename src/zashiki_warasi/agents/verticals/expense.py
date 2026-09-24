@@ -33,13 +33,13 @@ from zashiki_warasi.notifications.notion import (
 )
 from zashiki_warasi.observability import (
     graph_span,
+    llm_call,
     llm_calls_total,
     llm_latency_seconds,
 )
 from zashiki_warasi.observability.instrumentation import (
     record_call,
     set_gen_ai_attributes,
-    zashiki_span,
 )
 
 logger = logging.getLogger(__name__)
@@ -350,14 +350,16 @@ class ExpenseSubgraph:
                 }
 
             user_prompt = self._build_user_prompt(email, text)
-            with zashiki_span("llm.chat") as _span, record_call(
+            with llm_call(
+                "expense_extract", model=self._llm_model_name
+            ) as _lc, record_call(
                 counter=llm_calls_total,
                 histogram=llm_latency_seconds,
                 counter_labels={"node": "expense_extract"},
                 histogram_labels={"node": "expense_extract"},
             ):
                 set_gen_ai_attributes(
-                    _span,
+                    _lc.span,
                     system=self._llm_system,
                     model=self._llm_model_name,
                 )
@@ -368,7 +370,7 @@ class ExpenseSubgraph:
                     ]
                 )
                 set_gen_ai_attributes(
-                    _span,
+                    _lc.span,
                     system=self._llm_system,
                     model=self._llm_model_name,
                     response=draft,
