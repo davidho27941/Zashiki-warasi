@@ -52,6 +52,7 @@ def main():
     conf_correct, conf_wrong = [], []
     latencies = []
     hits = 0
+    preds = []  # (confidence, correct) per row, for the hybrid sweep
 
     for i, row in enumerate(rows):
         t0 = time.monotonic()
@@ -61,6 +62,7 @@ def main():
         pred, gold = a["choice"], row["en_label"]
         ok = pred == gold
         hits += ok
+        preds.append((a["confidence"], ok))
         per_class[gold][1] += 1
         if ok:
             per_class[gold][0] += 1
@@ -98,6 +100,19 @@ def main():
               f"({hi_wrong / len(rows):.1%} of all rows) — "
               "hybrid-threshold viability signal")
 
+    # Hybrid sweep: if laya only answers when confidence ≥ T (else LLM
+    # fallback), what precision does the laya-handled slice get, and how
+    # much traffic does it cover (= LLM calls saved)?
+    print("\nhybrid sweep (accept laya when conf ≥ T, else LLM fallback):")
+    print(f"  {'T':>5s} {'coverage':>9s} {'precision':>10s} {'llm-saved/day@60':>17s}")
+    sweep = []
+    for t in (0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95):
+        take = [ok for c, ok in preds if c >= t]
+        cov = len(take) / len(preds)
+        prec = (sum(take) / len(take)) if take else 0.0
+        sweep.append({"threshold": t, "coverage": cov, "precision": prec})
+        print(f"  {t:5.2f} {cov:9.1%} {prec:10.1%} {cov * 60:17.0f}")
+
     verdict = ("GO" if overall >= 0.85 and worst >= 0.60
                else "ITERATE/NO-GO")
     print(f"\nD10 gate (≥85% overall, no class <60% at n≥5): {verdict}")
@@ -111,6 +126,7 @@ def main():
         "confusion": [{"gold": zh_by_en[g], "pred": zh_by_en[p], "n": n}
                       for (g, p), n in confusion.most_common(20)],
         "latency_ms_p50": latencies[len(latencies) // 2],
+        "hybrid_sweep": sweep,
         "verdict": verdict,
     }, open(args.report, "w", encoding="utf-8"),
         ensure_ascii=False, indent=2)
