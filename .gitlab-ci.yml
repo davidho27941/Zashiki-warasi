@@ -92,7 +92,7 @@ Build_Laya_Image:
     LAYA_IMAGE_SIZE_LIMIT_MB: "3500"
   script:
     - cd deploy/docker/laya-serve
-    - wget --header "JOB-TOKEN: $CI_JOB_TOKEN" -O checkpoint.tar.gz "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/laya-checkpoint/$LAYA_CHECKPOINT_VERSION/laya_zashiki_$LAYA_CHECKPOINT_VERSION.tar.gz"
+    - 'wget --header "JOB-TOKEN: $CI_JOB_TOKEN" -O checkpoint.tar.gz "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/laya-checkpoint/$LAYA_CHECKPOINT_VERSION/laya_zashiki_$LAYA_CHECKPOINT_VERSION.tar.gz"'
     - mkdir -p checkpoint && tar xzf checkpoint.tar.gz -C checkpoint --strip-components=1
     - docker build -t "$LAYA_IMAGE:$LAYA_CHECKPOINT_VERSION" .
     - |
