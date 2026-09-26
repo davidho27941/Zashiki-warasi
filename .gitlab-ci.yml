@@ -87,7 +87,9 @@ Build_Laya_Image:
   variables:
     LAYA_IMAGE: gitlab.davidho.dev:5050/homelab/laya-serve
     LAYA_CHECKPOINT_VERSION: "v1"
-    LAYA_IMAGE_SIZE_LIMIT_MB: "2500"
+    # Checkpoint tarball measured 1.1 GB (fp16 safetensors barely
+    # compress) + CPU torch ~0.9 GB + base → ~2.5-2.7 GB expected.
+    LAYA_IMAGE_SIZE_LIMIT_MB: "3500"
   script:
     - cd deploy/docker/laya-serve
     - wget --header "JOB-TOKEN: $CI_JOB_TOKEN" -O checkpoint.tar.gz
