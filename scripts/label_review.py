@@ -16,7 +16,7 @@ looks at them. `--suspect-only` targets exactly that population.
 
 Keys at the prompt:
     [Enter]  LLM label is correct
-    1-9/0/a-e  pick the correct category (menu shows the mapping)
+    1-9/0/a-f  pick the correct category (menu shows the mapping)
     s        skip (no verdict recorded; reappears next run)
     n        add a free-text note, then decide
     q        save and quit
@@ -39,13 +39,13 @@ import random
 import sys
 from datetime import datetime, timezone
 
-# Category order defines the hotkey map: 1-9, 0, a-e.
+# Category order defines the hotkey map: 1-9, 0, a-f.
 CATEGORIES = [
     "消費支出", "消費資訊彙整", "點數資訊彙整", "訂閱服務", "技術文章",
     "講座資訊", "會議邀請", "帳單通知", "廣告", "促銷",
-    "社交", "新聞", "安全通知", "股票資訊", "其他",
+    "社交", "新聞", "安全通知", "股票資訊", "問卷調查", "其他",
 ]
-HOTKEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "a", "b", "c", "d", "e"]
+HOTKEYS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "a", "b", "c", "d", "e", "f"]
 KEY_TO_CATEGORY = dict(zip(HOTKEYS, CATEGORIES))
 
 V141_CUTOFF = datetime(2026, 9, 23, tzinfo=timezone.utc)
@@ -84,7 +84,7 @@ def _menu() -> str:
         f"{CYAN}{k}{RESET}) {c}" for k, c in zip(HOTKEYS, CATEGORIES)
     ]
     lines = []
-    for i in range(0, 15, 3):
+    for i in range(0, len(CATEGORIES), 3):
         lines.append("  " + "  ".join(f"{cell:<18s}" for cell in cells[i:i + 3]))
     return "\n".join(lines)
 
@@ -148,7 +148,7 @@ def main() -> int:
             while True:
                 try:
                     key = input(
-                        f"[Enter]=正確 [1-9/0/a-e]=更正 [s]kip [n]ote [q]uit > "
+                        f"[Enter]=正確 [1-9/0/a-f]=更正 [s]kip [n]ote [q]uit > "
                     ).strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     key = "q"

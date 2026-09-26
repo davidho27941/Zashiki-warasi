@@ -24,6 +24,7 @@
       "news": "a news digest or current-events newsletter from a news outlet",
       "security_alert": "an account security notice: new device login, password change, one-time verification code, suspicious activity warning",
       "stock_info": "securities, ETF, or fund INFORMATION for holdings: trade confirmations, dividend notices, earnings alerts, price alerts; a sales pitch for financial products is marketing, not this",
+      "survey": "a request to fill in a survey or questionnaire: service satisfaction, post-event feedback, 'tell us how it went'; cashback or reward-point mentions in promos are NOT this",
       "other": "none of the above: general administrative or system notices that fit no other category"
     }
   },
@@ -42,6 +43,7 @@
     "news": "新聞",
     "security_alert": "安全通知",
     "stock_info": "股票資訊",
+    "survey": "問卷調查",
     "other": "其他"
   }
 }
