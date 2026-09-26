@@ -48,8 +48,27 @@ def main() -> int:
     ap.add_argument("--train-cap", type=int, default=500,
                     help="max TRAIN rows per class after split")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--verified", default="data/verified_labels.jsonl",
+                    help="label_review.py output; corrections are applied "
+                         "and human-confirmed rows lose their suspect flag")
     args = ap.parse_args()
 
+    # Human verdicts (issue #6 CLI). A verified row's label REPLACES the
+    # LLM's; a confirmed-or-corrected row is no longer suspect — it has
+    # been looked at, so it becomes eligible for the TEST split.
+    verified: dict[str, str] = {}
+    try:
+        for line in open(args.verified, encoding="utf-8"):
+            if line.strip():
+                v = json.loads(line)
+                verified[v["message_id"]] = v["verified"]
+    except FileNotFoundError:
+        pass
+    if verified:
+        print(f"applying {len(verified)} human verdicts from {args.verified}",
+              file=sys.stderr)
+
+    corrections_applied = 0
     by_class: dict[str, list[dict]] = defaultdict(list)
     for line in open(args.input, encoding="utf-8"):
         row = json.loads(line)
@@ -58,10 +77,20 @@ def main() -> int:
         analyzed = datetime.fromisoformat(row["analyzed_at"])
         if analyzed.tzinfo is None:
             analyzed = analyzed.replace(tzinfo=timezone.utc)
-        row["suspect"] = (
-            row["category"] == SUSPECT_CATEGORY and analyzed < V141_CUTOFF
-        )
+        human = verified.get(row["message_id"])
+        if human is not None:
+            if human != row["category"]:
+                corrections_applied += 1
+            row["category"] = human
+            row["suspect"] = False  # human-reviewed
+        else:
+            row["suspect"] = (
+                row["category"] == SUSPECT_CATEGORY and analyzed < V141_CUTOFF
+            )
         by_class[row["category"]].append(row)
+    if corrections_applied:
+        print(f"{corrections_applied} labels corrected by human review",
+              file=sys.stderr)
 
     rng = random.Random(args.seed)
     train: list[dict] = []
