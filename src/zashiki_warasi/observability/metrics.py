@@ -266,6 +266,40 @@ external_api_duration_seconds: Histogram = _histogram(
     buckets=_GRAPH_LATENCY_BUCKETS,
 )
 
+# --- Shadow-classifier contract (v1.6.0 add-laya-shadow-classifier) ---
+#
+# Observational only: these move ONLY when LAYA_SHADOW_ENABLED=1.
+# `engine` is currently the single value "laya" (label exists so a
+# future second candidate shares the family). The agreement counter is
+# the live confusion matrix — worst case 16×16×2 ≈ 512 series, bounded
+# and sparse in practice; the authoritative per-email record lives in
+# the `laya_shadow_predictions` table.
+
+classifier_shadow_duration_seconds: Histogram = _histogram(
+    "zashiki_classifier_shadow_duration_seconds",
+    "Wall-clock time of one shadow-classifier HTTP call (success or "
+    "failure).",
+    labelnames=("engine",),
+    buckets=_GRAPH_LATENCY_BUCKETS,
+)
+
+classifier_shadow_agreement_total: Counter = _counter(
+    "zashiki_classifier_shadow_agreement_total",
+    "One increment per successful shadow prediction. `laya_category` "
+    "is the mapped Chinese label (行事曆事件 for the merged calendar "
+    "super-class); `agreed` applies the super-class rule: laya's "
+    "行事曆事件 matches an LLM 講座資訊 OR 會議邀請.",
+    labelnames=("llm_category", "laya_category", "agreed"),
+)
+
+classifier_shadow_error_total: Counter = _counter(
+    "zashiki_classifier_shadow_error_total",
+    "Shadow attempts that produced no prediction. `reason` ∈ {timeout, "
+    "bad_response, http_5xx, connection_refused, dropped_saturated}.",
+    labelnames=("reason",),
+)
+
+
 email_end_to_end_duration_seconds: Histogram = _histogram(
     "zashiki_email_end_to_end_duration_seconds",
     "Wall-clock latency from Gmail `internalDate` to Telegram-send "
