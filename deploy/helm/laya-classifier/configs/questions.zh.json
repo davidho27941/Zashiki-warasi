@@ -1,0 +1,132 @@
+{
+  "_meta": {
+    "version": "v0.1",
+    "format": "PROVISIONAL — final wire shape pends task 1.1 jev API verification (openspec add-laya-shadow-classifier D8)",
+    "source": "Descriptions for 講座資訊/消費支出/消費資訊彙整/點數資訊彙整 transcribed from ANALYZE_SYSTEM_PROMPT; the other 11 labels had NO definition in the LLM prompt (LLM inferred from label names) — their descriptions here are new operational semantics (design D4). All examples are SYNTHETIC (public repo mirror; no real senders/merchants/amounts).",
+    "labels_contract": "ids MUST equal the 15 Category Literal values in core/schemas.py exactly; the shadow client validates at startup and refuses to boot on mismatch."
+  },
+  "type": "choice",
+  "instruction": "閱讀這封電子郵件(主旨與內文前段),從 15 個類別中選出最合適的一項。",
+  "labels": [
+    {
+      "id": "消費支出",
+      "description": "單筆真實消費的通知。必須同時具備全部四項:(a) 具體日期時間 (b) 具體店家/商戶名稱(不是「本人利用」「カード利用」這類通用敘述)(c) 金額 (d) 交易識別碼(承認番号/伝票番号/注文番号等)。缺任何一項就不是本類,應歸「消費資訊彙整」。信件下方的手續費條款或 boilerplate 不算獨立交易。",
+      "examples": [
+        "【デビットカード】ご利用のお知らせ — ◇利用日時:2026/09/20 12:34 ◇利用先:サンプルストア渋谷店 ◇利用金額:1,280円 ◇承認番号:012345",
+        "刷卡消費通知:2026/09/21 18:05 於「範例咖啡 信義店」消費 NT$150,授權碼 654321"
+      ]
+    },
+    {
+      "id": "消費資訊彙整",
+      "description": "多筆消費的彙總、或缺少完整單筆細節的消費摘要。信用卡多筆刷卡紀錄彙總、當日消費總額速報(沒有具體店家名稱、沒有承認番号/注文番号)都屬本類 — 即便金額看起來只有一筆。",
+      "examples": [
+        "【速報版】カード利用のお知らせ(本人ご利用分)— 9/22 ご利用金額合計:3,456円(店舗名・承認番号は後日確定)",
+        "本週信用卡消費彙總:共 7 筆,合計 NT$4,321,明細請登入網銀查看"
+      ]
+    },
+    {
+      "id": "點數資訊彙整",
+      "description": "點數(ポイント)獲得、使用、到期的通知或週期彙整。楽天ポイント、d ポイント、悠遊付點數等。點數異動不視為「消費支出」。",
+      "examples": [
+        "サンプルポイントカード:2026/09/15-09/21 期間獲得的點數明細 — 於「範例超市」獲得 12 點,合計 12 點",
+        "您的會員點數即將到期:300 點將於 2026/10/31 失效"
+      ]
+    },
+    {
+      "id": "訂閱服務",
+      "description": "訂閱制服務的生命週期通知:續訂確認、扣款週期開始、方案變更、試用到期。重點是「訂閱關係」本身,不是單筆消費明細。",
+      "examples": [
+        "您的範例串流方案已自動續訂,下次扣款日 2026/10/26",
+        "Your Example Cloud subscription renews in 7 days"
+      ]
+    },
+    {
+      "id": "技術文章",
+      "description": "技術內容的文章、電子報、digest:工程部落格、開發者週報、技術雷達、開源專案動態。內容以技術知識為主體,不是課程促銷。",
+      "examples": [
+        "本週開發者週報:淺談向量資料庫的索引策略",
+        "Example Engineering Blog: How we cut build times by 60%"
+      ]
+    },
+    {
+      "id": "講座資訊",
+      "description": "具體場次的講座/活動/研討會。必須同時具備:(a) 明確的活動日期或時間(如 2026-09-17、9/17 19:30、週四 19:30,不是「近期」「即將推出」「隨時上課」)且 (b) 明確的地點或線上會議連結(實體地址、場館名稱、Zoom/Meet 網址、或「線上」字樣)。缺任一 → 歸「廣告」「促銷」或「其他」。MOOC/線上課程推薦信即使提到上課、講師,只要沒有明確開課場次日期就是「廣告」。",
+      "examples": [
+        "範例開發者社群 10 月月會 — 2026/10/15 19:30 於範例書店三樓,主題:WebAssembly 入門",
+        "Example Webinar: Protein Analysis Methods — Oct 20, 2026 9:00 AM PT, Zoom link inside"
+      ]
+    },
+    {
+      "id": "會議邀請",
+      "description": "指名邀請收件人出席的會議:含具體時間,通常有主辦人/與會者資訊或行事曆附件(.ics)。與「講座資訊」的差異:會議邀請是對收件人個人的邀約,講座是公開活動的資訊。",
+      "examples": [
+        "會議邀請:產品週會 — 2026/09/29 (一) 14:00-15:00,範例會議室 A",
+        "Invitation: Project sync @ Thu Oct 2, 2026 10am (Google Meet)"
+      ]
+    },
+    {
+      "id": "帳單通知",
+      "description": "待繳費用的帳單成立或繳費期限通知:水電瓦斯、電信、信用卡帳單已出帳等。重點是「有一筆待繳金額」。",
+      "examples": [
+        "您的 9 月電信帳單已產生:NT$599,繳費期限 2026/10/15",
+        "ご請求金額確定のお知らせ:10月支払分 12,345円"
+      ]
+    },
+    {
+      "id": "廣告",
+      "description": "一般行銷宣傳:產品/服務/課程推薦、品牌宣傳、招募型內容,沒有具體可兌換的優惠。MOOC 課程推薦(無開課日期)、金融產品(基金、ETF、信貸)推銷都屬本類。",
+      "examples": [
+        "為你推薦:雲端資料工程線上課程,隨時開始學習",
+        "範例銀行:認識我們的新基金組合,讓資產穩健成長"
+      ]
+    },
+    {
+      "id": "促銷",
+      "description": "有具體優惠的行銷:折扣碼、優惠券、限時特價、買一送一 — 有明確的優惠內容與(通常)截止期限,收件人可直接行動兌換。與「廣告」的差異:促銷有具體 offer,廣告只有宣傳。",
+      "examples": [
+        "限時三天:全站 8 折,結帳輸入 SAVE20",
+        "範例超商 App 優惠券:拿鐵買一送一(至 9/30)"
+      ]
+    },
+    {
+      "id": "社交",
+      "description": "社交平台通知或私人往來:好友動態、留言/追蹤通知、私人信件、社群互動摘要。",
+      "examples": [
+        "有人在貼文中提到你:查看留言",
+        "範例社群:您有 3 則新通知"
+      ]
+    },
+    {
+      "id": "新聞",
+      "description": "時事新聞、新聞媒體電子報、每日/每週新聞摘要。以報導時事為主體,不是技術教學也不是行銷。",
+      "examples": [
+        "今日焦點:央行利率決議與市場反應",
+        "Example Daily Brief: Top stories this morning"
+      ]
+    },
+    {
+      "id": "安全通知",
+      "description": "帳號安全相關通知:新裝置登入、密碼變更、驗證碼、異常活動警示、二階段驗證設定。",
+      "examples": [
+        "偵測到新裝置登入您的帳號 — 若非本人操作請立即變更密碼",
+        "您的一次性驗證碼:123456(10 分鐘內有效)"
+      ]
+    },
+    {
+      "id": "股票資訊",
+      "description": "證券/ETF/基金相關資訊:成交回報、配息通知、財報快訊、價格到價提醒、持股月報。注意:金融產品的「推銷」不屬本類,歸「廣告」。",
+      "examples": [
+        "成交回報:範例 ETF 買進 100 股,成交價 50.25",
+        "配息通知:您持有的範例基金將於 2026/10/05 發放每單位 0.35 元"
+      ]
+    },
+    {
+      "id": "其他",
+      "description": "不屬於以上任何類別的郵件:一般事務通知、系統通知、無法歸類的內容。",
+      "examples": [
+        "您的包裹已送達管理室,請於三日內領取",
+        "系統維護通知:服務將於週日凌晨 2:00-4:00 暫停"
+      ]
+    }
+  ]
+}
