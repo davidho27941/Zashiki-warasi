@@ -62,6 +62,7 @@ docs/lessons/
 scripts/
 # Committed exceptions: repo tooling that happens to live under scripts/
 !scripts/check_env_parity.py
+!scripts/backfill_training_pairs.py
 
 # Repo-root scratch YAML — k3s helm-values / other one-off overrides
 # an operator might drop next to the repo (e.g. `alloy.yaml`,
@@ -76,3 +77,7 @@ scripts/
 deploy/helm/exports/
 deploy/helm/values.*.yaml
 !deploy/helm/values.*.yaml.example
+
+# laya fine-tune artifacts — real mail text + checkpoints; never commit (public mirror)
+data/
+training_pairs*.jsonl
