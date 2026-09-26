@@ -3,30 +3,33 @@
 Everything runs on the 4090 box. Training data holds real mail text —
 it never leaves the LAN (design D10: privacy is why we're not on Kaggle).
 
-## 1. Ship files from the laptop (run ON THE LAPTOP)
+## 1. Get code (clone) + data (scp — gitignored, not in the repo)
 
 ```bash
+# ON nttu-gpu-lab:
+git clone --branch feature/laya-shadow-classifier-v1.6.0 --depth 1 \
+    ssh://git@gitlab.davidho.dev:222/homelab/zashiki-warasi.git ~/laya-finetune
+mkdir -p ~/laya-finetune/data
+
+# ON THE LAPTOP:
 cd ~/workplace/homelab/Zashiki-warasi
-ssh david@192.168.1.254 'mkdir -p ~/laya-finetune'
-scp scripts/finetune/*.py \
-    deploy/helm/laya-classifier/configs/questions.json \
-    data/train.jsonl data/test.jsonl \
-    david@192.168.1.254:~/laya-finetune/
+scp data/train.jsonl data/test.jsonl david@192.168.1.254:~/laya-finetune/data/
 ```
 
-## 2. Environment (run ON nttu-gpu-lab, once)
+Later script fixes: `git pull` on the box instead of re-scp'ing.
+
+## 2. Environment (uv, once)
 
 ```bash
 cd ~/laya-finetune
-python3 -m venv venv
-source venv/bin/activate
-pip install -U pip
-pip install "laya==0.3.20" "transformers>=4.48.0" safetensors huggingface_hub
-# CUDA torch: laya pulls torch; verify it sees the GPU —
-python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
-# If cuda.is_available() is False, install the CUDA wheel explicitly:
-#   pip install torch --index-url https://download.pytorch.org/whl/cu124
+uv venv --python 3.12
+uv pip install "laya==0.3.20" "transformers>=4.48.0" safetensors huggingface_hub
+.venv/bin/python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+# cuda.is_available() must be True. If False, install the CUDA wheel:
+#   uv pip install torch --index-url https://download.pytorch.org/whl/cu124
 ```
+
+(If `uv` is missing on the box: `curl -LsSf https://astral.sh/uv/install.sh | sh`.)
 
 ## 3. VRAM check (llama.cpp holds ~18.4 GB of 24 GB)
 
@@ -44,12 +47,14 @@ Ladder — try in order, move down only on OOM:
 ## 4. Train (~1-3 h expected for 3.9k items × 4 epochs on a 4090)
 
 ```bash
-cd ~/laya-finetune && source venv/bin/activate
-nohup python train_laya_zashiki.py \
-    --train train.jsonl --questions questions.json \
-    --output laya_zashiki_v1 --micro-batch 4 --grad-accum 8 \
-    > train.log 2>&1 &
-tail -f train.log          # Ctrl-C detaches from tail only
+cd ~/laya-finetune/scripts/finetune
+nohup ../../.venv/bin/python train_laya_zashiki.py \
+    --train ../../data/train.jsonl \
+    --questions ../../deploy/helm/laya-classifier/configs/questions.json \
+    --output ~/laya-finetune/laya_zashiki_v1 \
+    --micro-batch 4 --grad-accum 8 \
+    > ~/laya-finetune/train.log 2>&1 &
+tail -f ~/laya-finetune/train.log     # Ctrl-C detaches from tail only
 ```
 
 Rolling checkpoint lands in `laya_zashiki_v1/checkpoint_latest/` after
@@ -58,12 +63,16 @@ every epoch — a crash never loses more than one epoch.
 ## 5. Evaluate — the D10 gate
 
 ```bash
-# Fine-tuned:
-python eval_laya_zashiki.py --model laya_zashiki_v1 \
-    --test test.jsonl --questions questions.json --report eval_tuned.json
+cd ~/laya-finetune/scripts/finetune
+../../.venv/bin/python eval_laya_zashiki.py --model ~/laya-finetune/laya_zashiki_v1 \
+    --test ../../data/test.jsonl \
+    --questions ../../deploy/helm/laya-classifier/configs/questions.json \
+    --report ~/laya-finetune/eval_tuned.json
 # Zero-shot baseline for the delta (optional but nice for the record):
-python eval_laya_zashiki.py --model base \
-    --test test.jsonl --questions questions.json --report eval_base.json
+../../.venv/bin/python eval_laya_zashiki.py --model base \
+    --test ../../data/test.jsonl \
+    --questions ../../deploy/helm/laya-classifier/configs/questions.json \
+    --report ~/laya-finetune/eval_base.json
 ```
 
 Gate: **overall ≥85% AND no class <60% (n≥5) → GO**; below → paste
