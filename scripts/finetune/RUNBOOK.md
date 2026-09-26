@@ -50,7 +50,7 @@ Ladder — try in order, move down only on OOM:
 cd ~/laya-finetune/scripts/finetune
 nohup ../../.venv/bin/python train_laya_zashiki.py \
     --train ../../data/train.jsonl \
-    --questions ../../deploy/helm/laya-classifier/configs/questions.json \
+    --questions ../../deploy/helm/zashiki-warasi/configs/laya-questions.json \
     --output ~/laya-finetune/laya_zashiki_v1 \
     --micro-batch 4 --grad-accum 8 \
     > ~/laya-finetune/train.log 2>&1 &
@@ -66,12 +66,12 @@ every epoch — a crash never loses more than one epoch.
 cd ~/laya-finetune/scripts/finetune
 ../../.venv/bin/python eval_laya_zashiki.py --model ~/laya-finetune/laya_zashiki_v1 \
     --test ../../data/test.jsonl \
-    --questions ../../deploy/helm/laya-classifier/configs/questions.json \
+    --questions ../../deploy/helm/zashiki-warasi/configs/laya-questions.json \
     --report ~/laya-finetune/eval_tuned.json
 # Zero-shot baseline for the delta (optional but nice for the record):
 ../../.venv/bin/python eval_laya_zashiki.py --model base \
     --test ../../data/test.jsonl \
-    --questions ../../deploy/helm/laya-classifier/configs/questions.json \
+    --questions ../../deploy/helm/zashiki-warasi/configs/laya-questions.json \
     --report ~/laya-finetune/eval_base.json
 ```
 

@@ -1,0 +1,9 @@
+apiVersion: v2
+name: laya-classifier
+description: >-
+  laya-serve with the fine-tuned zashiki checkpoint baked in — the
+  shadow classifier backend (v1.6.0 add-laya-shadow-classifier).
+  Observational only: the zashiki pipeline never routes on its output.
+type: application
+version: 0.1.0
+appVersion: "zashiki-v1"

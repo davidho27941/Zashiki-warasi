@@ -21,6 +21,11 @@
 
 # ---------- Non-secret env overrides ----------
 env:
+  # ---- v1.6.0 laya shadow classifier (observational; off by default) ----
+  # LAYA_SHADOW_ENABLED: "1"
+  # LAYA_BASE_URL: http://<release>-laya-classifier.<namespace>.svc:8000
+  # LAYA_QUESTIONS_PATH: /etc/zashiki/laya-questions.json
+  # LAYA_SEMANTIC_VER: zashiki-v1
   # Local / self-hosted LLM (llama.cpp / vLLM / Ollama) reachable from the cluster.
   # Example: http://192.168.x.x:8000/v1  OR  http://llama.svc.cluster.local:8000/v1
   LLM_BASE_URL: http://<llm-host>:<llm-port>/v1

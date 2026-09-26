@@ -537,7 +537,7 @@ class LayaSettings(BaseSettings):
         description="Per-request timeout for the shadow HTTP call.",
     )
     questions_path: str = Field(
-        default="deploy/helm/laya-classifier/configs/questions.json",
+        default="deploy/helm/zashiki-warasi/configs/laya-questions.json",
         description=(
             "Path to the questions dict (ConfigMap mount in k8s; repo "
             "path in local dev). Loaded once at client startup; its "

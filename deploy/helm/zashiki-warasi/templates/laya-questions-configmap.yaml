@@ -1,0 +1,17 @@
+{{- /*
+v1.6.0 shadow classifier: the questions dict the zashiki-side shadow
+client sends with every laya request (per D8, laya-serve is
+task-stateless). Mounted read-only at /etc/zashiki/; the client points
+at it via LAYA_QUESTIONS_PATH in values.env. Content edits rotate
+`laya_model_ver` automatically (dict-hash half), opening a fresh
+comparison series without human bookkeeping.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "zashiki-warasi.fullname" . }}-laya-questions
+  labels:
+    {{- include "zashiki-warasi.labels" . | nindent 4 }}
+data:
+  laya-questions.json: |
+{{ .Files.Get "configs/laya-questions.json" | indent 4 }}

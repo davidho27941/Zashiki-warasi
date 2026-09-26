@@ -24,7 +24,7 @@ from zashiki_warasi.core.schemas import EmailMessage
 from zashiki_warasi.observability import REGISTRY
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
-DICT_PATH = str(REPO / "deploy/helm/laya-classifier/configs/questions.json")
+DICT_PATH = str(REPO / "deploy/helm/zashiki-warasi/configs/laya-questions.json")
 
 
 def _email(msg_id="m-shadow-1") -> EmailMessage:
