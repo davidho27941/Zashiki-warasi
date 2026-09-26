@@ -25,21 +25,21 @@ and bump `LAYA_CHECKPOINT_VERSION` when triggering the build job.
 changes rarely; no point building 2 GB on every push). Trigger it from
 the pipeline UI; it downloads the checkpoint with the job's own
 `CI_JOB_TOKEN`, bakes it, and pushes
-`gitlab.davidho.dev:5050/homelab/laya-serve:<version>`.
+`gitlab.davidho.dev:5050/homelab/zashiki-warasi/laya-serve:<version>`.
 
 ## Local build (fallback, e.g. registry quirks)
 
 ```bash
 cd deploy/docker/laya-serve
 mkdir -p checkpoint && tar xzf /path/to/laya_zashiki_v1.tar.gz -C checkpoint --strip-components=1
-docker build -t gitlab.davidho.dev:5050/homelab/laya-serve:v1 .
-docker push gitlab.davidho.dev:5050/homelab/laya-serve:v1
+docker build -t gitlab.davidho.dev:5050/homelab/zashiki-warasi/laya-serve:v1 .
+docker push gitlab.davidho.dev:5050/homelab/zashiki-warasi/laya-serve:v1
 ```
 
 ## Smoke (task 1.4 — no-network start proves weights are baked)
 
 ```bash
-docker run --rm --network=none -p 8000:8000 gitlab.davidho.dev:5050/homelab/laya-serve:v1 &
+docker run --rm --network=none -p 8000:8000 gitlab.davidho.dev:5050/homelab/zashiki-warasi/laya-serve:v1 &
 sleep 30 && curl -s localhost:8000/health
 curl -s -X POST localhost:8000/v1/systemone -H 'content-type: application/json' \
   -d '{"state":"限時三天全站 8 折!結帳輸入 SAVE20","questions":{"category":{"type":"choice","instructions":"Which category?","criteria":{"promotion":"a discount offer","other":"none"}}}}'

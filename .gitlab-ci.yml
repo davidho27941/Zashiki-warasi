@@ -85,7 +85,10 @@ Build_Laya_Image:
   rules:
     - when: manual
   variables:
-    LAYA_IMAGE: gitlab.davidho.dev:5050/homelab/laya-serve
+    # Registry paths are project-scoped: the job token can only write
+    # under this project's own registry, so laya-serve lives as a
+    # sub-path of zashiki-warasi's registry (GitLab allows two levels).
+    LAYA_IMAGE: gitlab.davidho.dev:5050/homelab/$CI_PROJECT_NAME/laya-serve
     LAYA_CHECKPOINT_VERSION: "v1"
     # Checkpoint tarball measured 1.1 GB (fp16 safetensors barely
     # compress) + CPU torch ~0.9 GB + base → ~2.5-2.7 GB expected.
