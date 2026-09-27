@@ -98,6 +98,8 @@ def _mock_calendar_client(
     events: list[ExistingEvent] | None = None,
     insert_result: InsertedEvent | Exception | None = None,
     freebusy_error: Exception | None = None,
+    ical_uid_hits: list[ExistingEvent] | Exception | None = None,
+    fingerprint_hits: list[ExistingEvent] | Exception | None = None,
 ) -> MagicMock:
     client = MagicMock(name="calendar_client")
     if freebusy_error is not None:
@@ -105,6 +107,20 @@ def _mock_calendar_client(
     else:
         client.check_free_busy.return_value = busy or []
     client.list_events_in_window.return_value = events or []
+    # v1.7.0 dedup lookups — default to MISS ([]), else every create
+    # test would see MagicMock's truthy auto-attribute as a "hit".
+    if isinstance(ical_uid_hits, Exception):
+        client.list_events_by_ical_uid.side_effect = ical_uid_hits
+    else:
+        client.list_events_by_ical_uid.return_value = ical_uid_hits or []
+    if isinstance(fingerprint_hits, Exception):
+        client.list_events_by_private_extended_property.side_effect = (
+            fingerprint_hits
+        )
+    else:
+        client.list_events_by_private_extended_property.return_value = (
+            fingerprint_hits or []
+        )
     if isinstance(insert_result, Exception):
         client.insert_event.side_effect = insert_result
     else:
@@ -679,7 +695,7 @@ class TestInsertPayload:
                 end=datetime(2026, 9, 15, 14, 30, tzinfo=timezone.utc),
             )
         ]
-        payload = _build_insert_payload(_draft(), "msg-1", "uid-1", conflicts)
+        payload = _build_insert_payload(_draft(), "msg-1", "uid-1", conflicts, "fp-test")
 
         assert payload["status"] == "tentative"
         assert payload["iCalUID"] == "uid-1"
@@ -690,7 +706,7 @@ class TestInsertPayload:
     def test_no_conflicts_no_conflict_section(self, fake_email):
         from zashiki_warasi.agents.verticals.calendar import _build_insert_payload
 
-        payload = _build_insert_payload(_draft(), "msg-2", "uid-2", [])
+        payload = _build_insert_payload(_draft(), "msg-2", "uid-2", [], "fp-test")
         assert "Time conflicts" not in payload["description"]
 
     def test_more_than_3_conflicts_truncated(self, fake_email):
@@ -705,7 +721,7 @@ class TestInsertPayload:
             )
             for i in range(5)
         ]
-        payload = _build_insert_payload(_draft(), "msg-3", "uid-3", conflicts)
+        payload = _build_insert_payload(_draft(), "msg-3", "uid-3", conflicts, "fp-test")
         assert "and 2 more" in payload["description"]
 
     def test_tz_aware_utc_draft_rebased_to_default_taipei(self):
@@ -719,7 +735,7 @@ class TestInsertPayload:
             start=datetime(2026, 9, 17, 11, 30, tzinfo=timezone.utc),
             end=datetime(2026, 9, 17, 13, 30, tzinfo=timezone.utc),
         )
-        payload = _build_insert_payload(draft, "m", "u", [])
+        payload = _build_insert_payload(draft, "m", "u", [], "fp-test")
         # 11:30 UTC = 19:30 Asia/Taipei; emitted naive; timeZone hint set.
         assert payload["start"]["dateTime"] == "2026-09-17T19:30:00"
         assert payload["start"]["timeZone"] == "Asia/Taipei"
@@ -742,7 +758,7 @@ class TestInsertPayload:
             end=datetime(2026, 9, 17, 21, 30),
             timezone_hint="Asia/Taipei",
         )
-        payload = _build_insert_payload(draft, "m", "u", [])
+        payload = _build_insert_payload(draft, "m", "u", [], "fp-test")
         assert payload["start"]["dateTime"] == "2026-09-17T19:30:00"
         assert payload["start"]["timeZone"] == "Asia/Taipei"
 
@@ -757,7 +773,7 @@ class TestInsertPayload:
             end=datetime(2026, 9, 17, 21, 30),
             timezone_hint="Asia/Tokyo",
         )
-        payload = _build_insert_payload(draft, "m", "u", [])
+        payload = _build_insert_payload(draft, "m", "u", [], "fp-test")
         assert payload["start"]["timeZone"] == "Asia/Tokyo"
         assert payload["start"]["dateTime"] == "2026-09-17T19:30:00"
 
@@ -844,7 +860,7 @@ class TestSanitizeTzHint:
             end=datetime(2026, 9, 17, 21, 30),
             timezone_hint="UTC",
         )
-        payload = _build_insert_payload(draft, "m", "u", [])
+        payload = _build_insert_payload(draft, "m", "u", [], "fp-test")
         assert payload["start"]["timeZone"] == "Asia/Taipei"
         assert payload["start"]["dateTime"] == "2026-09-17T19:30:00"
         assert payload["end"]["timeZone"] == "Asia/Taipei"
@@ -1011,3 +1027,331 @@ class TestCreateGraphSpanOutcomes:
         })
         after = _read_graph_count("create", "calendar_sg", "error")
         assert after == before + 1.0
+
+
+# ---------- v1.7.0 dedup -------------------------------------------------
+
+
+class TestNormalization:
+    def test_summary_strips_noise_prefixes_iteratively(self):
+        from zashiki_warasi.agents.verticals.calendar import _normalize_summary
+
+        assert (
+            _normalize_summary("Fwd: Fwd: [Reminder] Bio-protocol Webinar")
+            == "bio-protocol webinar"
+        )
+        assert _normalize_summary("Re: [提醒] 產品週會") == "產品週會"
+        assert (
+            _normalize_summary("[Starting Soon]  Webinar")
+            == "webinar"
+        )
+        assert _normalize_summary("[即將開始] 講座") == "講座"
+
+    def test_summary_collapses_whitespace_and_lowercases(self):
+        from zashiki_warasi.agents.verticals.calendar import _normalize_summary
+
+        assert _normalize_summary("  Product\t\tWeekly   SYNC ") == (
+            "product weekly sync"
+        )
+
+    def test_prefix_inside_title_survives(self):
+        from zashiki_warasi.agents.verticals.calendar import _normalize_summary
+
+        # Only LEADING noise strips — a legit "re:" mid-title stays.
+        assert _normalize_summary("Deep dive: Re: invent recap") == (
+            "deep dive: re: invent recap"
+        )
+
+    def test_bucket_rounds_down(self):
+        from zoneinfo import ZoneInfo
+
+        from zashiki_warasi.agents.verticals.calendar import _bucket_start_5min
+
+        utc = ZoneInfo("UTC")
+        assert _bucket_start_5min(datetime(2026, 9, 15, 14, 7), utc) == (
+            "2026-09-15T14:05"
+        )
+        assert _bucket_start_5min(datetime(2026, 9, 15, 14, 0), utc) == (
+            "2026-09-15T14:00"
+        )
+        assert _bucket_start_5min(
+            datetime(2026, 9, 15, 14, 59, 59), utc
+        ) == "2026-09-15T14:55"
+
+    def test_bucket_converts_aware_and_naive_to_same_utc(self):
+        """The .ics path yields tz-aware starts; the LLM path yields
+        naive + hint. Same instant MUST land in the same bucket."""
+        from zoneinfo import ZoneInfo
+
+        from zashiki_warasi.agents.verticals.calendar import _bucket_start_5min
+
+        taipei = ZoneInfo("Asia/Taipei")
+        aware = datetime(2026, 9, 15, 6, 2, tzinfo=timezone.utc)
+        naive_taipei = datetime(2026, 9, 15, 14, 3)  # 06:03 UTC
+        assert _bucket_start_5min(aware, taipei) == _bucket_start_5min(
+            naive_taipei, taipei
+        )
+
+    def test_location_normalization(self):
+        from zashiki_warasi.agents.verticals.calendar import (
+            _normalize_location,
+        )
+
+        assert _normalize_location(None) == ""
+        assert _normalize_location("") == ""
+        assert _normalize_location("   ") == ""
+        assert _normalize_location("Zoom　Meeting  Room") == (
+            "zoom meeting room"
+        )
+        assert _normalize_location("信義區辦公室") == "信義區辦公室"
+
+
+class TestComputeFingerprint:
+    def _fp(self, **overrides) -> str:
+        from zashiki_warasi.agents.verticals.calendar import (
+            _compute_fingerprint,
+        )
+
+        base = dict(
+            title="Bio-protocol Webinar",
+            start=datetime(2026, 9, 29, 9, 0),
+            end=datetime(2026, 9, 29, 10, 0),
+            location="Zoom",
+            timezone_hint="Asia/Taipei",
+        )
+        base.update(overrides)
+        return _compute_fingerprint(
+            CalendarEventDraft(**base), default_tz="Asia/Taipei"
+        )
+
+    def test_deterministic(self):
+        assert self._fp() == self._fp()
+
+    def test_reminder_variants_collapse(self):
+        assert self._fp(title="[Reminder] Bio-protocol   webinar") == self._fp()
+        assert self._fp(title="Fwd: Re: BIO-PROTOCOL Webinar") == self._fp()
+
+    def test_start_jitter_within_bucket_collapses(self):
+        assert self._fp(start=datetime(2026, 9, 29, 9, 4)) == self._fp()
+
+    def test_different_bucket_differs(self):
+        assert self._fp(start=datetime(2026, 9, 29, 9, 5)) != self._fp()
+
+    def test_different_location_differs(self):
+        assert self._fp(location="Google Meet") != self._fp()
+
+    def test_end_not_in_fingerprint(self):
+        assert self._fp(end=datetime(2026, 9, 29, 11, 30)) == self._fp()
+
+
+def _existing_hit() -> ExistingEvent:
+    return ExistingEvent(
+        id="gcal-existing",
+        title="產品週會",
+        start=datetime(2026, 9, 15, 14, 0, tzinfo=timezone.utc),
+        end=datetime(2026, 9, 15, 15, 0, tzinfo=timezone.utc),
+    )
+
+
+class TestDedupLayerOne:
+    def test_ical_uid_hit_skips_without_insert(self, fake_email):
+        calendar_client = _mock_calendar_client(
+            ical_uid_hits=[_existing_hit()],
+        )
+        sg = _sg(_build_model_returning(None), MagicMock(), calendar_client)
+
+        out = sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": _draft(),
+        })
+        assert isinstance(out["side_effect"], CalendarSkipped)
+        assert out["side_effect"].reason == "duplicate_by_ical_uid"
+        assert "gcal-existing" in out["side_effect"].detail
+        calendar_client.insert_event.assert_not_called()
+
+    def test_ical_uid_miss_falls_through_to_layer_two(self, fake_email):
+        calendar_client = _mock_calendar_client()
+        sg = _sg(_build_model_returning(None), MagicMock(), calendar_client)
+
+        out = sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": _draft(),
+        })
+        assert isinstance(out["side_effect"], CalendarCreated)
+        calendar_client.list_events_by_ical_uid.assert_called_once_with(
+            "ics-uid@example.com"
+        )
+        calendar_client.list_events_by_private_extended_property.assert_called_once()
+
+    def test_no_ical_uid_skips_layer_one(self, fake_email):
+        draft = CalendarEventDraft(
+            title="test",
+            start=datetime(2026, 9, 17, 19, 30),
+            end=datetime(2026, 9, 17, 21, 30),
+        )
+        calendar_client = _mock_calendar_client()
+        sg = _sg(_build_model_returning(None), MagicMock(), calendar_client)
+
+        out = sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": draft,
+        })
+        assert isinstance(out["side_effect"], CalendarCreated)
+        calendar_client.list_events_by_ical_uid.assert_not_called()
+
+    def test_layer_one_error_falls_through_to_layer_two(
+        self, fake_email, caplog
+    ):
+        import logging as _logging
+
+        calendar_client = _mock_calendar_client(
+            ical_uid_hits=CalendarError("500"),
+            fingerprint_hits=[_existing_hit()],
+        )
+        sg = _sg(_build_model_returning(None), MagicMock(), calendar_client)
+
+        with caplog.at_level(_logging.WARNING):
+            out = sg._create_node({
+                "email": fake_email, "analysis": None,
+                "side_effect": None, "extracted": _draft(),
+            })
+        assert out["side_effect"].reason == "duplicate_by_fingerprint"
+        assert any("Layer 1" in m for m in caplog.messages)
+
+
+class TestDedupLayerTwo:
+    def test_fingerprint_hit_skips_without_insert(self, fake_email):
+        draft = CalendarEventDraft(
+            title="[Reminder] Bio-protocol Webinar",
+            start=datetime(2026, 9, 29, 9, 0),
+            end=datetime(2026, 9, 29, 10, 0),
+        )
+        calendar_client = _mock_calendar_client(
+            fingerprint_hits=[_existing_hit()],
+        )
+        sg = _sg(_build_model_returning(None), MagicMock(), calendar_client)
+
+        out = sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": draft,
+        })
+        assert isinstance(out["side_effect"], CalendarSkipped)
+        assert out["side_effect"].reason == "duplicate_by_fingerprint"
+        calendar_client.insert_event.assert_not_called()
+
+    def test_fingerprint_lookup_uses_versioned_key_and_window(
+        self, fake_email
+    ):
+        calendar_client = _mock_calendar_client()
+        sg = _sg(_build_model_returning(None), MagicMock(), calendar_client)
+
+        sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": _draft(),
+        })
+        call = calendar_client.list_events_by_private_extended_property.call_args
+        assert call.args[0] == "zwFingerprintV1"
+        assert len(call.args[1]) == 40  # sha1 hex
+        window = call.kwargs["time_max"] - call.kwargs["time_min"]
+        assert window.days == 2  # start ± 1d
+
+    def test_miss_inserts_with_fingerprint_stamped(self, fake_email):
+        calendar_client = _mock_calendar_client()
+        sg = _sg(_build_model_returning(None), MagicMock(), calendar_client)
+
+        out = sg._create_node({
+            "email": fake_email, "analysis": None,
+            "side_effect": None, "extracted": _draft(),
+        })
+        assert isinstance(out["side_effect"], CalendarCreated)
+        payload = calendar_client.insert_event.call_args.args[0]
+        stamped = payload["extendedProperties"]["private"]["zwFingerprintV1"]
+        # The stamp must be the SAME hash the lookup queried —
+        # single-source `_compute_fingerprint` (design D3 property).
+        queried = (
+            calendar_client.list_events_by_private_extended_property
+            .call_args.args[1]
+        )
+        assert stamped == queried
+        # Forensic message-id key still present alongside.
+        assert (
+            payload["extendedProperties"]["private"]["zashiki_message_id"]
+            == fake_email.id
+        )
+
+    def test_reminder_variant_hits_same_fingerprint_as_invite(
+        self, fake_email
+    ):
+        from zashiki_warasi.agents.verticals.calendar import (
+            _compute_fingerprint,
+        )
+
+        invite = CalendarEventDraft(
+            title="Bio-protocol Webinar",
+            start=datetime(2026, 9, 29, 9, 0),
+            end=datetime(2026, 9, 29, 10, 0),
+        )
+        reminder = CalendarEventDraft(
+            title="[提醒] Fwd: Bio-protocol  Webinar",
+            start=datetime(2026, 9, 29, 9, 3),  # LLM jitter within bucket
+            end=datetime(2026, 9, 29, 10, 30),  # end differs — excluded
+        )
+        assert _compute_fingerprint(
+            invite, default_tz="Asia/Taipei"
+        ) == _compute_fingerprint(reminder, default_tz="Asia/Taipei")
+
+
+class TestDedupBothLayersFail:
+    def test_both_lookups_error_insert_proceeds(self, fake_email, caplog):
+        import logging as _logging
+
+        calendar_client = _mock_calendar_client(
+            ical_uid_hits=CalendarError("500"),
+            fingerprint_hits=CalendarError("503"),
+        )
+        sg = _sg(_build_model_returning(None), MagicMock(), calendar_client)
+
+        with caplog.at_level(_logging.WARNING):
+            out = sg._create_node({
+                "email": fake_email, "analysis": None,
+                "side_effect": None, "extracted": _draft(),
+            })
+        # Best-effort semantics: dedup failure never blocks the event.
+        assert isinstance(out["side_effect"], CalendarCreated)
+        warned = [m for m in caplog.messages if "dedup Layer" in m]
+        assert len(warned) == 2
+        calendar_client.insert_event.assert_called_once()
+
+
+class TestDuplicateSkipNotifyWording:
+    @pytest.mark.parametrize(
+        "reason", ["duplicate_by_ical_uid", "duplicate_by_fingerprint"]
+    )
+    def test_duplicate_reasons_render_friendly_line(self, reason):
+        from zashiki_warasi.agents.email_agent import (
+            _format_calendar_skipped,
+        )
+
+        text = _format_calendar_skipped(
+            CalendarSkipped(
+                reason=reason,
+                detail="產品週會 @ 2026-09-15T14:00:00+00:00 (event abc)",
+            )
+        )
+        assert "已跳過" in text
+        assert "此事件已存在於行事曆" in text
+        assert "產品週會" in text
+        # Distinct from the failure wordings.
+        assert "行事曆事件未建立" not in text
+
+    def test_failure_reasons_unchanged(self):
+        from zashiki_warasi.agents.email_agent import (
+            _format_calendar_skipped,
+        )
+
+        text = _format_calendar_skipped(
+            CalendarSkipped(reason="no_event_signal")
+        )
+        assert "行事曆事件未建立" in text
+        assert "內文無明確活動時間" in text
+        assert "已存在" not in text

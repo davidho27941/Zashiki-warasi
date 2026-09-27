@@ -252,3 +252,134 @@ class TestInsertEvent:
         client = _client(service)
         result = client.insert_event(self._payload)
         assert "eventedit/gcal-evt-no-link" in result.view_url
+
+
+# ---- v1.7.0 dedup lookups -------------------------------------------------
+
+
+class TestListEventsByIcalUid:
+    def test_empty_response(self):
+        service = _fake_service({"events.list.execute": {"items": []}})
+        client = _client(service)
+        assert client.list_events_by_ical_uid("uid@example.com") == []
+
+    def test_single_hit_mapped(self):
+        service = _fake_service({
+            "events.list.execute": {
+                "items": [{
+                    "id": "ev-1",
+                    "summary": "產品週會",
+                    "start": {"dateTime": "2026-09-15T14:00:00+08:00"},
+                    "end": {"dateTime": "2026-09-15T15:00:00+08:00"},
+                }]
+            }
+        })
+        client = _client(service)
+        hits = client.list_events_by_ical_uid("uid@example.com")
+        assert len(hits) == 1
+        assert hits[0].id == "ev-1"
+        assert hits[0].title == "產品週會"
+        # Query used Google's native iCalUID param, deleted excluded.
+        kwargs = service.events.return_value.list.call_args.kwargs
+        assert kwargs["iCalUID"] == "uid@example.com"
+        assert kwargs["showDeleted"] is False
+
+    def test_all_day_event_still_counts(self):
+        """A duplicate is a duplicate even when it's all-day — the
+        `date`-only shape must NOT be silently dropped like in the
+        conflict-summary path."""
+        service = _fake_service({
+            "events.list.execute": {
+                "items": [{
+                    "id": "ev-allday",
+                    "summary": "conference",
+                    "start": {"date": "2026-09-15"},
+                    "end": {"date": "2026-09-16"},
+                }]
+            }
+        })
+        client = _client(service)
+        hits = client.list_events_by_ical_uid("uid@example.com")
+        assert len(hits) == 1
+
+    def test_http_error_maps_to_calendar_error(self):
+        service = _fake_service({
+            "events.list.execute": _http_error(500, b"boom"),
+        })
+        client = _client(service)
+        with pytest.raises(CalendarError):
+            client.list_events_by_ical_uid("uid@example.com")
+
+    def test_403_maps_to_scope_not_granted(self):
+        service = _fake_service({
+            "events.list.execute": _http_error(403),
+        })
+        client = _client(service)
+        with pytest.raises(CalendarScopeNotGranted):
+            client.list_events_by_ical_uid("uid@example.com")
+
+
+class TestListEventsByPrivateExtendedProperty:
+    def test_query_shape(self):
+        service = _fake_service({"events.list.execute": {"items": []}})
+        client = _client(service)
+        client.list_events_by_private_extended_property(
+            "zwFingerprintV1",
+            "a" * 40,
+            time_min=datetime(2026, 9, 28, 9, 0, tzinfo=timezone.utc),
+            time_max=datetime(2026, 9, 30, 9, 0, tzinfo=timezone.utc),
+        )
+        kwargs = service.events.return_value.list.call_args.kwargs
+        assert kwargs["privateExtendedProperty"] == (
+            "zwFingerprintV1=" + "a" * 40
+        )
+        assert kwargs["timeMin"] == "2026-09-28T09:00:00+00:00"
+        assert kwargs["timeMax"] == "2026-09-30T09:00:00+00:00"
+        assert kwargs["maxResults"] == 10
+
+    def test_multi_hit_mapped(self):
+        service = _fake_service({
+            "events.list.execute": {
+                "items": [
+                    {
+                        "id": f"ev-{i}",
+                        "start": {"dateTime": "2026-09-29T09:00:00+00:00"},
+                        "end": {"dateTime": "2026-09-29T10:00:00+00:00"},
+                    }
+                    for i in range(2)
+                ]
+            }
+        })
+        client = _client(service)
+        hits = client.list_events_by_private_extended_property(
+            "zwFingerprintV1",
+            "b" * 40,
+            time_min=datetime(2026, 9, 28, tzinfo=timezone.utc),
+            time_max=datetime(2026, 9, 30, tzinfo=timezone.utc),
+        )
+        assert [h.id for h in hits] == ["ev-0", "ev-1"]
+        assert hits[0].title == "(no title)"
+
+    def test_naive_window_rejected(self):
+        service = _fake_service({"events.list.execute": {"items": []}})
+        client = _client(service)
+        with pytest.raises(ValueError, match="tz-aware"):
+            client.list_events_by_private_extended_property(
+                "zwFingerprintV1",
+                "c" * 40,
+                time_min=datetime(2026, 9, 28),  # naive
+                time_max=datetime(2026, 9, 30, tzinfo=timezone.utc),
+            )
+
+    def test_http_error_maps_to_calendar_error(self):
+        service = _fake_service({
+            "events.list.execute": _http_error(503, b"unavailable"),
+        })
+        client = _client(service)
+        with pytest.raises(CalendarError):
+            client.list_events_by_private_extended_property(
+                "zwFingerprintV1",
+                "d" * 40,
+                time_min=datetime(2026, 9, 28, tzinfo=timezone.utc),
+                time_max=datetime(2026, 9, 30, tzinfo=timezone.utc),
+            )

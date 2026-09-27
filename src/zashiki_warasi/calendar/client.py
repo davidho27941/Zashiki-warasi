@@ -222,6 +222,73 @@ class GoogleCalendarClient:
             )
         return events
 
+    # ---- dedup lookups (v1.7.0) -------------------------------------------
+
+    def list_events_by_ical_uid(
+        self,
+        ical_uid: str,
+        calendar_id: str | None = None,
+    ) -> list[ExistingEvent]:
+        """Dedup Layer 1: direct lookup by Google's native series key.
+
+        `events.list(iCalUID=...)` is an O(1) point query — any hit
+        means the organizer-issued invite series already has an event
+        on this calendar. `showDeleted=False` so an operator-deleted
+        event does NOT count as existing (re-insert is then desirable).
+        """
+        target = calendar_id or self._primary_id
+        try:
+            with api_call("calendar", "list") as _ac:
+                response = (
+                    self._service.events()
+                    .list(
+                        calendarId=target,
+                        iCalUID=ical_uid,
+                        showDeleted=False,
+                        maxResults=10,
+                    )
+                    .execute()
+                )
+                _ac.status_code = 200
+        except HttpError as exc:
+            raise self._map_http_error(exc) from exc
+        return _to_existing_events(response)
+
+    def list_events_by_private_extended_property(
+        self,
+        key: str,
+        value: str,
+        time_min: datetime,
+        time_max: datetime,
+        calendar_id: str | None = None,
+    ) -> list[ExistingEvent]:
+        """Dedup Layer 2: lookup by a private extended property zashiki
+        stamped on its own prior inserts (`zwFingerprintV1=<hash>`).
+
+        The [time_min, time_max] window bounds the scan — fingerprints
+        embed a 5-minute start bucket, so any true duplicate's event
+        starts within ±1 day of the draft's start.
+        """
+        target = calendar_id or self._primary_id
+        try:
+            with api_call("calendar", "list") as _ac:
+                response = (
+                    self._service.events()
+                    .list(
+                        calendarId=target,
+                        privateExtendedProperty=f"{key}={value}",
+                        timeMin=_iso(time_min),
+                        timeMax=_iso(time_max),
+                        singleEvents=True,
+                        maxResults=10,
+                    )
+                    .execute()
+                )
+                _ac.status_code = 200
+        except HttpError as exc:
+            raise self._map_http_error(exc) from exc
+        return _to_existing_events(response)
+
     # ---- events.insert ---------------------------------------------------
 
     def insert_event(
@@ -319,6 +386,41 @@ def _parse_iso(value: str) -> datetime:
     """Parse an RFC 3339 timestamp Google returned."""
     # Python 3.13's fromisoformat handles the trailing Z since 3.11.
     return datetime.fromisoformat(value)
+
+
+def _to_existing_events(response: dict) -> list[ExistingEvent]:
+    """Map an events.list response to ExistingEvent rows for dedup.
+
+    Unlike the conflict-summary path, ALL-DAY events count here — a
+    duplicate is a duplicate regardless of its time representation —
+    so a `date`-only field parses to midnight rather than being
+    dropped.
+    """
+    events: list[ExistingEvent] = []
+    for item in response.get("items", []):
+        start_obj = _extract_datetime_or_date(item.get("start"))
+        end_obj = _extract_datetime_or_date(item.get("end"))
+        if start_obj is None or end_obj is None:
+            continue
+        events.append(
+            ExistingEvent(
+                id=item["id"],
+                title=item.get("summary", "(no title)"),
+                start=start_obj,
+                end=end_obj,
+            )
+        )
+    return events
+
+
+def _extract_datetime_or_date(field: dict | None) -> datetime | None:
+    if field is None:
+        return None
+    if "dateTime" in field:
+        return _parse_iso(field["dateTime"])
+    if "date" in field:
+        return datetime.fromisoformat(field["date"])
+    return None
 
 
 def _extract_datetime(field: dict | None) -> datetime | None:

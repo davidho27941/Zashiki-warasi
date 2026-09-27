@@ -864,6 +864,14 @@ def _format_calendar_duplicate(effect: CalendarDuplicate) -> str:
 
 
 def _format_calendar_skipped(effect: CalendarSkipped) -> str:
+    # Duplicate skips are GOOD news (the event is already on the
+    # calendar), so they get a friendlier header than the failure
+    # reasons below — distinct from no_event_signal/extraction_failed.
+    if effect.reason in ("duplicate_by_ical_uid", "duplicate_by_fingerprint"):
+        lines = ["📅 <b>已跳過:</b> 此事件已存在於行事曆"]
+        if effect.detail:
+            lines.append(f"  說明: {html.escape(effect.detail)}")
+        return "\n".join(lines)
     reason_zh = {
         "scope_missing": "尚未授權 Google Calendar (請 /reauth)",
         "extraction_failed": "無法擷取完整事件資訊",

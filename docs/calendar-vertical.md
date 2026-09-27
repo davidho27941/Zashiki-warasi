@@ -133,6 +133,45 @@ which the vertical treats as a no-op success.
 For forwarded / CC'd invites carrying the same real calendar UID,
 this gives cross-email dedup for free.
 
+## Deduplication (v1.7.0)
+
+The 409-on-iCalUID idempotency above only covers the SAME email (or
+emails sharing a real `.ics` UID). v1.7.0 adds a two-layer duplicate
+check that runs after freebusy, immediately before `events.insert`,
+covering the dominant real-world case: the invite → reminder →
+starting-soon *series* announcing one event across several emails.
+
+- **Layer 1 — iCalUID lookup**: when the draft carries an
+  organizer-issued `ical_uid`, `events.list(iCalUID=…)` is queried
+  first. Any hit → skip with reason `duplicate_by_ical_uid`. Deleted
+  events don't count (`showDeleted=false`), so removing an event by
+  hand lets the next email recreate it.
+- **Layer 2 — fingerprint lookup**: for UID-less drafts (pure-text
+  webinar reminders), a SHA-1 fingerprint of
+  `normalized-title | 5-min UTC start bucket | normalized-location`
+  is computed. Every insert stamps it into
+  `extendedProperties.private.zwFingerprintV1`; the pre-insert check
+  queries `events.list(privateExtendedProperty=…)` within ±1 day of
+  the start. Any hit → skip with reason `duplicate_by_fingerprint`.
+
+Normalization strips `Fwd:`/`Re:`/`[Reminder]`/`[提醒]`/`[Starting
+Soon]`/`[即將開始]` prefixes iteratively, lowercases and collapses
+whitespace — so a reminder's mangled subject fingerprints identically
+to the original invite. The start bucket is UTC-normalized, aligning
+`.ics` invites (tz-aware) with LLM-extracted reminders (naive local +
+hint). `end` is deliberately excluded (reminder emails often omit it).
+
+Dedup is **best-effort**: if a lookup call fails, the vertical warns
+and proceeds to insert — an occasional duplicate beats silently
+dropping a real event. On a duplicate skip Telegram shows
+`📅 已跳過:此事件已存在於行事曆` with the existing event's title and
+start, distinct from the failure wordings.
+
+Events created before v1.7.0 carry no fingerprint stamp; each old
+series misses dedup at most once (the first post-upgrade email
+re-stamps it). Reschedules (same UID, new time) are still treated as
+duplicates and skipped — see Non-goals.
+
 ## Inspecting via Grafana
 
 Every `calendar_sg` run produces a span tree in Tempo:
