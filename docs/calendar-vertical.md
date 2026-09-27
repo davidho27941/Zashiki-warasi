@@ -150,9 +150,9 @@ starting-soon *series* announcing one event across several emails.
   hand lets the next email recreate it.
 - **Layer 2 — fingerprint lookup**: for UID-less drafts (pure-text
   webinar reminders), a SHA-1 fingerprint of
-  `normalized-title | 5-min UTC start bucket | normalized-location`
+  `normalized-title | 5-min UTC start bucket` (location is deliberately NOT in the key — the .ics LOCATION field usually has no counterpart in body text, so including it broke dedup across mixed invite+reminder series)
   is computed. Every insert stamps it into
-  `extendedProperties.private.zwFingerprintV1`; the pre-insert check
+  `extendedProperties.private.zwFingerprintV2`; the pre-insert check
   queries `events.list(privateExtendedProperty=…)` within ±1 day of
   the start. Any hit → skip with reason `duplicate_by_fingerprint`.
 

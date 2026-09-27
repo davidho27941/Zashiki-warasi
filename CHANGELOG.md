@@ -13,8 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   issue #2) — two-layer duplicate check in `_create_node` before
   `events.insert`: Layer 1 looks up organizer-issued `iCalUID`;
   Layer 2 looks up a SHA-1 fingerprint (normalized title + 5-min UTC
-  start bucket + normalized location) stamped into
-  `extendedProperties.private.zwFingerprintV1` on every insert. An
+  start bucket) stamped into
+  `extendedProperties.private.zwFingerprintV2` on every insert.
+  Gmail invites' inline `text/calendar` parts and forward-re-typed
+  `application/ics` attachments now reach the deterministic `.ics`
+  parser. An
   invite → reminder → starting-soon email series now yields exactly
   one calendar event. `CalendarSkipped.reason` gains
   `duplicate_by_ical_uid` / `duplicate_by_fingerprint`, rendered in

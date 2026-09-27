@@ -63,7 +63,10 @@ from zashiki_warasi.observability.instrumentation import (
 logger = logging.getLogger(__name__)
 
 
-CALENDAR_ICS_MIME = "text/calendar"
+# Gmail stamps a composed .ics attachment as text/calendar but
+# RE-TYPES it to application/ics on forward (Round B smoke finding,
+# 2026-09-27). Filename fallback catches any other mislabeling.
+CALENDAR_ICS_MIMES = ("text/calendar", "application/ics")
 
 
 # Second line of defense behind the classifier's `講座資訊` definition:
@@ -692,9 +695,16 @@ class CalendarSubgraph:
 # ---- Module helpers -----------------------------------------------------
 
 
-# Versioned key: if the normalization algorithm below ever changes,
-# bump to zwFingerprintV2 so old stamps can't false-hit the new hashes.
-_ZW_FINGERPRINT_KEY = "zwFingerprintV1"
+# Versioned key: bumped whenever the normalization algorithm changes
+# so old stamps can't false-hit the new hashes.
+# V1 = summary|bucket|location — never shipped in a release.
+# V2 = summary|bucket. Location dropped: it is systematically
+#      asymmetric across extraction paths (.ics LOCATION field vs
+#      LLM body extraction, which often has no location text at all)
+#      and broke Layer 2 on exactly the mixed invite+reminder series
+#      it exists for. Same-title-same-bucket different-location
+#      collisions are rare and freebusy still surfaces them.
+_ZW_FINGERPRINT_KEY = "zwFingerprintV2"
 
 # Iteratively stripped from the front of a summary before hashing.
 # Reminder/forward chains ("Fwd: Fwd: [Reminder] Webinar") must
@@ -710,12 +720,6 @@ def _normalize_summary(text: str) -> str:
     while prev != text:
         prev = text
         text = _SUMMARY_NOISE_PREFIX.sub("", text)
-    return " ".join(text.lower().split())
-
-
-def _normalize_location(text: str | None) -> str:
-    if text is None:
-        return ""
     return " ".join(text.lower().split())
 
 
@@ -739,26 +743,33 @@ def _bucket_start_5min(dt: datetime, tz: ZoneInfo) -> str:
 def _compute_fingerprint(
     draft: CalendarEventDraft, *, default_tz: str
 ) -> str:
-    """SHA-1 hex over `summary|start_bucket|location` — the Layer-2
-    dedup key. Single-source: BOTH the dedup lookup and the insert
-    stamp call this, so the two can never diverge. Not a security
-    digest — SHA-1's 40-char hex fits extendedProperties comfortably.
+    """SHA-1 hex over `summary|start_bucket` — the Layer-2 dedup key
+    (V2; see the key comment for why location was dropped).
+    Single-source: BOTH the dedup lookup and the insert stamp call
+    this, so the two can never diverge. Not a security digest —
+    SHA-1's 40-char hex fits extendedProperties comfortably.
     """
     tz = _load_zone(_sanitize_tz_hint(draft.timezone_hint, default=default_tz))
     parts = "|".join(
         (
             _normalize_summary(draft.title),
             _bucket_start_5min(draft.start, tz),
-            _normalize_location(draft.location),
         )
     )
     return hashlib.sha1(parts.encode("utf-8")).hexdigest()
 
 
 def _find_ics_attachment(email: EmailMessage):
-    """Return the first `text/calendar` attachment, or None."""
+    """Return the first calendar attachment, or None.
+
+    Matches by MIME type (`text/calendar`, or `application/ics` as
+    Gmail re-types forwards) with a `.ics` filename fallback.
+    """
     for att in email.attachments:
-        if att.mime_type.lower().startswith(CALENDAR_ICS_MIME):
+        mime = att.mime_type.lower()
+        if any(mime.startswith(m) for m in CALENDAR_ICS_MIMES):
+            return att
+        if att.filename.lower().endswith(".ics"):
             return att
     return None
 

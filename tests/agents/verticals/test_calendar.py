@@ -1092,18 +1092,36 @@ class TestNormalization:
             naive_taipei, taipei
         )
 
-    def test_location_normalization(self):
+    def test_ics_attachment_detection_mime_variants(self):
+        """Gmail re-types a forwarded .ics to application/ics; anything
+        else with a .ics filename is caught by the fallback."""
         from zashiki_warasi.agents.verticals.calendar import (
-            _normalize_location,
+            _find_ics_attachment,
         )
+        from zashiki_warasi.core.schemas import AttachmentMeta
 
-        assert _normalize_location(None) == ""
-        assert _normalize_location("") == ""
-        assert _normalize_location("   ") == ""
-        assert _normalize_location("Zoom　Meeting  Room") == (
-            "zoom meeting room"
-        )
-        assert _normalize_location("信義區辦公室") == "信義區辦公室"
+        def _email_with(mime, filename="invite.ics"):
+            return EmailMessage(
+                id="m", thread_id="t", history_id=1,
+                from_address="a@x", subject="s",
+                received_at=datetime(2026, 9, 27, tzinfo=timezone.utc),
+                attachments=[AttachmentMeta(
+                    attachment_id="att-1", filename=filename,
+                    mime_type=mime, size=100,
+                )],
+            )
+
+        assert _find_ics_attachment(_email_with("text/calendar")) is not None
+        assert _find_ics_attachment(
+            _email_with('text/calendar; charset="US-ASCII"')
+        ) is not None
+        assert _find_ics_attachment(_email_with("application/ics")) is not None
+        assert _find_ics_attachment(
+            _email_with("application/octet-stream", "event.ICS")
+        ) is not None
+        assert _find_ics_attachment(
+            _email_with("application/pdf", "notes.pdf")
+        ) is None
 
 
 class TestComputeFingerprint:
@@ -1137,8 +1155,12 @@ class TestComputeFingerprint:
     def test_different_bucket_differs(self):
         assert self._fp(start=datetime(2026, 9, 29, 9, 5)) != self._fp()
 
-    def test_different_location_differs(self):
-        assert self._fp(location="Google Meet") != self._fp()
+    def test_location_not_in_fingerprint(self):
+        """V2 dropped location: the .ics path carries LOCATION but the
+        LLM body path often has none — including it broke Layer 2 on
+        mixed invite+reminder series (Round B smoke, 2026-09-27)."""
+        assert self._fp(location="Google Meet") == self._fp(location=None)
+        assert self._fp(location="信義區辦公室") == self._fp()
 
     def test_end_not_in_fingerprint(self):
         assert self._fp(end=datetime(2026, 9, 29, 11, 30)) == self._fp()
@@ -1250,7 +1272,7 @@ class TestDedupLayerTwo:
             "side_effect": None, "extracted": _draft(),
         })
         call = calendar_client.list_events_by_private_extended_property.call_args
-        assert call.args[0] == "zwFingerprintV1"
+        assert call.args[0] == "zwFingerprintV2"
         assert len(call.args[1]) == 40  # sha1 hex
         window = call.kwargs["time_max"] - call.kwargs["time_min"]
         assert window.days == 2  # start ± 1d
@@ -1265,7 +1287,7 @@ class TestDedupLayerTwo:
         })
         assert isinstance(out["side_effect"], CalendarCreated)
         payload = calendar_client.insert_event.call_args.args[0]
-        stamped = payload["extendedProperties"]["private"]["zwFingerprintV1"]
+        stamped = payload["extendedProperties"]["private"]["zwFingerprintV2"]
         # The stamp must be the SAME hash the lookup queried —
         # single-source `_compute_fingerprint` (design D3 property).
         queried = (

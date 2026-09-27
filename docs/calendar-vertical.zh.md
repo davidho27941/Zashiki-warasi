@@ -136,8 +136,10 @@ starting-soon 系列信。
   信可以重建。
 - **第二層 — fingerprint 查詢**:沒有 UID 的 draft(純文字 webinar
   提醒信)改用 SHA-1 fingerprint:
-  `正規化標題 | 5 分鐘 UTC 時間桶 | 正規化地點`。每次 insert 都把它
-  蓋進 `extendedProperties.private.zwFingerprintV1`;insert 前用
+  `正規化標題 | 5 分鐘 UTC 時間桶`(地點刻意不放進 key——.ics 的
+  LOCATION 欄位在信件內文常常沒有對應文字,放進去會讓混合
+  邀請+提醒系列的 dedup 系統性失效)。每次 insert 都把它
+  蓋進 `extendedProperties.private.zwFingerprintV2`;insert 前用
   `events.list(privateExtendedProperty=…)` 在開始時間 ±1 天內查。
   命中 → 以 `duplicate_by_fingerprint` 跳過。
 
