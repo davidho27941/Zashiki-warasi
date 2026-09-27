@@ -110,63 +110,6 @@ spec:
               reauth` (CLI) or hit POST /reauth (headless).
         {{- end }}
         {{- end }}
-        {{- with $alerts.shadowErrorRateHigh }}
-        {{- if .enabled }}
-        - alert: ZashikiShadowErrorRateHigh
-          expr: sum(increase(zashiki_classifier_shadow_error_total{job="{{ $fullname }}"}[1h])) > {{ .errorsPerHour }}
-          for: {{ .for }}
-          labels:
-            severity: {{ .severity }}
-          annotations:
-            summary: "Laya shadow errors above {{ .errorsPerHour }}/h for {{ .for }}"
-            description: >-
-              Sustained shadow-classifier failures. connection_refused
-              → laya-serve pod down/unready; timeout → CPU saturation
-              or cold model (see docs/classifier-laya-shadow.md);
-              dropped_saturated → mail burst beyond the 2-slot pool.
-              The main pipeline is UNAFFECTED by design, but every
-              errored email is a lost comparison sample for the
-              Phase 2 decision.
-        {{- end }}
-        {{- end }}
-        {{- with $alerts.shadowSilent }}
-        {{- if .enabled }}
-        - alert: ZashikiShadowSilent
-          expr: >-
-            ((sum(increase(zashiki_classifier_shadow_agreement_total{job="{{ $fullname }}"}[{{ .window }}])) or vector(0))
-             + (sum(increase(zashiki_classifier_shadow_error_total{job="{{ $fullname }}"}[{{ .window }}])) or vector(0))) == 0
-            and on() increase(zashiki_tick_messages_processed_total{job="{{ $fullname }}"}[{{ .window }}]) > 0
-          for: {{ .for }}
-          labels:
-            severity: {{ .severity }}
-          annotations:
-            summary: "Laya shadow produced no samples in {{ .window }} despite processed mail"
-            description: >-
-              Emails are flowing but the shadow classifier recorded
-              neither agreements nor errors — the observation window
-              is silently wasting away. Check the pod log for the
-              "laya shadow enabled" boot line (flag/env regression?)
-              and LAYA_* env plumbing. Enable this alert ONLY on
-              deployments running with LAYA_SHADOW_ENABLED=1.
-        {{- end }}
-        {{- end }}
-        {{- with $alerts.shadowLatencyNearTimeout }}
-        {{- if .enabled }}
-        - alert: ZashikiShadowLatencyNearTimeout
-          expr: histogram_quantile(0.95, sum by (le) (rate(zashiki_classifier_shadow_duration_seconds_bucket{job="{{ $fullname }}"}[30m]))) > {{ .p95Seconds }}
-          for: {{ .for }}
-          labels:
-            severity: {{ .severity }}
-          annotations:
-            summary: "Laya shadow p95 latency above {{ .p95Seconds }}s for {{ .for }}"
-            description: >-
-              p95 shadow round-trip is approaching LAYA_TIMEOUT_SECONDS
-              — samples are about to start landing as timeout errors.
-              Likely causes: laya-serve CPU throttling (check requests/
-              limits), node pressure, or longer inputs. Warm baseline
-              is ~1.0-1.5s p50 / ~2.4s p95 (2026-09-27 measurement).
-        {{- end }}
-        {{- end }}
         {{- with .Values.observability.prometheusRule.additionalRules }}
         {{- toYaml . | nindent 8 }}
         {{- end }}

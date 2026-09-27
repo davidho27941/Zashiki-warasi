@@ -253,28 +253,6 @@ observability:
         enabled: true
         for: 15m
         severity: warning
-      # ---- v1.6.0+ laya shadow classifier alerts ----
-      # Shadow failures never touch the main pipeline, but every
-      # errored/silent email is a lost comparison sample for the
-      # Phase 2 decision — that's what these guard.
-      shadowErrorRateHigh:
-        enabled: true
-        for: 30m
-        severity: warning
-        # Total shadow errors (all reasons) over the trailing hour.
-        errorsPerHour: 3
-      shadowSilent:
-        enabled: false  # enable ONLY where LAYA_SHADOW_ENABLED=1
-        for: 30m
-        severity: warning
-        # Mail processed but zero shadow samples in this window.
-        window: 6h
-      shadowLatencyNearTimeout:
-        enabled: true
-        for: 30m
-        severity: info
-        # p95 over 30m approaching LAYA_TIMEOUT_SECONDS (prod: 5).
-        p95Seconds: 4
     # Append custom Prometheus alerting rules AFTER the starter set.
     # Each entry is a full rule dict: alert / expr / for / labels /
     # annotations. Additive — starter alerts stay unless individually
