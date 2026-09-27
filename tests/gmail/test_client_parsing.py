@@ -341,3 +341,60 @@ class TestParseMessage:
         assert msg.body_plain == "just text"
         assert msg.body_html is None
         assert msg.attachments == []
+
+
+# --- _extract_inline_ics (v1.7.0) ---
+
+
+_VCAL = (
+    "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:real-uid@google.com\r\n"
+    "DTSTART:20260930T060000Z\r\nDTEND:20260930T070000Z\r\n"
+    "SUMMARY:test event\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+)
+
+
+class TestExtractInlineIcs:
+    def test_inline_text_calendar_captured(self):
+        """Google-invite shape: text/calendar with inline body.data
+        and NO attachmentId — must surface as ics_inline."""
+        leaves = [
+            {"mimeType": "text/plain", "body": {"data": _b64url("hi")}},
+            {
+                "mimeType": 'text/calendar; charset="UTF-8"; method=REQUEST',
+                "body": {"data": _b64url(_VCAL)},
+            },
+        ]
+        out = GmailClient._extract_inline_ics(leaves)
+        assert out is not None
+        assert "UID:real-uid@google.com" in out
+
+    def test_mime_params_and_case_tolerated(self):
+        leaves = [{
+            "mimeType": "TEXT/CALENDAR",
+            "body": {"data": _b64url(_VCAL)},
+        }]
+        assert GmailClient._extract_inline_ics(leaves) is not None
+
+    def test_attachment_style_ics_not_captured(self):
+        """A REAL .ics attachment (attachmentId, no inline data) stays
+        on the attachment path — this helper must return None."""
+        leaves = [{
+            "mimeType": "text/calendar",
+            "filename": "invite.ics",
+            "body": {"attachmentId": "att-1", "size": 400},
+        }]
+        assert GmailClient._extract_inline_ics(leaves) is None
+
+    def test_no_calendar_part_returns_none(self):
+        leaves = [
+            {"mimeType": "text/plain", "body": {"data": _b64url("hi")}},
+            {"mimeType": "text/html", "body": {"data": _b64url("<p>hi</p>")}},
+        ]
+        assert GmailClient._extract_inline_ics(leaves) is None
+
+    def test_first_calendar_part_wins(self):
+        leaves = [
+            {"mimeType": "text/calendar", "body": {"data": _b64url("FIRST")}},
+            {"mimeType": "text/calendar", "body": {"data": _b64url("SECOND")}},
+        ]
+        assert GmailClient._extract_inline_ics(leaves) == "FIRST"

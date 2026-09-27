@@ -42,6 +42,15 @@ class EmailMessage(BaseModel):
     labels: list[str] = Field(default_factory=list)
     attachments: list[AttachmentMeta] = Field(default_factory=list)
     raw_headers: dict[str, str] = Field(default_factory=dict)
+    ics_inline: str | None = Field(
+        default=None,
+        description=(
+            "Decoded content of the first inline text/calendar MIME "
+            "part, when present. Google Calendar invites ship their "
+            ".ics this way (body.data, no attachmentId), invisible to "
+            "the attachments list. v1.7.0 — see calendar-vertical spec."
+        ),
+    )
 
 
 class ProfileInfo(BaseModel):
@@ -412,6 +421,11 @@ class CalendarSkipped(BaseModel):
       save the call on obvious non-events (Coursera promos, MOOC
       recommendations, etc.). Second line of defense behind the
       classifier's `講座資訊` boundary.
+    - duplicate_by_ical_uid: v1.7.0 dedup Layer 1 — an event with the
+      draft's organizer-issued iCalUID already exists on the calendar.
+    - duplicate_by_fingerprint: v1.7.0 dedup Layer 2 — an event with
+      the same zwFingerprintV1 (normalized title + 5-min start bucket
+      + normalized location) already exists near the draft's start.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -422,6 +436,8 @@ class CalendarSkipped(BaseModel):
         "extraction_failed",
         "disabled",
         "no_event_signal",
+        "duplicate_by_ical_uid",
+        "duplicate_by_fingerprint",
     ]
     detail: str | None = None
 

@@ -18,9 +18,10 @@ degrades gracefully to notify (design D4).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -62,7 +63,10 @@ from zashiki_warasi.observability.instrumentation import (
 logger = logging.getLogger(__name__)
 
 
-CALENDAR_ICS_MIME = "text/calendar"
+# Gmail stamps a composed .ics attachment as text/calendar but
+# RE-TYPES it to application/ics on forward (Round B smoke finding,
+# 2026-09-27). Filename fallback catches any other mislabeling.
+CALENDAR_ICS_MIMES = ("text/calendar", "application/ics")
 
 
 # Second line of defense behind the classifier's `講座資訊` definition:
@@ -254,6 +258,27 @@ class CalendarSubgraph:
                         )
                         return {"extracted": draft}
                     log.info("calendar: .ics parse returned None → LLM fallback")
+
+            # ---- inline text/calendar part (v1.7.0 D7) ----
+            # Real Google Calendar invites ship the .ics inline
+            # (body.data, no attachmentId) — invisible to the
+            # attachments list, but deterministic gold when present.
+            if email.ics_inline:
+                log.info("calendar: parsing inline text/calendar part")
+                draft = parse_ics_bytes(
+                    email.ics_inline.encode("utf-8"), self._default_timezone
+                )
+                if draft is not None:
+                    log.info(
+                        f"calendar: inline .ics extracted "
+                        f"title={draft.title!r} "
+                        f"start={draft.start.isoformat()} "
+                        f"uid={draft.ical_uid!r}"
+                    )
+                    return {"extracted": draft}
+                log.info(
+                    "calendar: inline .ics parse returned None → LLM fallback"
+                )
 
             # ---- LLM extraction (fallback) ----
             body = (
@@ -488,9 +513,21 @@ class CalendarSubgraph:
                     "proceeding with insert without conflict info"
                 )
 
+            # ---- Dedup check (v1.7.0, after freebusy / before insert) ----
+            # Freebusy answers "is the operator busy?"; dedup answers
+            # "did zashiki already create THIS event?". A dedup hit wins
+            # over any freebusy verdict — skip cleanly, no double alert.
+            fingerprint = _compute_fingerprint(
+                draft, default_tz=self._default_timezone
+            )
+            duplicate = self._dedup_check(log, draft, fingerprint, fb_start)
+            if duplicate is not None:
+                gs.outcome = "skipped"
+                return {"side_effect": duplicate}
+
             # ---- Build payload ----
             payload = _build_insert_payload(
-                draft, email.id, ical_uid, conflicts
+                draft, email.id, ical_uid, conflicts, fingerprint
             )
 
             # ---- Insert ----
@@ -554,6 +591,80 @@ class CalendarSubgraph:
 
     # ----- helpers -----
 
+    def _dedup_check(
+        self,
+        log,
+        draft: CalendarEventDraft,
+        fingerprint: str,
+        aware_start: datetime,
+    ) -> CalendarSkipped | None:
+        """Two-layer duplicate lookup. Returns the skip payload on a
+        hit, None when the insert should proceed.
+
+        Best-effort semantics (spec): a layer that ERRORS is treated
+        as a miss — WARN and fall through. Creating an occasional
+        duplicate beats silently dropping a real event because a
+        lookup call flaked.
+
+        Layer 1 uses only an ORGANIZER-issued `draft.ical_uid`. The
+        synthesized `zashiki-<message_id>@` UID is deliberately not
+        checked here — it is message-scoped, so the same-email-twice
+        case it covers is already handled idempotently by the 409
+        `iCalUidExists` path on insert.
+        """
+        if draft.ical_uid:
+            try:
+                hits = self._calendar_client.list_events_by_ical_uid(
+                    draft.ical_uid
+                )
+            except CalendarError as exc:
+                log.warning(
+                    f"calendar: dedup Layer 1 (iCalUID) lookup failed "
+                    f"({exc}); falling through to Layer 2"
+                )
+            else:
+                if hits:
+                    hit = hits[0]
+                    log.info(
+                        f"calendar: duplicate by iCalUID "
+                        f"{draft.ical_uid!r} → existing event {hit.id}"
+                    )
+                    return CalendarSkipped(
+                        reason="duplicate_by_ical_uid",
+                        detail=(
+                            f"{hit.title} @ {hit.start.isoformat()} "
+                            f"(event {hit.id})"
+                        ),
+                    )
+
+        try:
+            hits = self._calendar_client.list_events_by_private_extended_property(
+                _ZW_FINGERPRINT_KEY,
+                fingerprint,
+                time_min=aware_start - timedelta(days=1),
+                time_max=aware_start + timedelta(days=1),
+            )
+        except CalendarError as exc:
+            log.warning(
+                f"calendar: dedup Layer 2 (fingerprint) lookup failed "
+                f"({exc}); proceeding to insert (best-effort dedup)"
+            )
+            return None
+        if hits:
+            hit = hits[0]
+            log.info(
+                f"calendar: duplicate by fingerprint {fingerprint} "
+                f"→ existing event {hit.id}"
+            )
+            return CalendarSkipped(
+                reason="duplicate_by_fingerprint",
+                detail=(
+                    f"{hit.title} @ {hit.start.isoformat()} "
+                    f"(event {hit.id})"
+                ),
+            )
+        return None
+
     def _degrade_scope_missing(self, log, message: str) -> dict:
         """Log ONCE per subgraph instance lifetime, degrade to skipped.
 
@@ -584,10 +695,81 @@ class CalendarSubgraph:
 # ---- Module helpers -----------------------------------------------------
 
 
+# Versioned key: bumped whenever the normalization algorithm changes
+# so old stamps can't false-hit the new hashes.
+# V1 = summary|bucket|location — never shipped in a release.
+# V2 = summary|bucket. Location dropped: it is systematically
+#      asymmetric across extraction paths (.ics LOCATION field vs
+#      LLM body extraction, which often has no location text at all)
+#      and broke Layer 2 on exactly the mixed invite+reminder series
+#      it exists for. Same-title-same-bucket different-location
+#      collisions are rare and freebusy still surfaces them.
+_ZW_FINGERPRINT_KEY = "zwFingerprintV2"
+
+# Iteratively stripped from the front of a summary before hashing.
+# Reminder/forward chains ("Fwd: Fwd: [Reminder] Webinar") must
+# fingerprint identically to the original invite's clean title.
+_SUMMARY_NOISE_PREFIX = re.compile(
+    r"^(Fwd:|Re:|\[Reminder\]|\[提醒\]|\[Starting Soon\]|\[即將開始\])\s*",
+    re.IGNORECASE,
+)
+
+
+def _normalize_summary(text: str) -> str:
+    prev = None
+    while prev != text:
+        prev = text
+        text = _SUMMARY_NOISE_PREFIX.sub("", text)
+    return " ".join(text.lower().split())
+
+
+def _bucket_start_5min(dt: datetime, tz: ZoneInfo) -> str:
+    """Serialize the start to a 5-minute UTC bucket: `YYYY-MM-DDTHH:MM`.
+
+    Naive datetimes get `tz` attached first (the draft's sanitized
+    timezone_hint or the operator default). Everything is then
+    converted to UTC before flooring — so an .ics invite carrying an
+    explicit offset and its pure-text reminder extracted as
+    local-time + hint land in the SAME bucket even though they
+    represent the instant differently.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    dt = dt.astimezone(timezone.utc)
+    dt = dt.replace(minute=dt.minute - dt.minute % 5, second=0, microsecond=0)
+    return dt.strftime("%Y-%m-%dT%H:%M")
+
+
+def _compute_fingerprint(
+    draft: CalendarEventDraft, *, default_tz: str
+) -> str:
+    """SHA-1 hex over `summary|start_bucket` — the Layer-2 dedup key
+    (V2; see the key comment for why location was dropped).
+    Single-source: BOTH the dedup lookup and the insert stamp call
+    this, so the two can never diverge. Not a security digest —
+    SHA-1's 40-char hex fits extendedProperties comfortably.
+    """
+    tz = _load_zone(_sanitize_tz_hint(draft.timezone_hint, default=default_tz))
+    parts = "|".join(
+        (
+            _normalize_summary(draft.title),
+            _bucket_start_5min(draft.start, tz),
+        )
+    )
+    return hashlib.sha1(parts.encode("utf-8")).hexdigest()
+
+
 def _find_ics_attachment(email: EmailMessage):
-    """Return the first `text/calendar` attachment, or None."""
+    """Return the first calendar attachment, or None.
+
+    Matches by MIME type (`text/calendar`, or `application/ics` as
+    Gmail re-types forwards) with a `.ics` filename fallback.
+    """
     for att in email.attachments:
-        if att.mime_type.lower().startswith(CALENDAR_ICS_MIME):
+        mime = att.mime_type.lower()
+        if any(mime.startswith(m) for m in CALENDAR_ICS_MIMES):
+            return att
+        if att.filename.lower().endswith(".ics"):
             return att
     return None
 
@@ -607,6 +789,7 @@ def _build_insert_payload(
     message_id: str,
     ical_uid: str,
     conflicts: list[CalendarConflict],
+    fingerprint: str,
 ) -> dict:
     """Compose the Google Calendar events.insert JSON body.
 
@@ -660,7 +843,11 @@ def _build_insert_payload(
         "description": description,
         "extendedProperties": {
             "private": {
+                # forensic trail: which email created this event
                 "zashiki_message_id": message_id,
+                # v1.7.0 dedup Layer 2 index — future duplicates of
+                # this event are found via privateExtendedProperty.
+                _ZW_FINGERPRINT_KEY: fingerprint,
             },
         },
     }

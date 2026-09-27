@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Calendar dedup** (`add-calendar-dedup-by-ical-and-fingerprint`,
+  issue #2) — two-layer duplicate check in `_create_node` before
+  `events.insert`: Layer 1 looks up organizer-issued `iCalUID`;
+  Layer 2 looks up a SHA-1 fingerprint (normalized title + 5-min UTC
+  start bucket) stamped into
+  `extendedProperties.private.zwFingerprintV2` on every insert.
+  Gmail invites' inline `text/calendar` parts and forward-re-typed
+  `application/ics` attachments now reach the deterministic `.ics`
+  parser. An
+  invite → reminder → starting-soon email series now yields exactly
+  one calendar event. `CalendarSkipped.reason` gains
+  `duplicate_by_ical_uid` / `duplicate_by_fingerprint`, rendered in
+  Telegram as `📅 已跳過:此事件已存在於行事曆`. Dedup is
+  best-effort: lookup failures warn and fall through to insert.
+
 ## [1.6.0] — 2026-09-27
 
 New minor: **laya shadow classifier** (issue #4 Phase 0). A fine-tuned

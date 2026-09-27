@@ -121,6 +121,43 @@ blocks 會 surface 到兩處:
 對於**轉寄 / CC 過來、帶同一個真實 iCalUID** 的邀請,這樣就免費有跨郵件
 去重。
 
+## 重複事件防護(v1.7.0)
+
+上面的 409-on-iCalUID 冪等只涵蓋「同一封信」(或帶同一個真實 `.ics`
+UID 的信)。v1.7.0 加入兩層重複檢查,在 freebusy 之後、`events.insert`
+之前執行,涵蓋真實世界最常見的情境:同一活動的 invite → reminder →
+starting-soon 系列信。
+
+- **第一層 — iCalUID 查詢**:draft 帶主辦方簽發的 `ical_uid` 時(v1.7.0
+  起也能偵測真實 Google 邀請信的 inline `text/calendar` part——過去
+  只有 `.ics`「附件」進得了確定性解析),先查
+  `events.list(iCalUID=…)`。命中 → 以 `duplicate_by_ical_uid` 跳過。
+  已刪除的事件不算數(`showDeleted=false`),手動刪掉事件後,下一封
+  信可以重建。
+- **第二層 — fingerprint 查詢**:沒有 UID 的 draft(純文字 webinar
+  提醒信)改用 SHA-1 fingerprint:
+  `正規化標題 | 5 分鐘 UTC 時間桶`(地點刻意不放進 key——.ics 的
+  LOCATION 欄位在信件內文常常沒有對應文字,放進去會讓混合
+  邀請+提醒系列的 dedup 系統性失效)。每次 insert 都把它
+  蓋進 `extendedProperties.private.zwFingerprintV2`;insert 前用
+  `events.list(privateExtendedProperty=…)` 在開始時間 ±1 天內查。
+  命中 → 以 `duplicate_by_fingerprint` 跳過。
+
+正規化會反覆剝除 `Fwd:`/`Re:`/`[Reminder]`/`[提醒]`/`[Starting
+Soon]`/`[即將開始]` 前綴、轉小寫、摺疊空白——reminder 信被弄髒的
+主旨會跟原始邀請算出同一個 fingerprint。時間桶以 UTC 正規化,讓
+`.ics` 邀請(帶時區)與 LLM 擷取的提醒信(naive 當地時間 + hint)
+對齊。`end` 刻意排除在外(提醒信常常不寫結束時間)。
+
+Dedup 是 **best-effort**:查詢失敗只會 WARN 然後照常 insert——
+偶爾重複一個事件,好過因為查詢閃失而默默漏掉真實活動。重複跳過時
+Telegram 顯示 `📅 已跳過:此事件已存在於行事曆`,附既有事件的標題
+與開始時間,與各種失敗訊息區隔。
+
+v1.7.0 之前建立的事件沒有 fingerprint 印記;每個舊系列最多漏擋一次
+(升級後第一封信會重新蓋章)。改期信(同 UID、新時間)目前仍視為
+重複而跳過——見 Non-goals。
+
 ## 用 Grafana 查
 
 每次 `calendar_sg` 執行都會在 Tempo 產生一個 span tree:
