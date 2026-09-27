@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.6.0] — 2026-09-27
+
+New minor: **laya shadow classifier** (issue #4 Phase 0). A fine-tuned
+laya encoder runs in shadow next to the LLM classifier and records
+agreement data for the Phase 2 hybrid decision. Off by default; no
+behavior change.
+
 ### Added
 
 - **Laya shadow classifier** (`add-laya-shadow-classifier`, issue #4
