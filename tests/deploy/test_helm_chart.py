@@ -153,6 +153,9 @@ class TestPrometheusRuleRender:
         "ZashikiTickConflictRateHigh",
         "ZashikiHealthzUnhealthy",
         "ZashikiOAuthRefreshFailing",
+        # laya shadow bundle (shadowSilent is default-OFF — see its test)
+        "ZashikiShadowErrorRateHigh",
+        "ZashikiShadowLatencyNearTimeout",
     )
 
     def test_renders_when_enabled(self):
@@ -198,6 +201,32 @@ class TestPrometheusRuleRender:
         assert "ZashikiTickNoSuccessfulTick" in out
         # Custom appended
         assert "MyCustomAlert" in out
+
+    def test_shadow_silent_off_by_default(self):
+        """shadowSilent false-fires on deployments running with the
+        shadow disabled (mail flows, zero samples — by design), so it
+        ships default-OFF and is opted into per cluster."""
+        out = _render(**{"observability.prometheusRule.enabled": "true"})
+        assert "ZashikiShadowSilent" not in out
+
+    def test_shadow_silent_renders_when_enabled(self):
+        out = _render(**{
+            "observability.prometheusRule.enabled": "true",
+            "observability.prometheusRule.alerts.shadowSilent.enabled": "true",
+        })
+        assert "ZashikiShadowSilent" in out
+        # Window knob flows into both the increase() ranges and the
+        # tick-activity guard.
+        assert out.count("[6h]") >= 3
+
+    def test_shadow_threshold_knobs_flow_into_exprs(self):
+        out = _render(**{
+            "observability.prometheusRule.enabled": "true",
+            "observability.prometheusRule.alerts.shadowErrorRateHigh.errorsPerHour": "10",
+            "observability.prometheusRule.alerts.shadowLatencyNearTimeout.p95Seconds": "4.5",
+        })
+        assert "> 10" in out
+        assert "> 4.5" in out
 
     def test_job_label_matches_servicemonitor_relabeling(self):
         """Alert exprs filter on `job="<fullname>"` — must match what
