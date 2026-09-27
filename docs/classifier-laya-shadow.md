@@ -123,7 +123,14 @@ data at any threshold without re-calling the model.
    resumed later get **no shadow row** — the hook sits on the
    success tail of `_analyze`. Expected; do not chase the missing
    rows.
-4. **Definition-sync duty**: the English criteria in
+4. **Counter-reset undercount**: the Grafana agreement panels use
+   `increase(counter[range])`; Prometheus loses each series' birth
+   value after a pod restart, so on deploy-heavy days the dashboard
+   OVER-reports agreement (it drops mostly the rare disagreement
+   series). Fine in steady state; for any decision, compute the rate
+   from `laya_shadow_predictions` (the SQL above) — the DB is ground
+   truth.
+5. **Definition-sync duty**: the English criteria in
    `deploy/helm/zashiki-warasi/configs/laya-questions.json` mirror
    `ANALYZE_SYSTEM_PROMPT`. Any category-definition change in the
    prompt MUST be mirrored in the dict (and vice versa) — the
