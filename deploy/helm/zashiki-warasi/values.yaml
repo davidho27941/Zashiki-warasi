@@ -277,3 +277,7 @@ observability:
     # end-to-end by category.
     graphLatency:
       enabled: true
+    # v1.6.0 laya shadow dashboard: agreement rate + confusion matrix
+    # (LLM vs laya) + shadow error/latency health.
+    layaShadow:
+      enabled: true

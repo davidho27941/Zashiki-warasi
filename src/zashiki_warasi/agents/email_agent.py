@@ -27,6 +27,7 @@ from zashiki_warasi.agents.llm import get_chat_model
 from zashiki_warasi.agents.verticals.calendar import CalendarSubgraph
 from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
 from zashiki_warasi.calendar.client import GoogleCalendarClient
+from zashiki_warasi.classifier.laya_shadow_client import LayaShadowClient
 from zashiki_warasi.core.config import CalendarSettings
 from zashiki_warasi.agents.verticals.html_text import html_to_text
 from zashiki_warasi.core.config import LLMSettings
@@ -142,7 +143,13 @@ ANALYZE_SYSTEM_PROMPT = """\
 從以下列表選擇 **一項**:
 消費支出、消費資訊彙整、點數資訊彙整、訂閱服務、技術文章、
 講座資訊、會議邀請、帳單通知、廣告、促銷、社交、新聞、
-安全通知、股票資訊、其他
+安全通知、股票資訊、問卷調查、其他
+
+- 「問卷調查」= 請求填寫問卷 / 意見回饋 / 満足度調查的郵件
+  (アンケートご協力、服務應對調查、活動後 feedback survey、
+  「Tell us how ... went」等)。注意:促銷信裡的「回饋/紅利」
+  是 cashback,不是問卷;必須是以「請你填寫調查」為主旨的信
+  才算本類。
 
 分類規則:
 
@@ -305,9 +312,16 @@ class EmailAgent:
         notion: NotionExpenseRecorder | None = None,
         calendar_client: GoogleCalendarClient | None = None,
         calendar_settings: CalendarSettings | None = None,
+        laya_shadow: LayaShadowClient | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._notifier = notifier
+        # v1.6.0 shadow classifier — inert unless LAYA_SHADOW_ENABLED=1
+        # (constructing the default reads env; disabled = zero cost,
+        # no laya connectivity, no questions-file read).
+        self._laya_shadow = laya_shadow or LayaShadowClient(
+            session_factory=session_factory
+        )
 
         # Two model instances against the same server:
         # - analyze: capped by LLM_ANALYZE_MAX_TOKENS. Bounds
@@ -490,6 +504,12 @@ class EmailAgent:
                 }
             if analysis is not None:
                 log.info(f"classified as {analysis.category}")
+                # v1.6.0 shadow: fire-and-forget, never raises, never
+                # read by the pipeline. AnalysisFailed paths return
+                # earlier — no llm_category means no shadow sample.
+                self._laya_shadow.classify_async(
+                    email=email, llm_category=analysis.category
+                )
             return {"analysis": analysis}
 
     # Categories that go through the expense subgraph — where PDF /

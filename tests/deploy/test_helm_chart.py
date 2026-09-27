@@ -232,11 +232,13 @@ class TestDashboardConfigMapRender:
             # ON; disable it too so this test isolates the "per-dashboard
             # toggle works" invariant across ALL dashboards.
             "observability.dashboards.graphLatency.enabled": "false",
+            "observability.dashboards.layaShadow.enabled": "false",
         })
         # Master on, all per-dashboards off → zero dashboard CMs.
         assert "grafana_dashboard" not in out
         assert "zashiki-warasi-overview.json" not in out
         assert "zashiki-graph-latency.json" not in out
+        assert "zashiki-laya-shadow.json" not in out
 
     def test_graph_latency_dashboard_renders_by_default(self):
         """v1.5.0 dashboard ships enabled-by-default when master is on."""
@@ -255,6 +257,23 @@ class TestDashboardConfigMapRender:
         })
         assert "zashiki-warasi-overview.json" in out
         assert "zashiki-graph-latency.json" not in out
+
+    def test_laya_shadow_dashboard_renders_by_default(self):
+        """v1.6.0 dashboard ships enabled-by-default when master is on."""
+        out = _render(**{
+            "observability.dashboards.enabled": "true",
+        })
+        assert "zashiki-laya-shadow.json" in out
+        assert "dashboard-laya-shadow" in out
+
+    def test_laya_shadow_per_dashboard_toggle(self):
+        """layaShadow=false while the others stay on → its CM only."""
+        out = _render(**{
+            "observability.dashboards.enabled": "true",
+            "observability.dashboards.layaShadow.enabled": "false",
+        })
+        assert "zashiki-warasi-overview.json" in out
+        assert "zashiki-laya-shadow.json" not in out
 
     def test_sidecar_label_customizable(self):
         out = _render(**{
@@ -283,3 +302,49 @@ class TestObservabilityAllOn:
         # Sanity: still exactly one of each observability manifest.
         assert out.count("kind: ServiceMonitor") == 1
         assert out.count("kind: PrometheusRule") == 1
+
+
+class TestLayaQuestionsConfigMap:
+    """v1.6.0: the questions dict ships as a ConfigMap mounted into the
+    ZASHIKI pod (shadow client sends it per-request; laya-serve is
+    task-stateless per openspec D8)."""
+
+    def test_configmap_renders_with_dict_content(self):
+        out = _render()
+        assert "laya-questions.json: |" in out
+        # A distinctive fragment of the committed dict proves .Files.Get
+        # picked up the real file, not an empty string.
+        assert "calendar" in out and "label_map" in out
+
+    def test_deployment_mounts_the_configmap(self):
+        out = _render()
+        assert "mountPath: /etc/zashiki" in out
+        assert "-laya-questions" in out
+
+
+class TestLayaClassifierChart:
+    """Separate chart for the laya-serve backend."""
+
+    LAYA_CHART = CHART_DIR.parent / "laya-classifier"
+
+    def _render_laya(self, **set_overrides) -> str:
+        cmd = ["helm", "template", "laya", str(self.LAYA_CHART)]
+        for key, value in set_overrides.items():
+            cmd += ["--set", f"{key}={value}"]
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=True)
+        return result.stdout
+
+    def test_renders_deployment_and_service(self):
+        out = self._render_laya()
+        assert "kind: Deployment" in out
+        assert "kind: Service" in out
+        assert "laya-serve:v1" in out
+
+    def test_probes_target_health_endpoint(self):
+        out = self._render_laya()
+        assert out.count("path: /health") == 2  # readiness + liveness
+
+    def test_thread_cap_env_present(self):
+        out = self._render_laya()
+        assert "LAYA_THREADS" in out

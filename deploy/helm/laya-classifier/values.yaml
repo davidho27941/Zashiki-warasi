@@ -1,0 +1,40 @@
+image:
+  # Built by the manual Build_Laya_Image CI job; checkpoint weights are
+  # baked at build time (private registry ONLY — trained on personal mail).
+  repository: gitlab.davidho.dev:5050/homelab/zashiki-warasi/laya-serve
+  tag: "v1"
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+#  - name: gitlabregisterysecret
+
+replicaCount: 1
+
+service:
+  port: 8000
+
+env:
+  # Cap torch intra-op threads to the CPU limit — oversubscription is a
+  # large regression per upstream laya-serve docs.
+  LAYA_THREADS: "2"
+  LAYA_LOG_LEVEL: "info"
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 2Gi
+  limits:
+    cpu: "2"
+    memory: 3Gi
+
+# Model load takes tens of seconds on CPU — generous initial delays so
+# the pod isn't killed mid-load.
+probes:
+  readiness:
+    initialDelaySeconds: 20
+    periodSeconds: 10
+    failureThreshold: 6
+  liveness:
+    initialDelaySeconds: 90
+    periodSeconds: 30
+    failureThreshold: 4

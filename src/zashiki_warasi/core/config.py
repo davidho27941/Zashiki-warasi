@@ -500,3 +500,55 @@ class NotionSettings(BaseSettings):
             "thread (the one-shot `sync-notion` subcommand still works)."
         ),
     )
+
+
+class LayaSettings(BaseSettings):
+    """v1.6.0 laya shadow-classifier knobs (openspec
+    add-laya-shadow-classifier). All observational — the shadow client
+    never influences the pipeline; `shadow_enabled=False` (the default)
+    makes the client fully inert with zero laya connectivity.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="LAYA_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    shadow_enabled: bool = Field(
+        default=False,
+        description=(
+            "Kill switch for the shadow classifier. Off = no HTTP call, "
+            "no DB row, no metric movement."
+        ),
+    )
+    base_url: str = Field(
+        default="",
+        description=(
+            "laya-serve base URL, e.g. "
+            "`http://laya-classifier.zashiki.svc:8080`. The client "
+            "appends `/v1/systemone`. Empty = shadow inert even when "
+            "the flag is on."
+        ),
+    )
+    timeout_seconds: float = Field(
+        default=2.0, ge=0.5, le=30.0,
+        description="Per-request timeout for the shadow HTTP call.",
+    )
+    questions_path: str = Field(
+        default="deploy/helm/zashiki-warasi/configs/laya-questions.json",
+        description=(
+            "Path to the questions dict (ConfigMap mount in k8s; repo "
+            "path in local dev). Loaded once at client startup; its "
+            "content hash forms the second half of `laya_model_ver`."
+        ),
+    )
+    semantic_ver: str = Field(
+        default="zashiki-v1",
+        description=(
+            "Human half of `laya_model_ver` — names the checkpoint "
+            "generation (e.g. the fine-tuned `laya_zashiki_v1`). The "
+            "dict-hash half rotates automatically on any dict edit."
+        ),
+    )

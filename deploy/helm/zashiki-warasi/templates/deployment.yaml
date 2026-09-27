@@ -107,7 +107,13 @@ spec:
               readOnly: true
             - name: data
               mountPath: /data
+            - name: laya-questions
+              mountPath: /etc/zashiki
+              readOnly: true
       volumes:
+        - name: laya-questions
+          configMap:
+            name: {{ include "zashiki-warasi.fullname" . }}-laya-questions
         - name: secrets
           secret:
             secretName: {{ include "zashiki-warasi.fullname" . }}-oauth

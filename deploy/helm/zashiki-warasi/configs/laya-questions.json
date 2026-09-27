@@ -1,0 +1,49 @@
+{
+  "_meta": {
+    "semantic_version": "v0.1",
+    "authoring": "ENGLISH-primary per openspec add-laya-shadow-classifier D8: live probing showed zh criteria collapse zero-shot accuracy (1/5) while EN criteria on the same zh/ja inputs reach 3/5 with high-confidence correct answers. State text stays zh/ja (multilingual checkpoint handles the state side). label_map converts wire labels back to the Category Literal for ALL storage and metrics.",
+    "semantics_source": "criteria for event_info / card_transaction / card_summary / points_summary preserve ANALYZE_SYSTEM_PROMPT's explicit definitions (v1.4.1 date+venue rule, four-field transaction rule); the other 11 categories had no LLM-prompt definition — their criteria are new operational semantics (design D4). All illustrative content synthetic (public repo mirror).",
+    "wire_contract": "jev choice question: criteria is a FLAT {label: description} map (no examples field). Sent per-request in POST /v1/systemone as {state, questions, model}. Pin model=multilingual."
+  },
+  "model": "multilingual",
+  "question": {
+    "type": "choice",
+    "instructions": "Which category does the email in `subject` and `body` belong to?",
+    "criteria": {
+      "card_transaction": "a bank or card notification for ONE completed purchase, containing ALL of: date/time, a concrete merchant name, the amount, and an authorization or receipt number; a summary or daily total without merchant name and authorization number is card_summary, not this",
+      "card_summary": "a card usage digest: multiple purchases summarized in one mail, or a same-day spending total that lacks a concrete merchant name and authorization number",
+      "points_summary": "loyalty or reward POINTS earned, used, or expiring (store point programs, cashback points); points activity is never a money purchase",
+      "subscription": "a subscription lifecycle notice: auto-renewal confirmation, billing cycle, plan change, trial ending",
+      "tech_article": "technical content: an engineering blog post, developer newsletter, tech digest, or open-source project update; knowledge content, not a course promotion",
+      "event_info": "a lecture, seminar, webinar, or community event announcement with BOTH a concrete date/time AND a venue or online meeting link; a course recommendation without a scheduled session date is marketing, not this",
+      "meeting_invite": "a meeting invitation addressed to the recipient personally, with a specific time, usually with an organizer and often a calendar attachment",
+      "bill_due": "a bill or statement notice with an amount due and/or a payment deadline: utility, telecom, or a credit-card statement being issued",
+      "marketing": "general marketing or a recommendation (products, online courses, financial products such as funds or loans) WITHOUT a concrete redeemable offer and WITHOUT a scheduled event",
+      "promotion": "a promotion carrying a concrete redeemable offer the recipient can act on: a discount code, coupon, or limited-time sale, usually with a deadline",
+      "social": "a social network notification or personal correspondence: mentions, follows, comments, messages from a person",
+      "news": "a news digest or current-events newsletter from a news outlet",
+      "security_alert": "an account security notice: new device login, password change, one-time verification code, suspicious activity warning",
+      "stock_info": "securities, ETF, or fund INFORMATION for holdings: trade confirmations, dividend notices, earnings alerts, price alerts; a sales pitch for financial products is marketing, not this",
+      "survey": "a request to fill in a survey or questionnaire: service satisfaction, post-event feedback, 'tell us how it went'; cashback or reward-point mentions in promos are NOT this",
+      "other": "none of the above: general administrative or system notices that fit no other category"
+    }
+  },
+  "label_map": {
+    "card_transaction": "消費支出",
+    "card_summary": "消費資訊彙整",
+    "points_summary": "點數資訊彙整",
+    "subscription": "訂閱服務",
+    "tech_article": "技術文章",
+    "event_info": "講座資訊",
+    "meeting_invite": "會議邀請",
+    "bill_due": "帳單通知",
+    "marketing": "廣告",
+    "promotion": "促銷",
+    "social": "社交",
+    "news": "新聞",
+    "security_alert": "安全通知",
+    "stock_info": "股票資訊",
+    "survey": "問卷調查",
+    "other": "其他"
+  }
+}

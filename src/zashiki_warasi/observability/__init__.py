@@ -17,6 +17,9 @@ from __future__ import annotations
 
 from zashiki_warasi.observability.metrics import (
     REGISTRY,
+    classifier_shadow_agreement_total,
+    classifier_shadow_duration_seconds,
+    classifier_shadow_error_total,
     email_end_to_end_duration_seconds,
     external_api_duration_seconds,
     gmail_api_calls_total,
@@ -51,6 +54,9 @@ __all__ = [
     "LLMCallCtx",
     "NodeSpanCtx",
     "api_call",
+    "classifier_shadow_agreement_total",
+    "classifier_shadow_duration_seconds",
+    "classifier_shadow_error_total",
     "email_end_to_end_duration_seconds",
     "external_api_duration_seconds",
     "gmail_api_calls_total",
