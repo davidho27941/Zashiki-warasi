@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Laya shadow classifier** (`add-laya-shadow-classifier`, issue #4
+  Phase 0) — a fine-tuned laya encoder (`laya-zashiki-email-v1`,
+  RLCD on ~4.8k operator-labeled mails; held-out 83.0% standalone,
+  hybrid sweep T=0.80 → 96.2% precision @ 66.2% coverage) runs in
+  shadow next to the LLM classifier. **Off by default; zero behavior
+  change** — the LLM stays authoritative, shadow output only lands
+  in the new `laya_shadow_predictions` table (self-contained
+  `(input_text, prediction)` samples under
+  `UNIQUE(message_id, laya_model_ver)`) and three new metric
+  families (`zashiki_classifier_shadow_{agreement_total,
+  duration_seconds,error_total}`). Enable via `LAYA_SHADOW_ENABLED=1`
+  + `LAYA_BASE_URL`; see `docs/classifier-laya-shadow.md`.
+- **`問卷調查` category** (16th) in the `Category` Literal and
+  `ANALYZE_SYSTEM_PROMPT` — surveys/feedback-requests previously
+  fell into `其他` or were confused with cashback `促銷`.
+- **`deploy/helm/laya-classifier/` chart** — CPU-only `laya-serve`
+  Deployment + Service with the fine-tuned checkpoint baked into the
+  image (`Build_Laya_Image` manual CI job; checkpoint fetched from
+  the private GitLab generic package registry).
+- **Questions-dict ConfigMap** mounted at `/etc/zashiki` in the
+  zashiki pod; `laya_model_ver` auto-rotates on any dict edit
+  (`{semantic}-{sha1(dict)[:8]}`).
+
 ## [1.5.0] — 2026-09-24
 
 New minor: **per-node latency observability**. Adds four Prometheus
