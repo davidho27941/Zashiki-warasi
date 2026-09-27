@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.7.0] — 2026-09-27
+
+New minor: **calendar deduplication** (issue #2). An invite →
+reminder → starting-soon email series now yields exactly one
+calendar event, via a two-layer duplicate check (organizer iCalUID,
+then a title+start fingerprint stamped on every insert). Also fixes
+real Google invites never reaching the deterministic `.ics` parser
+(inline text/calendar parts, forward-re-typed application/ics).
+
 ### Added
 
 - **Calendar dedup** (`add-calendar-dedup-by-ical-and-fingerprint`,
