@@ -113,13 +113,7 @@ GROUP BY 1, 2 ORDER BY 3 DESC;
 3. **LangGraph resume 缺口**:分析失敗、事後 resume 的信**沒有**
    影子 row——hook 掛在 `_analyze` 的成功尾端。這是預期行為,
    不要去追少掉的 rows。
-4. **Counter 重啟低估**:Grafana 的 agreement 面板用
-   `increase(counter[range])`;pod 重啟後 Prometheus 看不到各序列
-   「出生自帶」的那筆值,所以部署頻繁的日子 dashboard 會**高估**
-   agreement(掉的多半是稀有的分歧序列)。穩態下沒問題;要做決策
-   時一律用 `laya_shadow_predictions` 算(上面的 SQL)——DB 才是
-   ground truth。
-5. **定義同步義務**:
+4. **定義同步義務**:
    `deploy/helm/zashiki-warasi/configs/laya-questions.json` 裡的
    英文 criteria 對映 `ANALYZE_SYSTEM_PROMPT`。prompt 的類別定義
    一改,dict 必須跟著改(反之亦然)——
