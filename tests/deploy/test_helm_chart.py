@@ -232,11 +232,13 @@ class TestDashboardConfigMapRender:
             # ON; disable it too so this test isolates the "per-dashboard
             # toggle works" invariant across ALL dashboards.
             "observability.dashboards.graphLatency.enabled": "false",
+            "observability.dashboards.layaShadow.enabled": "false",
         })
         # Master on, all per-dashboards off → zero dashboard CMs.
         assert "grafana_dashboard" not in out
         assert "zashiki-warasi-overview.json" not in out
         assert "zashiki-graph-latency.json" not in out
+        assert "zashiki-laya-shadow.json" not in out
 
     def test_graph_latency_dashboard_renders_by_default(self):
         """v1.5.0 dashboard ships enabled-by-default when master is on."""
@@ -255,6 +257,23 @@ class TestDashboardConfigMapRender:
         })
         assert "zashiki-warasi-overview.json" in out
         assert "zashiki-graph-latency.json" not in out
+
+    def test_laya_shadow_dashboard_renders_by_default(self):
+        """v1.6.0 dashboard ships enabled-by-default when master is on."""
+        out = _render(**{
+            "observability.dashboards.enabled": "true",
+        })
+        assert "zashiki-laya-shadow.json" in out
+        assert "dashboard-laya-shadow" in out
+
+    def test_laya_shadow_per_dashboard_toggle(self):
+        """layaShadow=false while the others stay on → its CM only."""
+        out = _render(**{
+            "observability.dashboards.enabled": "true",
+            "observability.dashboards.layaShadow.enabled": "false",
+        })
+        assert "zashiki-warasi-overview.json" in out
+        assert "zashiki-laya-shadow.json" not in out
 
     def test_sidecar_label_customizable(self):
         out = _render(**{
