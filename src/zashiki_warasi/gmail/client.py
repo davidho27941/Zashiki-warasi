@@ -277,6 +277,7 @@ class GmailClient:
         leaves = list(self._walk_parts(payload))
         body_plain, body_html = self._extract_bodies(leaves)
         attachments = self._extract_attachments(leaves)
+        ics_inline = self._extract_inline_ics(leaves)
         return EmailMessage(
             id=raw["id"],
             thread_id=raw["threadId"],
@@ -294,6 +295,7 @@ class GmailClient:
             labels=list(raw.get("labelIds", [])),
             attachments=attachments,
             raw_headers=headers,
+            ics_inline=ics_inline,
         )
 
     @staticmethod
@@ -339,6 +341,25 @@ class GmailClient:
             elif mime == "text/html" and html is None:
                 html = GmailClient._decode_body(data, part)
         return plain, html
+
+    @staticmethod
+    def _extract_inline_ics(leaves: Iterable[dict]) -> str | None:
+        """First inline `text/calendar` part's decoded content, or None.
+
+        Google Calendar invites carry their .ics as an INLINE part
+        (`body.data` present, no `attachmentId`) which the attachments
+        list can't represent. A text/calendar part that IS a real
+        attachment has `attachmentId` and no `data` — it stays on the
+        attachment path and is skipped here (v1.7.0, design D7).
+        """
+        for part in leaves:
+            mime = part.get("mimeType", "").lower()
+            if not mime.startswith("text/calendar"):
+                continue
+            data = part.get("body", {}).get("data")
+            if data:
+                return GmailClient._decode_body(data, part)
+        return None
 
     @staticmethod
     def _extract_attachments(leaves: Iterable[dict]) -> list[AttachmentMeta]:

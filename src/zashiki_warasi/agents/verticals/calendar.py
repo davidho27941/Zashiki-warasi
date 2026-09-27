@@ -256,6 +256,27 @@ class CalendarSubgraph:
                         return {"extracted": draft}
                     log.info("calendar: .ics parse returned None → LLM fallback")
 
+            # ---- inline text/calendar part (v1.7.0 D7) ----
+            # Real Google Calendar invites ship the .ics inline
+            # (body.data, no attachmentId) — invisible to the
+            # attachments list, but deterministic gold when present.
+            if email.ics_inline:
+                log.info("calendar: parsing inline text/calendar part")
+                draft = parse_ics_bytes(
+                    email.ics_inline.encode("utf-8"), self._default_timezone
+                )
+                if draft is not None:
+                    log.info(
+                        f"calendar: inline .ics extracted "
+                        f"title={draft.title!r} "
+                        f"start={draft.start.isoformat()} "
+                        f"uid={draft.ical_uid!r}"
+                    )
+                    return {"extracted": draft}
+                log.info(
+                    "calendar: inline .ics parse returned None → LLM fallback"
+                )
+
             # ---- LLM extraction (fallback) ----
             body = (
                 email.body_plain

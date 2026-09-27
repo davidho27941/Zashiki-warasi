@@ -128,7 +128,9 @@ UID 的信)。v1.7.0 加入兩層重複檢查,在 freebusy 之後、`events.inse
 之前執行,涵蓋真實世界最常見的情境:同一活動的 invite → reminder →
 starting-soon 系列信。
 
-- **第一層 — iCalUID 查詢**:draft 帶主辦方簽發的 `ical_uid` 時,先查
+- **第一層 — iCalUID 查詢**:draft 帶主辦方簽發的 `ical_uid` 時(v1.7.0
+  起也能偵測真實 Google 邀請信的 inline `text/calendar` part——過去
+  只有 `.ics`「附件」進得了確定性解析),先查
   `events.list(iCalUID=…)`。命中 → 以 `duplicate_by_ical_uid` 跳過。
   已刪除的事件不算數(`showDeleted=false`),手動刪掉事件後,下一封
   信可以重建。

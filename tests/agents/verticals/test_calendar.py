@@ -1355,3 +1355,123 @@ class TestDuplicateSkipNotifyWording:
         assert "行事曆事件未建立" in text
         assert "內文無明確活動時間" in text
         assert "已存在" not in text
+
+
+# ---------- v1.7.0 inline .ics extraction (design D7) --------------------
+
+
+_INLINE_VCAL = """BEGIN:VCALENDAR
+PRODID:-//Google Inc//Google Calendar 70.9054//EN
+VERSION:2.0
+METHOD:REQUEST
+BEGIN:VEVENT
+DTSTART:20260930T060000Z
+DTEND:20260930T070000Z
+DTSTAMP:20260927T000000Z
+UID:inline-real-uid@google.com
+SUMMARY:Test Event
+END:VEVENT
+END:VCALENDAR
+"""
+
+
+class TestExtractInlineIcs:
+    def _email_with_inline_ics(self) -> EmailMessage:
+        return EmailMessage(
+            id="msg-inline-ics",
+            thread_id="t",
+            history_id=100,
+            from_address="calendar-notification@google.com",
+            subject="邀請:Test Event",
+            body_plain="You have been invited.",
+            received_at=datetime(2026, 9, 27, 10, 0, tzinfo=timezone.utc),
+            attachments=[],
+            ics_inline=_INLINE_VCAL,
+        )
+
+    def test_inline_ics_extracts_without_llm(self):
+        model = _build_model_returning(None)
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        out = sg._extract_node({
+            "email": self._email_with_inline_ics(), "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        draft = out["extracted"]
+        assert draft is not None
+        assert draft.ical_uid == "inline-real-uid@google.com"
+        assert draft.title == "Test Event"
+        # Deterministic path — the LLM must NOT have been invoked.
+        model.with_structured_output.return_value.invoke.assert_not_called()
+
+    def test_attachment_ics_takes_priority_over_inline(
+        self, fake_email_with_ics
+    ):
+        """When a REAL .ics attachment exists, it wins; ics_inline is
+        only the fallback for invite-style inline parts."""
+        email = fake_email_with_ics.model_copy(
+            update={"ics_inline": _INLINE_VCAL}
+        )
+        gmail = _mock_gmail_client_returning_ics(
+            _INLINE_VCAL.replace(
+                "inline-real-uid@google.com", "attachment-uid@google.com"
+            ).encode()
+        )
+        sg = _sg(_build_model_returning(None), gmail, _mock_calendar_client())
+
+        out = sg._extract_node({
+            "email": email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        assert out["extracted"].ical_uid == "attachment-uid@google.com"
+
+    def test_unparsable_inline_falls_through_to_llm(self):
+        llm_draft = CalendarEventDraft(
+            title="fallback",
+            start=datetime(2026, 9, 30, 14, 0),
+            end=datetime(2026, 9, 30, 15, 0),
+        )
+        model = _build_model_returning(llm_draft)
+        sg = _sg(model, MagicMock(), _mock_calendar_client())
+
+        email = self._email_with_inline_ics().model_copy(
+            update={
+                "ics_inline": "BEGIN:VCALENDAR\nEND:VCALENDAR\n",
+                # keep a date-signal body so the LLM short-circuit
+                # doesn't trigger before the fallback
+                "body_plain": "活動時間 2026-09-30 14:00-15:00",
+            }
+        )
+        out = sg._extract_node({
+            "email": email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })
+        assert out["extracted"] is not None
+        assert out["extracted"].title == "fallback"
+
+    def test_inline_uid_reaches_layer_one_dedup(self):
+        """End-to-end within the subgraph nodes: inline .ics UID flows
+        into `_create_node`'s Layer 1 lookup — the Round B smoke gap."""
+        hit = ExistingEvent(
+            id="manual-event",
+            title="Test Event",
+            start=datetime(2026, 9, 30, 6, 0, tzinfo=timezone.utc),
+            end=datetime(2026, 9, 30, 7, 0, tzinfo=timezone.utc),
+        )
+        calendar_client = _mock_calendar_client(ical_uid_hits=[hit])
+        sg = _sg(_build_model_returning(None), MagicMock(), calendar_client)
+
+        email = self._email_with_inline_ics()
+        extracted = sg._extract_node({
+            "email": email, "analysis": None,
+            "side_effect": None, "extracted": None,
+        })["extracted"]
+        out = sg._create_node({
+            "email": email, "analysis": None,
+            "side_effect": None, "extracted": extracted,
+        })
+        assert out["side_effect"].reason == "duplicate_by_ical_uid"
+        calendar_client.list_events_by_ical_uid.assert_called_once_with(
+            "inline-real-uid@google.com"
+        )
+        calendar_client.insert_event.assert_not_called()

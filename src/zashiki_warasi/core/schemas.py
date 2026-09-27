@@ -42,6 +42,15 @@ class EmailMessage(BaseModel):
     labels: list[str] = Field(default_factory=list)
     attachments: list[AttachmentMeta] = Field(default_factory=list)
     raw_headers: dict[str, str] = Field(default_factory=dict)
+    ics_inline: str | None = Field(
+        default=None,
+        description=(
+            "Decoded content of the first inline text/calendar MIME "
+            "part, when present. Google Calendar invites ship their "
+            ".ics this way (body.data, no attachmentId), invisible to "
+            "the attachments list. v1.7.0 — see calendar-vertical spec."
+        ),
+    )
 
 
 class ProfileInfo(BaseModel):

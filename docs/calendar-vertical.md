@@ -142,7 +142,9 @@ covering the dominant real-world case: the invite → reminder →
 starting-soon *series* announcing one event across several emails.
 
 - **Layer 1 — iCalUID lookup**: when the draft carries an
-  organizer-issued `ical_uid`, `events.list(iCalUID=…)` is queried
+  organizer-issued `ical_uid` (v1.7.0 also detects the INLINE
+  `text/calendar` part real Google invites ship — previously only
+  `.ics` *attachments* reached the deterministic parser), `events.list(iCalUID=…)` is queried
   first. Any hit → skip with reason `duplicate_by_ical_uid`. Deleted
   events don't count (`showDeleted=false`), so removing an event by
   hand lets the next email recreate it.
