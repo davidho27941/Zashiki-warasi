@@ -21,6 +21,7 @@ PRIVACY: input and output live in gitignored data/ — real mail text.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import random
 import sys
@@ -141,8 +142,18 @@ def main() -> int:
     order = list(rows)
     random.Random(args.seed).shuffle(order)
 
-    server = HTTPServer(("127.0.0.1", args.port),
-                        make_handler(rows, order, args.output))
+    try:
+        server = HTTPServer(("127.0.0.1", args.port),
+                            make_handler(rows, order, args.output))
+    except OSError as exc:
+        if exc.errno != errno.EADDRINUSE:
+            raise
+        print(f"port {args.port} is already in use — another "
+              f"label_review_web may already be running (just open "
+              f"http://127.0.0.1:{args.port}), or pass --port N. "
+              f"Two instances on one --output would interleave writes.",
+              file=sys.stderr)
+        return 1
     done = len(_load_done(args.output) & set(rows))
     print(f"{len(rows)} rows ({done} already labeled) → "
           f"http://127.0.0.1:{args.port}   (Ctrl-C to stop)")
