@@ -83,6 +83,10 @@ env:
   # CALENDAR_ENABLED: "1"
   # CALENDAR_TIMEZONE: "Asia/Taipei"
   # CALENDAR_PRIMARY_ID: "primary"
+  # Category vocabulary for new analyses (openspec adopt-email-taxonomy-v2).
+  # `v1` = 16 classes (default); `v2` = 14 classes. Flip back to `v1` to
+  # roll back — drain pending LangGraph threads first (cutover runbook).
+  # TAXONOMY_VERSION: "v1"
   # Gmail scopes / paths / tuning (all read via GmailSettings env_prefix=GMAIL_)
   GMAIL_CREDENTIALS_PATH: "/secrets/credentials.json"
   GMAIL_TOKEN_PATH: "/data/token.json"

@@ -308,6 +308,29 @@ class CalendarSettings(BaseSettings):
     )
 
 
+class TaxonomySettings(BaseSettings):
+    """Category vocabulary selector (openspec `adopt-email-taxonomy-v2`).
+
+    Picks the prompt, structured-output schema and routing map for NEW
+    analyses. Flipping it back is the rollback path — no DB change.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="TAXONOMY_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    version: Literal["v1", "v2"] = Field(
+        default="v1",
+        description=(
+            "`v1` = 16-class vocabulary (pre-v2 behavior); `v2` = 14-class "
+            "vocabulary shared with laya v2. Unknown values fail at boot."
+        ),
+    )
+
+
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 
