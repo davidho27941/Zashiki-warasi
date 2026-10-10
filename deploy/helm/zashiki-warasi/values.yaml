@@ -50,6 +50,13 @@ strategy:
 # to drain cleanly — the taxonomy cutover runbook relies on that drain.
 terminationGracePeriodSeconds: 120
 
+# laya questions dict mounted at /etc/zashiki/laya-questions.json (the
+# file name LAYA_QUESTIONS_PATH points at never changes). Its taxonomy
+# must match TAXONOMY_VERSION or the shadow client refuses to boot:
+#   configs/laya-questions.json     — taxonomy v1 (15 effective labels)
+#   configs/laya-questions-v2.json  — taxonomy v2 (14 labels)
+layaQuestionsFile: configs/laya-questions.json
+
 resources:
   requests:
     cpu: 100m

@@ -28,6 +28,7 @@ spec:
         # env-only updates don't require a manual `kubectl rollout`.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        checksum/laya-questions: {{ include (print $.Template.BasePath "/laya-questions-configmap.yaml") . | sha256sum }}
     spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}

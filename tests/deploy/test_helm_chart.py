@@ -70,6 +70,28 @@ class TestTerminationGracePeriod:
         assert "      terminationGracePeriodSeconds: 300" in out
 
 
+class TestLayaQuestionsFile:
+    def test_default_mounts_the_v1_dict(self):
+        out = _render()
+        assert '"semantic_version": "v0.1"' in out
+        assert '"taxonomy_version": "v2"' not in out
+
+    def test_v2_dict_selectable(self):
+        out = _render(layaQuestionsFile="configs/laya-questions-v2.json")
+        assert '"taxonomy_version": "v2"' in out
+        assert "  laya-questions.json: |" in out
+
+    def test_switching_dict_rolls_the_pod(self):
+        def checksum(out):
+            return next(
+                line for line in out.splitlines()
+                if "checksum/laya-questions:" in line
+            )
+        assert checksum(_render()) != checksum(
+            _render(layaQuestionsFile="configs/laya-questions-v2.json")
+        )
+
+
 class TestExpectedKinds:
     """The chart must render all the manifests the deploy README
     promises. Prevents accidentally deleting a template."""

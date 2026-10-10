@@ -106,3 +106,59 @@ class TestAgreementRule:
 
     def test_plain_mismatch(self):
         assert not is_agreement("促銷", "廣告")
+
+
+# ---------- taxonomy v2 (adopt-email-taxonomy-v2) ----------
+
+DICT_V2_PATH = str(
+    REPO / "deploy/helm/zashiki-warasi/configs/laya-questions-v2.json"
+)
+
+
+class TestTaxonomyV2Dict:
+    def test_v2_question_identical_to_finetune_construction(self):
+        pkg_q, _, pkg_zh_by_en, pkg_en_by_zh = load_questions_file(
+            DICT_V2_PATH, "v2"
+        )
+        s_q, s_zh_by_en, s_en_by_zh = _load_scripts_variant().load_questions(
+            DICT_V2_PATH
+        )
+        assert json.dumps(pkg_q, ensure_ascii=False) == json.dumps(
+            s_q, ensure_ascii=False
+        ), "serve question != training question"
+        assert pkg_zh_by_en == s_zh_by_en
+        assert pkg_en_by_zh == s_en_by_zh
+
+    def test_v2_dict_is_a_plain_bijection_onto_v2(self):
+        from zashiki_warasi.core.schemas import CATEGORIES_BY_VERSION
+
+        q, _, zh_by_en, en_by_zh = load_questions_file(DICT_V2_PATH, "v2")
+        assert len(q["criteria"]) == 14
+        assert set(zh_by_en.values()) == set(CATEGORIES_BY_VERSION["v2"])
+        assert en_by_zh["行事曆事件"] == "calendar_event"
+        assert q["criteria"]["calendar_event"].startswith("an event with BOTH")
+
+    @pytest.mark.parametrize(
+        ("path", "active"), [(DICT_PATH, "v2"), (DICT_V2_PATH, "v1")],
+    )
+    def test_dict_and_taxonomy_version_must_match(self, path, active):
+        with pytest.raises(QuestionsDictError, match="TAXONOMY_VERSION"):
+            load_questions_file(path, active)
+
+    def test_v2_dict_with_a_v1_label_aborts(self, tmp_path):
+        d = json.load(open(DICT_V2_PATH, encoding="utf-8"))
+        d["label_map"]["marketing"] = "廣告"
+        p = tmp_path / "q.json"
+        p.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+        with pytest.raises(QuestionsDictError, match="taxonomy v2"):
+            load_questions_file(str(p), "v2")
+
+    def test_v2_agreement_is_plain_equality(self):
+        assert is_agreement("行事曆事件", "行事曆事件", "v2")
+        assert not is_agreement(CALENDAR_ZH, "講座資訊", "v2")
+
+    def test_v2_dict_examples_stay_synthetic(self):
+        # The dict ships in a publicly mirrored chart: no real senders.
+        text = open(DICT_V2_PATH, encoding="utf-8").read().lower()
+        for real in ("linkedin", "humble", "rakuten", "smbc", "楽天", "luma"):
+            assert real not in text

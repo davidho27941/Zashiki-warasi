@@ -282,3 +282,14 @@ class TestNonInterference:
             rows = s.scalars(select(LayaShadowPrediction).where(
                 LayaShadowPrediction.message_id == "m-dup")).all()
             assert len(rows) == 1
+
+
+def test_shadow_refuses_to_boot_on_taxonomy_mismatch():
+    from zashiki_warasi.classifier.question import QuestionsDictError
+    from zashiki_warasi.core.config import TaxonomySettings
+
+    with pytest.raises(QuestionsDictError, match="TAXONOMY_VERSION"):
+        LayaShadowClient(
+            settings=_settings(),
+            taxonomy_settings=TaxonomySettings(version="v2"),
+        )

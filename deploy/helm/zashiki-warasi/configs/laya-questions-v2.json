@@ -1,0 +1,46 @@
+{
+  "_meta": {
+    "semantic_version": "v2.0",
+    "authoring": "ENGLISH-primary per openspec add-laya-shadow-classifier D8 (zh criteria collapse zero-shot accuracy). State text stays zh/ja. label_map converts wire labels to the taxonomy-v2 categories for ALL storage and metrics.",
+    "semantics_source": "openspec adopt-email-taxonomy-v2: one 14-class vocabulary shared with the LLM's v2 analyze prompt (classifier/analyze_prompts.py CATEGORY_SECTION_V2). No super-class merge: calendar_event is a first-class label. All illustrative content synthetic (public repo mirror).",
+    "wire_contract": "jev choice question: criteria is a FLAT {label: description} map. Sent per-request in POST /v1/systemone as {state, questions, model}. Pin model=multilingual."
+  },
+  "taxonomy_version": "v2",
+  "model": "multilingual",
+  "question": {
+    "type": "choice",
+    "instructions": "Which category does the email in `subject` and `body` belong to?",
+    "criteria": {
+      "transaction_receipt": "a notification for ONE completed payment containing ALL of: date/time, a concrete merchant name, the amount, and a transaction identifier (order, receipt, or authorization number); anything missing one of the four is account_summary",
+      "account_summary": "a digest of several transactions, a same-day spending total without a concrete merchant or identifier, or loyalty points earned, used, or expiring",
+      "bill_due": "a bill or statement notice: an amount due, a payment deadline, or a statement being issued",
+      "service_notice": "a non-security notice about the recipient's own account or subscription: renewal, cancellation, trial ending, terms update, system or CI notification, settings reminder",
+      "calendar_event": "an event with BOTH a concrete date/time AND a venue or online meeting link: a lecture, seminar, meeting invitation, or a job interview or call with a scheduled time; a digest listing many events, or a course recommendation without a scheduled session, is not this",
+      "security_alert": "a security event on the recipient's own account: new device sign-in, one-time verification code, password or authorization change",
+      "public_alert": "a weather, disaster, or transit warning from a government or public agency",
+      "investment_account": "information about the recipient's own holdings or orders: trade executions, recurring purchases, deposits, dividends, fund net asset value; market commentary is newsletter",
+      "newsletter": "informational content: tech articles, news, market commentary, industry digests; no redeemable offer, no single scheduled event, no personal account data",
+      "marketing": "advertising or a promotion for products, services, courses, or financial products, with or without a discount code or deadline",
+      "social": "person-to-person or social-platform interaction: invitations to connect, messages, introductions, discussion-thread replies",
+      "career": "job alerts, recruiter or scout messages, company reviews; a recruiter mail proposing a scheduled interview time is calendar_event",
+      "survey": "a mail whose main purpose is requesting a survey, review, or feedback; a feedback link appended to a receipt or promotion is not this",
+      "other": "none of the above"
+    }
+  },
+  "label_map": {
+    "transaction_receipt": "交易收據",
+    "account_summary": "帳務彙整",
+    "bill_due": "帳單通知",
+    "service_notice": "服務通知",
+    "calendar_event": "行事曆事件",
+    "security_alert": "安全通知",
+    "public_alert": "公共警報",
+    "investment_account": "投資帳戶通知",
+    "newsletter": "內容電子報",
+    "marketing": "行銷",
+    "social": "社交",
+    "career": "職涯",
+    "survey": "問卷調查",
+    "other": "其他"
+  }
+}

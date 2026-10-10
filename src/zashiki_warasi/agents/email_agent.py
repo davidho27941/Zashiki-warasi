@@ -216,7 +216,8 @@ class EmailAgent:
         # (constructing the default reads env; disabled = zero cost,
         # no laya connectivity, no questions-file read).
         self._laya_shadow = laya_shadow or LayaShadowClient(
-            session_factory=session_factory
+            session_factory=session_factory,
+            taxonomy_settings=taxonomy_settings,
         )
 
         # Two model instances against the same server:
