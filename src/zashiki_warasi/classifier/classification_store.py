@@ -35,6 +35,21 @@ Outcome = Literal["inserted", "versioned", "unchanged", "human_kept"]
 
 _MACHINE_SOURCES = frozenset({"llm", "laya"})
 
+# Seeds v1 history for analyses with no classification row at all.
+# Idempotent; same statement as migration 0009 (frozen copy there,
+# equality pinned by a test). Run after a deploy to cover analyses the
+# previous pod wrote between the migration and its own shutdown.
+SEED_V1_HISTORY_SQL = """
+INSERT INTO email_classifications
+    (message_id, category, taxonomy_version, source, recorded_by, valid_from)
+SELECT a.message_id, a.category, a.taxonomy_version, 'llm', 'migration',
+       a.analyzed_at
+FROM email_analyses a
+WHERE NOT EXISTS (
+    SELECT 1 FROM email_classifications c WHERE c.message_id = a.message_id
+)
+"""
+
 
 def _current(session: Session, message_id: str) -> EmailClassification | None:
     return session.scalar(
