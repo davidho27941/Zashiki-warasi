@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Ground work for the **email taxonomy v2** (issue #12, openspec
+`adopt-email-taxonomy-v2`). Ships with `TAXONOMY_VERSION=v1` — the
+analyze prompt and LLM tool schema are byte-identical to 1.7.0, so
+classification and routing do not change until the cutover.
+
+### Added
+
+- **Taxonomy registry + `TAXONOMY_VERSION`** (`v1` default | `v2`):
+  one switch selects the analyze prompt, the LLM output schema and the
+  routing map. v2 is the 14-class vocabulary (交易收據, 帳務彙整,
+  帳單通知, 服務通知, 行事曆事件, 安全通知, 公共警報, 投資帳戶通知,
+  內容電子報, 行銷, 社交, 職涯, 問卷調查, 其他). An analysis is routed by
+  the version it was produced under.
+- **Classification history** (alembic `0009`): `email_classifications`
+  as transaction-time SCD type 2 (one current row per message and no
+  overlapping ranges, enforced in Postgres via a partial unique index
+  and a btree_gist EXCLUDE constraint), append-only
+  `taxonomy_mappings`, and the `email_category_current` view as the
+  single read path. Existing analyses are seeded as v1 history.
+- `taxonomy_version` on `email_analyses` and `laya_shadow_predictions`.
+- Scripts: `seed_classifications.py`, `import_human_labels.py` (blind
+  verdicts as human history; human rows win over llm/laya),
+  `check_pending_threads.py` (cutover gate).
+- `configs/laya-questions-v2.json` and chart value `layaQuestionsFile`;
+  the shadow client refuses to boot when the dict's taxonomy differs
+  from `TAXONOMY_VERSION`.
+- Metrics: `taxonomy` label on `zashiki_email_end_to_end_duration_seconds`
+  and `zashiki_classifier_shadow_agreement_total`; new
+  `zashiki_taxonomy_active_info{version}`. Dashboards gain a Taxonomy
+  variable and a cutover annotation.
+- Chart value `terminationGracePeriodSeconds` (default 120) so the
+  email in hand finishes after SIGTERM.
+- Docs: `docs/taxonomy-v2{,.zh}.md` (cutover / rollback runbook).
+
+### Changed
+
+- `backfill_training_pairs.py` reads labels from
+  `email_category_current`, exact mappings only.
+- The laya super-class agreement rule applies to taxonomy v1 only.
+
 ## [1.7.0] — 2026-09-27
 
 New minor: **calendar deduplication** (issue #2). An invite →

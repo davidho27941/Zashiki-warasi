@@ -51,6 +51,12 @@ helm upgrade zashiki -n zashiki deploy/helm/zashiki-warasi \
     --set image.tag=<sha>
 ```
 
+The questions dict must serve the same taxonomy as `TAXONOMY_VERSION`
+(chart value `layaQuestionsFile`: `configs/laya-questions.json` for v1,
+`configs/laya-questions-v2.json` for v2); a mismatch aborts startup.
+See [`taxonomy-v2.md`](taxonomy-v2.md) for the cutover, during which
+shadow is off until laya v2 passes its gate.
+
 Kill switch: `LAYA_SHADOW_ENABLED=0` (default) or an empty
 `LAYA_BASE_URL` — the client constructs inert and never touches the
 network, the DB, or the metrics registry.
@@ -108,13 +114,16 @@ data at any threshold without re-calling the model.
 
 ## Caveats when interpreting agreement
 
-1. **Super-class agreement**: laya predicts the merged
+1. **Super-class agreement (taxonomy v1 only)**: laya predicts the merged
    `行事曆事件` (calendar_event) class; the LLM predicts the fine
    labels `會議邀請` / `講座資訊`. The agreement metric counts
    laya=`行事曆事件` vs LLM=either fine label as **agreed** (the
    274-row audit showed the fine boundary is humanly unstable —
    83 verdict flips). Raw SQL string equality will under-count
-   agreement; use the metric or replicate the rule.
+   agreement; use the metric or replicate the rule. Under taxonomy v2
+   both engines share one 14-class vocabulary and agreement is plain
+   equality. Rows and the agreement metric carry `taxonomy_version` /
+   `taxonomy` — filter on it so v1 and v2 series never mix.
 2. **Truncation confound**: the LLM sees the full email; laya sees
    `subject + body` capped at 1500 chars (`classifier/truncation.py`,
    snapshotted in `input_text`). A disagreement on a long email may
