@@ -141,9 +141,14 @@ class TestSuccessPath:
             200, json=_jev_response("marketing", 0.91, {"marketing": 0.91}),
             request=httpx.Request("POST", "http://laya.test"),
         ))
+        selector = 'taxonomy="v2"'
+        before = _counter("zashiki_classifier_shadow_agreement_total", selector)
         client.classify_async(
             email=_email("m-ver"), llm_category="廣告", taxonomy_version="v2",
         ).result(timeout=5)
+        assert _counter(
+            "zashiki_classifier_shadow_agreement_total", selector,
+        ) == before + 1.0
         with session_factory() as s:
             row = s.scalar(select(LayaShadowPrediction).where(
                 LayaShadowPrediction.message_id == "m-ver"))

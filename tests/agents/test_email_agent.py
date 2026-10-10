@@ -1687,7 +1687,7 @@ class TestEndToEndObservation:
         from zashiki_warasi.observability import REGISTRY
 
         family = "zashiki_email_end_to_end_duration_seconds_count"
-        selector = f'category="{category}",outcome="{outcome}"'
+        selector = f'category="{category}",outcome="{outcome}",taxonomy="v1"'
         total = 0.0
         for line in generate_latest(REGISTRY).decode().splitlines():
             if line.startswith(family) and selector in line:
@@ -1700,7 +1700,7 @@ class TestEndToEndObservation:
         from zashiki_warasi.observability import REGISTRY
 
         family = "zashiki_email_end_to_end_duration_seconds_sum"
-        selector = f'category="{category}",outcome="{outcome}"'
+        selector = f'category="{category}",outcome="{outcome}",taxonomy="v1"'
         total = 0.0
         for line in generate_latest(REGISTRY).decode().splitlines():
             if line.startswith(family) and selector in line:
@@ -1717,7 +1717,7 @@ class TestEndToEndObservation:
         before_count = self._read_e2e_count("廣告", "success")
         before_sum = self._read_e2e_sum("廣告", "success")
 
-        _observe_email_e2e(email, "廣告", "success")
+        _observe_email_e2e(email, "廣告", "success", "v1")
 
         after_count = self._read_e2e_count("廣告", "success")
         after_sum = self._read_e2e_sum("廣告", "success")
@@ -1739,7 +1739,7 @@ class TestEndToEndObservation:
         before_count = self._read_e2e_count("其他", "success")
         before_sum = self._read_e2e_sum("其他", "success")
 
-        _observe_email_e2e(email, "其他", "success")
+        _observe_email_e2e(email, "其他", "success", "v1")
 
         after_count = self._read_e2e_count("其他", "success")
         after_sum = self._read_e2e_sum("其他", "success")
@@ -1761,7 +1761,7 @@ class TestEndToEndObservation:
         email = self._make_email(naive_past)
         before_count = self._read_e2e_count("技術文章", "success")
 
-        _observe_email_e2e(email, "技術文章", "success")
+        _observe_email_e2e(email, "技術文章", "success", "v1")
 
         after_count = self._read_e2e_count("技術文章", "success")
         assert after_count == before_count + 1.0
@@ -1776,7 +1776,7 @@ class TestEndToEndObservation:
         past = datetime.now(tz=timezone.utc) - timedelta(seconds=5)
         email = self._make_email(past)
         before = self._read_e2e_count("unknown", "error")
-        _observe_email_e2e(email, "unknown", "error")
+        _observe_email_e2e(email, "unknown", "error", "v1")
         after = self._read_e2e_count("unknown", "error")
         assert after == before + 1.0
 
@@ -1905,6 +1905,14 @@ class TestTaxonomyV2:
 
         targets = [c.args[0] for c in model.with_structured_output.call_args_list]
         assert AnalysisOutputV2 in targets
+
+        from prometheus_client import generate_latest
+
+        from zashiki_warasi.observability import REGISTRY
+
+        assert 'zashiki_taxonomy_active_info{version="v2"} 1.0' in (
+            generate_latest(REGISTRY).decode()
+        )
 
         result = agent._analyze({"email": fake_email})
         assert result["analysis"].category == "職涯"

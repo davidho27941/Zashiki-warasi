@@ -184,6 +184,7 @@ class LayaShadowClient:
                 llm_category=llm_category,
                 laya_category=laya_category,
                 agreed="true" if agreed else "false",
+                taxonomy=taxonomy_version,
             ).inc()
 
         if self._session_factory is None:

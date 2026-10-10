@@ -51,7 +51,20 @@ class TestContract:
         "zashiki_llm_call_duration_seconds",
         "zashiki_external_api_duration_seconds",
         "zashiki_email_end_to_end_duration_seconds",
+        # adopt-email-taxonomy-v2
+        "zashiki_taxonomy_active_info",
     }
+
+    def test_category_families_carry_taxonomy_label(self):
+        # Same-name categories change meaning across taxonomy versions,
+        # so every category-labeled family must also say which version.
+        from zashiki_warasi.observability.metrics import (
+            classifier_shadow_agreement_total,
+            email_end_to_end_duration_seconds,
+        )
+
+        assert "taxonomy" in email_end_to_end_duration_seconds._labelnames
+        assert "taxonomy" in classifier_shadow_agreement_total._labelnames
 
     def test_all_contracted_zashiki_families_present(self):
         names = set(all_metric_names())

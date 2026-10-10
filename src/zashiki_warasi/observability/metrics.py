@@ -286,10 +286,10 @@ classifier_shadow_duration_seconds: Histogram = _histogram(
 classifier_shadow_agreement_total: Counter = _counter(
     "zashiki_classifier_shadow_agreement_total",
     "One increment per successful shadow prediction. `laya_category` "
-    "is the mapped Chinese label (行事曆事件 for the merged calendar "
-    "super-class); `agreed` applies the super-class rule: laya's "
-    "行事曆事件 matches an LLM 講座資訊 OR 會議邀請.",
-    labelnames=("llm_category", "laya_category", "agreed"),
+    "is the mapped Chinese label. Under taxonomy v1 (`taxonomy` label) "
+    "`agreed` applies the super-class rule: laya's 行事曆事件 matches "
+    "an LLM 講座資訊 OR 會議邀請; under v2 it is plain equality.",
+    labelnames=("llm_category", "laya_category", "agreed", "taxonomy"),
 )
 
 classifier_shadow_error_total: Counter = _counter(
@@ -300,6 +300,14 @@ classifier_shadow_error_total: Counter = _counter(
 )
 
 
+taxonomy_active_info: Gauge = _gauge(
+    "zashiki_taxonomy_active_info",
+    "Set to 1 for the TAXONOMY_VERSION this process classifies new mail "
+    "with. Dashboards annotate a taxonomy cutover where a version's "
+    "series first appears.",
+    labelnames=("version",),
+)
+
 email_end_to_end_duration_seconds: Histogram = _histogram(
     "zashiki_email_end_to_end_duration_seconds",
     "Wall-clock latency from Gmail `internalDate` to Telegram-send "
@@ -307,8 +315,10 @@ email_end_to_end_duration_seconds: Histogram = _histogram(
     "Includes poll-interval contribution — this is the "
     "operator-visible latency, not the processing-only slice. "
     "`category` is the analyze result's category (or `unknown` when "
-    "analyze failed); `outcome` ∈ {success, skipped, error}.",
-    labelnames=("category", "outcome"),
+    "analyze failed); `taxonomy` ∈ {v1, v2} names its vocabulary, so "
+    "same-name categories whose meaning changed stay distinguishable; "
+    "`outcome` ∈ {success, skipped, error}.",
+    labelnames=("category", "taxonomy", "outcome"),
     buckets=_GRAPH_LATENCY_BUCKETS,
 )
 

@@ -44,6 +44,12 @@ strategy:
     maxSurge: 1
     maxUnavailable: 0
 
+# Seconds Kubernetes waits after SIGTERM before SIGKILL. The app stops
+# polling on SIGTERM but finishes the email in hand (analyze → notify can
+# take tens of seconds on a slow LLM), so the default 30 s is too short
+# to drain cleanly — the taxonomy cutover runbook relies on that drain.
+terminationGracePeriodSeconds: 120
+
 resources:
   requests:
     cpu: 100m

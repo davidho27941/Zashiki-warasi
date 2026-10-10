@@ -64,6 +64,7 @@ from zashiki_warasi.observability import (
     llm_calls_total,
     llm_latency_seconds,
     observe_email_end_to_end,
+    taxonomy_active_info,
 )
 from zashiki_warasi.observability.instrumentation import (
     record_call,
@@ -164,7 +165,7 @@ def _extract_context_length_detail(exc: BadRequestError) -> str:
 
 
 def _observe_email_e2e(
-    email: EmailMessage, category: str, outcome: str
+    email: EmailMessage, category: str, outcome: str, taxonomy: str
 ) -> None:
     """Emit one observation into `zashiki_email_end_to_end_duration_seconds`.
 
@@ -182,7 +183,7 @@ def _observe_email_e2e(
     duration = (now - received).total_seconds()
     if duration < 0:
         duration = 0.0
-    observe_email_end_to_end(category, outcome, duration)
+    observe_email_end_to_end(category, outcome, duration, taxonomy=taxonomy)
 
 
 class AgentState(TypedDict):
@@ -209,6 +210,7 @@ class EmailAgent:
         self._taxonomy = get_taxonomy(
             (taxonomy_settings or TaxonomySettings()).version
         )
+        taxonomy_active_info.labels(version=self._taxonomy.version).set(1)
         self._notifier = notifier
         # v1.6.0 shadow classifier — inert unless LAYA_SHADOW_ENABLED=1
         # (constructing the default reads env; disabled = zero cost,
@@ -417,6 +419,11 @@ class EmailAgent:
                 )
             return {"analysis": analysis}
 
+    def _active_version(self) -> str:
+        # `getattr`: router / notify unit tests build agents via __new__.
+        taxonomy = getattr(self, "_taxonomy", None)
+        return taxonomy.version if taxonomy is not None else "v1"
+
     def _route_by_category(self, state: AgentState) -> str:
         log = self._log(state)
         analysis = state.get("analysis")
@@ -461,11 +468,15 @@ class EmailAgent:
                     )
                     self._notifier.send_message(text, reply_markup=markup)
                     log.info("notified user of analyze failure")
-                    _observe_email_e2e(email, "unknown", "error")
+                    _observe_email_e2e(
+                        email, "unknown", "error", self._active_version()
+                    )
                     return {}
                 log.warning("notify: skipping — no analysis")
                 gs.outcome = "skipped"
-                _observe_email_e2e(email, "unknown", "skipped")
+                _observe_email_e2e(
+                    email, "unknown", "skipped", self._active_version()
+                )
                 return {}
             text = _format_message(email, analysis, side_effect)
             # v1.4: when the side_effect is a CalendarCreated, add a
@@ -478,7 +489,10 @@ class EmailAgent:
                 )
             self._notifier.send_message(text, reply_markup=markup)
             log.info("notified user")
-            _observe_email_e2e(email, analysis.category, "success")
+            _observe_email_e2e(
+                email, analysis.category, "success",
+                analysis.taxonomy_version,
+            )
             return {}
 
     # ----- entry point -----

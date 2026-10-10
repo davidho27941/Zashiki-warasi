@@ -60,6 +60,16 @@ class TestRollingUpdateStrategy:
         assert "maxUnavailable: 0" in out
 
 
+class TestTerminationGracePeriod:
+    # Graceful drain before a taxonomy cutover (adopt-email-taxonomy-v2 D8).
+    def test_default_is_120(self):
+        assert "      terminationGracePeriodSeconds: 120" in _render()
+
+    def test_override_flows_through(self):
+        out = _render(terminationGracePeriodSeconds=300)
+        assert "      terminationGracePeriodSeconds: 300" in out
+
+
 class TestExpectedKinds:
     """The chart must render all the manifests the deploy README
     promises. Prevents accidentally deleting a template."""

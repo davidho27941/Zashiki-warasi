@@ -9,10 +9,11 @@
         "iconColor": "rgba(0, 211, 255, 1)",
         "name": "Annotations & Alerts",
         "type": "dashboard"
-      }
+      },
+      {"name": "Taxonomy cutover", "enable": true, "iconColor": "orange", "datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "max by (version) (zashiki_taxonomy_active_info) unless max by (version) (zashiki_taxonomy_active_info offset 10m)", "step": "5m", "titleFormat": "taxonomy → {{version}}", "textFormat": "New mail is classified under taxonomy {{version}} from here. 職涯 / 公共警報 have no v1 predecessor; same-name categories (安全通知, 其他, 社交) changed meaning.", "useValueForTime": false}
     ]
   },
-  "description": "Zashiki-warasi v1.5.0 graph-node latency: end-to-end, per-node, per-LLM-purpose, per-external-API breakdown. All queries against the Prometheus datasource. See openspec/specs/observability/spec.md for the metric contract.",
+  "description": "Zashiki-warasi v1.5.0 graph-node latency: end-to-end, per-node, per-LLM-purpose, per-external-API breakdown. All queries against the Prometheus datasource. See openspec/specs/observability/spec.md for the metric contract. End-to-end latency is split by `taxonomy` (v1/v2) as well as category and filterable with the Taxonomy variable; the Taxonomy cutover annotation marks the switch.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -43,9 +44,9 @@
       "id": 101,
       "options": {"legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["last", "mean", "max"]}, "tooltip": {"mode": "multi", "sort": "desc"}},
       "targets": [
-        {"expr": "histogram_quantile(0.50, sum by (category, le) (rate(zashiki_email_end_to_end_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{category}}", "refId": "A"},
-        {"expr": "histogram_quantile(0.95, sum by (category, le) (rate(zashiki_email_end_to_end_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{category}}", "refId": "B"},
-        {"expr": "histogram_quantile(0.99, sum by (category, le) (rate(zashiki_email_end_to_end_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p99 {{category}}", "refId": "C"}
+        {"expr": "histogram_quantile(0.50, sum by (category, taxonomy, le) (rate(zashiki_email_end_to_end_duration_seconds_bucket{taxonomy=~\"$taxonomy\"}[$__rate_interval])))", "legendFormat": "p50 {{taxonomy}} {{category}}", "refId": "A"},
+        {"expr": "histogram_quantile(0.95, sum by (category, taxonomy, le) (rate(zashiki_email_end_to_end_duration_seconds_bucket{taxonomy=~\"$taxonomy\"}[$__rate_interval])))", "legendFormat": "p95 {{taxonomy}} {{category}}", "refId": "B"},
+        {"expr": "histogram_quantile(0.99, sum by (category, taxonomy, le) (rate(zashiki_email_end_to_end_duration_seconds_bucket{taxonomy=~\"$taxonomy\"}[$__rate_interval])))", "legendFormat": "p99 {{taxonomy}} {{category}}", "refId": "C"}
       ],
       "title": "End-to-end latency (p50 / p95 / p99 by category)",
       "type": "timeseries"
@@ -58,7 +59,7 @@
       "id": 102,
       "options": {"legend": {"displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi"}},
       "targets": [
-        {"expr": "sum by (outcome) (increase(zashiki_email_end_to_end_duration_seconds_count[1h]))", "legendFormat": "{{outcome}}", "refId": "A"}
+        {"expr": "sum by (outcome) (increase(zashiki_email_end_to_end_duration_seconds_count{taxonomy=~\"$taxonomy\"}[1h]))", "legendFormat": "{{outcome}}", "refId": "A"}
       ],
       "title": "Email outcomes (per 1h window)",
       "type": "timeseries"
@@ -184,7 +185,7 @@
   "schemaVersion": 39,
   "style": "dark",
   "tags": ["zashiki-warasi", "v1.5.0", "graph-latency"],
-  "templating": {"list": []},
+  "templating": {"list": [{"name": "taxonomy", "label": "Taxonomy", "type": "query", "datasource": {"type": "prometheus", "uid": "prometheus"}, "query": {"query": "label_values(zashiki_taxonomy_active_info, version)", "refId": "taxonomy"}, "definition": "label_values(zashiki_taxonomy_active_info, version)", "includeAll": true, "allValue": ".*", "multi": false, "current": {"selected": true, "text": "All", "value": "$__all"}, "refresh": 2, "sort": 1, "hide": 0}]},
   "time": {"from": "now-6h", "to": "now"},
   "timepicker": {},
   "timezone": "",
