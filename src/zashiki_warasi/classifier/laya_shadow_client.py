@@ -82,7 +82,11 @@ class LayaShadowClient:
         )
 
     def classify_async(
-        self, *, email: EmailMessage, llm_category: str
+        self,
+        *,
+        email: EmailMessage,
+        llm_category: str,
+        taxonomy_version: str = "v1",
     ) -> Future | None:
         """Submit one shadow classification. Returns the Future (tests
         use it for determinism) or None when disabled / dropped. NEVER
@@ -97,7 +101,7 @@ class LayaShadowClient:
                 return None
             try:
                 return self._executor.submit(
-                    self._worker, email, llm_category
+                    self._worker, email, llm_category, taxonomy_version
                 )
             except BaseException:
                 self._slots.release()
@@ -112,16 +116,18 @@ class LayaShadowClient:
 
     # ---- worker (background thread) ----------------------------------
 
-    def _worker(self, email: EmailMessage, llm_category: str) -> None:
+    def _worker(
+        self, email: EmailMessage, llm_category: str, taxonomy_version: str
+    ) -> None:
         try:
-            self._classify_and_persist(email, llm_category)
+            self._classify_and_persist(email, llm_category, taxonomy_version)
         except Exception:  # noqa: BLE001 — never propagate anywhere
             logger.exception("laya shadow: worker failed (swallowed)")
         finally:
             self._slots.release()
 
     def _classify_and_persist(
-        self, email: EmailMessage, llm_category: str
+        self, email: EmailMessage, llm_category: str, taxonomy_version: str
     ) -> None:
         input_text = build_classifier_input(email)
         started = time.monotonic()
@@ -193,6 +199,7 @@ class LayaShadowClient:
                 laya_latency_ms=latency_ms,
                 laya_error=error,
                 laya_model_ver=self.model_ver,
+                taxonomy_version=taxonomy_version,
             ))
             try:
                 session.commit()

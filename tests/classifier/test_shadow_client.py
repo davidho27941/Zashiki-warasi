@@ -130,6 +130,24 @@ class TestSuccessPath:
             assert row.input_text.startswith("測試")
             assert row.laya_model_ver.startswith("test-v1-")
             assert row.laya_alternates[0]["cat"] == "廣告"
+            assert row.taxonomy_version == "v1"
+
+    def test_row_records_the_analysis_taxonomy_version(
+        self, session_factory, monkeypatch
+    ):
+        client = LayaShadowClient(
+            settings=_settings(), session_factory=session_factory)
+        monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(
+            200, json=_jev_response("marketing", 0.91, {"marketing": 0.91}),
+            request=httpx.Request("POST", "http://laya.test"),
+        ))
+        client.classify_async(
+            email=_email("m-ver"), llm_category="廣告", taxonomy_version="v2",
+        ).result(timeout=5)
+        with session_factory() as s:
+            row = s.scalar(select(LayaShadowPrediction).where(
+                LayaShadowPrediction.message_id == "m-ver"))
+            assert row.taxonomy_version == "v2"
 
     def test_calendar_superclass_agreement(
         self, session_factory, monkeypatch

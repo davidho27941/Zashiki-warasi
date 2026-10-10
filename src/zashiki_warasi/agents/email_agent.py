@@ -31,6 +31,7 @@ from zashiki_warasi.agents.llm import get_chat_model
 from zashiki_warasi.agents.verticals.calendar import CalendarSubgraph
 from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
 from zashiki_warasi.calendar.client import GoogleCalendarClient
+from zashiki_warasi.classifier import classification_store
 from zashiki_warasi.classifier.laya_shadow_client import LayaShadowClient
 from zashiki_warasi.classifier.taxonomy import get_taxonomy
 from zashiki_warasi.core.config import CalendarSettings, TaxonomySettings
@@ -410,7 +411,9 @@ class EmailAgent:
                 # read by the pipeline. AnalysisFailed paths return
                 # earlier — no llm_category means no shadow sample.
                 self._laya_shadow.classify_async(
-                    email=email, llm_category=analysis.category
+                    email=email,
+                    llm_category=analysis.category,
+                    taxonomy_version=analysis.taxonomy_version,
                 )
             return {"analysis": analysis}
 
@@ -528,6 +531,8 @@ class EmailAgent:
             importance = 3
 
         with self._session_factory() as session:
+            # Replays, resumes and cached-analysis reuse stop here, so
+            # they never open a classification version.
             if session.get(EmailAnalysisORM, message_id) is not None:
                 return
             session.add(
@@ -536,9 +541,19 @@ class EmailAgent:
                     importance=importance,
                     urgency=analysis.urgency,
                     category=analysis.category,
+                    taxonomy_version=analysis.taxonomy_version,
                     summary=analysis.summary,
                     keywords=list(analysis.keywords),
                 )
+            )
+            session.flush()
+            classification_store.record(
+                session,
+                message_id=message_id,
+                category=analysis.category,
+                taxonomy_version=analysis.taxonomy_version,
+                source="llm",
+                recorded_by="app",
             )
             session.commit()
 
