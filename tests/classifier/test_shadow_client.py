@@ -130,6 +130,29 @@ class TestSuccessPath:
             assert row.input_text.startswith("測試")
             assert row.laya_model_ver.startswith("test-v1-")
             assert row.laya_alternates[0]["cat"] == "廣告"
+            assert row.taxonomy_version == "v1"
+
+    def test_row_records_the_analysis_taxonomy_version(
+        self, session_factory, monkeypatch
+    ):
+        client = LayaShadowClient(
+            settings=_settings(), session_factory=session_factory)
+        monkeypatch.setattr(httpx, "post", lambda *a, **k: httpx.Response(
+            200, json=_jev_response("marketing", 0.91, {"marketing": 0.91}),
+            request=httpx.Request("POST", "http://laya.test"),
+        ))
+        selector = 'taxonomy="v2"'
+        before = _counter("zashiki_classifier_shadow_agreement_total", selector)
+        client.classify_async(
+            email=_email("m-ver"), llm_category="廣告", taxonomy_version="v2",
+        ).result(timeout=5)
+        assert _counter(
+            "zashiki_classifier_shadow_agreement_total", selector,
+        ) == before + 1.0
+        with session_factory() as s:
+            row = s.scalar(select(LayaShadowPrediction).where(
+                LayaShadowPrediction.message_id == "m-ver"))
+            assert row.taxonomy_version == "v2"
 
     def test_calendar_superclass_agreement(
         self, session_factory, monkeypatch
@@ -259,3 +282,14 @@ class TestNonInterference:
             rows = s.scalars(select(LayaShadowPrediction).where(
                 LayaShadowPrediction.message_id == "m-dup")).all()
             assert len(rows) == 1
+
+
+def test_shadow_refuses_to_boot_on_taxonomy_mismatch():
+    from zashiki_warasi.classifier.question import QuestionsDictError
+    from zashiki_warasi.core.config import TaxonomySettings
+
+    with pytest.raises(QuestionsDictError, match="TAXONOMY_VERSION"):
+        LayaShadowClient(
+            settings=_settings(),
+            taxonomy_settings=TaxonomySettings(version="v2"),
+        )

@@ -4,7 +4,8 @@ client sends with every laya request (per D8, laya-serve is
 task-stateless). Mounted read-only at /etc/zashiki/; the client points
 at it via LAYA_QUESTIONS_PATH in values.env. Content edits rotate
 `laya_model_ver` automatically (dict-hash half), opening a fresh
-comparison series without human bookkeeping.
+comparison series without human bookkeeping. `layaQuestionsFile` picks
+the dict (v1 or v2 taxonomy); the mounted key stays laya-questions.json.
 */}}
 apiVersion: v1
 kind: ConfigMap
@@ -14,4 +15,4 @@ metadata:
     {{- include "zashiki-warasi.labels" . | nindent 4 }}
 data:
   laya-questions.json: |
-{{ .Files.Get "configs/laya-questions.json" | indent 4 }}
+{{ required "layaQuestionsFile must name a file under the chart" (.Files.Get .Values.layaQuestionsFile) | indent 4 }}

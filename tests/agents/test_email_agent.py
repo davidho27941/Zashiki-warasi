@@ -252,16 +252,16 @@ class TestLLMInvocation:
     def test_with_structured_output_uses_email_analysis_schema(
         self, agent, mock_chat_model
     ):
-        # Analyze uses EmailAnalysis; the expense subgraph (built in
-        # __init__) also calls with_structured_output(ExpenseDraft) on
-        # the same model. Assert EmailAnalysis is among the calls.
-        from zashiki_warasi.core.schemas import ExpenseDraft
+        # Analyze uses the active taxonomy's output model (v1 by
+        # default); the expense subgraph (built in __init__) also calls
+        # with_structured_output(ExpenseDraft) on the same model.
+        from zashiki_warasi.core.schemas import AnalysisOutputV1, ExpenseDraft
 
         targets = [
             c.args[0]
             for c in mock_chat_model.model.with_structured_output.call_args_list
         ]
-        assert EmailAnalysis in targets
+        assert AnalysisOutputV1 in targets
         assert ExpenseDraft in targets
 
     def test_system_prompt_starts_correctly(
@@ -1687,7 +1687,7 @@ class TestEndToEndObservation:
         from zashiki_warasi.observability import REGISTRY
 
         family = "zashiki_email_end_to_end_duration_seconds_count"
-        selector = f'category="{category}",outcome="{outcome}"'
+        selector = f'category="{category}",outcome="{outcome}",taxonomy="v1"'
         total = 0.0
         for line in generate_latest(REGISTRY).decode().splitlines():
             if line.startswith(family) and selector in line:
@@ -1700,7 +1700,7 @@ class TestEndToEndObservation:
         from zashiki_warasi.observability import REGISTRY
 
         family = "zashiki_email_end_to_end_duration_seconds_sum"
-        selector = f'category="{category}",outcome="{outcome}"'
+        selector = f'category="{category}",outcome="{outcome}",taxonomy="v1"'
         total = 0.0
         for line in generate_latest(REGISTRY).decode().splitlines():
             if line.startswith(family) and selector in line:
@@ -1717,7 +1717,7 @@ class TestEndToEndObservation:
         before_count = self._read_e2e_count("廣告", "success")
         before_sum = self._read_e2e_sum("廣告", "success")
 
-        _observe_email_e2e(email, "廣告", "success")
+        _observe_email_e2e(email, "廣告", "success", "v1")
 
         after_count = self._read_e2e_count("廣告", "success")
         after_sum = self._read_e2e_sum("廣告", "success")
@@ -1739,7 +1739,7 @@ class TestEndToEndObservation:
         before_count = self._read_e2e_count("其他", "success")
         before_sum = self._read_e2e_sum("其他", "success")
 
-        _observe_email_e2e(email, "其他", "success")
+        _observe_email_e2e(email, "其他", "success", "v1")
 
         after_count = self._read_e2e_count("其他", "success")
         after_sum = self._read_e2e_sum("其他", "success")
@@ -1761,7 +1761,7 @@ class TestEndToEndObservation:
         email = self._make_email(naive_past)
         before_count = self._read_e2e_count("技術文章", "success")
 
-        _observe_email_e2e(email, "技術文章", "success")
+        _observe_email_e2e(email, "技術文章", "success", "v1")
 
         after_count = self._read_e2e_count("技術文章", "success")
         assert after_count == before_count + 1.0
@@ -1776,7 +1776,7 @@ class TestEndToEndObservation:
         past = datetime.now(tz=timezone.utc) - timedelta(seconds=5)
         email = self._make_email(past)
         before = self._read_e2e_count("unknown", "error")
-        _observe_email_e2e(email, "unknown", "error")
+        _observe_email_e2e(email, "unknown", "error", "v1")
         after = self._read_e2e_count("unknown", "error")
         assert after == before + 1.0
 
@@ -1836,3 +1836,86 @@ class TestAnalyzeGraphSpanOutcomes:
         agent.handle_email(fake_email)
         after = self._read_analyze_count("error")
         assert after == before + 1.0
+
+
+# ---------- taxonomy v2 (adopt-email-taxonomy-v2) ----------
+
+
+class TestTaxonomyV2:
+    @staticmethod
+    def _analysis(category: str, version: str) -> EmailAnalysis:
+        return EmailAnalysis(
+            importance=3, urgency="normal", category=category,
+            summary="s", keywords=[], taxonomy_version=version,
+        )
+
+    @pytest.mark.parametrize(
+        ("category", "route"),
+        [
+            ("交易收據", "expense"),
+            ("帳單通知", "expense"),
+            ("帳務彙整", "notify"),
+            ("職涯", "notify"),
+            ("行銷", "notify"),
+        ],
+    )
+    def test_v2_routing(self, category, route):
+        agent = EmailAgent.__new__(EmailAgent)
+        state = {"analysis": self._analysis(category, "v2")}
+        assert agent._route_by_category(state) == route
+
+    def test_v2_calendar_event_routes_to_calendar(self):
+        agent = EmailAgent.__new__(EmailAgent)
+        agent._calendar_subgraph = object()
+        state = {"analysis": self._analysis("行事曆事件", "v2")}
+        assert agent._route_by_category(state) == "calendar"
+
+    def test_v1_analysis_keeps_v1_routing_under_any_setting(self):
+        # Routing follows the analysis' own version: a v1 analysis
+        # resumed from a checkpoint after cutover still reaches expense.
+        agent = EmailAgent.__new__(EmailAgent)
+        state = {"analysis": self._analysis("消費支出", "v1")}
+        assert agent._route_by_category(state) == "expense"
+
+    def test_analyze_under_v2_uses_v2_prompt_schema_and_version(
+        self, monkeypatch, session_factory, fake_email,
+        mock_notifier, mock_client,
+    ):
+        from zashiki_warasi.core.config import TaxonomySettings
+        from zashiki_warasi.core.schemas import AnalysisOutputV2
+
+        structured = MagicMock(name="structured_output")
+        structured.invoke.return_value = AnalysisOutputV2(
+            importance=3, urgency="normal", category="職涯",
+            summary="s", keywords=[],
+        )
+        model = MagicMock(name="chat_model")
+        model.with_structured_output.return_value = structured
+        monkeypatch.setattr(
+            "zashiki_warasi.agents.email_agent.get_chat_model",
+            lambda *a, **kw: model,
+        )
+        agent = EmailAgent(
+            checkpointer=InMemorySaver(),
+            session_factory=session_factory,
+            notifier=mock_notifier,
+            client=mock_client,
+            taxonomy_settings=TaxonomySettings(version="v2"),
+        )
+
+        targets = [c.args[0] for c in model.with_structured_output.call_args_list]
+        assert AnalysisOutputV2 in targets
+
+        from prometheus_client import generate_latest
+
+        from zashiki_warasi.observability import REGISTRY
+
+        assert 'zashiki_taxonomy_active_info{version="v2"} 1.0' in (
+            generate_latest(REGISTRY).decode()
+        )
+
+        result = agent._analyze({"email": fake_email})
+        assert result["analysis"].category == "職涯"
+        assert result["analysis"].taxonomy_version == "v2"
+        prompt = structured.invoke.call_args.args[0][0].content
+        assert "「職涯」" in prompt and "「消費支出」" not in prompt

@@ -7,8 +7,13 @@ the classifier trains and serves on a MERGED calendar super-class —
 the fine boundary is unstable even for the operator (83/274 flips).
 Fine-grained display labels are a Phase-1 `summarize` concern, not ours.
 
-Everything here derives from `deploy/helm/laya-classifier/configs/
-questions.json` so the wire dict stays the single source of truth.
+Everything here derives from the questions dict so the wire dict stays
+the single source of truth. A dict declaring `"taxonomy_version": "v2"`
+(openspec adopt-email-taxonomy-v2) has no merge: its 14 labels are used
+as-is and `行事曆事件` is a real category. These scripts run on the GPU
+box without the zashiki package, so the construction is duplicated
+here; `tests/classifier/test_question.py` pins it equal to the
+package's `load_questions_file` for both dicts.
 """
 
 from __future__ import annotations
@@ -33,6 +38,16 @@ def load_questions(path: str) -> dict:
     the way in; `calendar_event` maps back to the super-class marker
     `行事曆事件` on the way out (storage/reporting only)."""
     d = json.load(open(path, encoding="utf-8"))
+    if d.get("taxonomy_version", "v1") != "v1":
+        zh_by_en = dict(d["label_map"])
+        en_by_zh = {zh: en for en, zh in zh_by_en.items()}
+        question = {
+            "type": "choice",
+            "instructions": d["question"]["instructions"],
+            "criteria": dict(d["question"]["criteria"]),
+        }
+        return question, zh_by_en, en_by_zh
+
     criteria: dict[str, str] = {}
     for en, desc in d["question"]["criteria"].items():
         if en in CALENDAR_MERGE:

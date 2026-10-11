@@ -9,7 +9,10 @@ from decimal import Decimal
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
+    CheckConstraint,
     DateTime,
+    ForeignKey,
     Float,
     Index,
     Integer,
@@ -19,6 +22,7 @@ from sqlalchemy import (
     UniqueConstraint,
     Uuid,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -59,6 +63,12 @@ class EmailAnalysis(Base):
     importance: Mapped[int] = mapped_column(Integer, nullable=False)
     urgency: Mapped[str] = mapped_column(String(16), nullable=False)
     category: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Vocabulary `category` belongs to. The app always writes it; the
+    # server default only covers pre-v2 code still writing during a
+    # rolling deploy (and image rollback), which is v1 by definition.
+    taxonomy_version: Mapped[str] = mapped_column(
+        String(8), nullable=False, server_default="v1",
+    )
     summary: Mapped[str] = mapped_column(Text, nullable=False)
     keywords: Mapped[list[str]] = mapped_column(
         JSON, nullable=False, default=list,
@@ -198,8 +208,89 @@ class LayaShadowPrediction(Base):
         String(32), nullable=True,
     )
     laya_model_ver: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Vocabulary of `llm_category` / `laya_category` (see EmailAnalysis).
+    taxonomy_version: Mapped[str] = mapped_column(
+        String(8), nullable=False, server_default="v1",
+    )
     predicted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
     )
+
+
+class EmailClassification(Base):
+    """Classification history — transaction-time SCD type 2.
+
+    One row per version of our judgement about a message. Validity is
+    processing time, half-open `[valid_from, valid_to)`; the current
+    row is the one with `valid_to IS NULL` (no separate flag that could
+    drift). Writes go through `ClassificationWriter`, never ad hoc.
+
+    Postgres additionally enforces non-overlapping ranges per message
+    with an EXCLUDE constraint (btree_gist) created in migration 0009;
+    it is not declared here so SQLite-based tests can `create_all`.
+    """
+
+    __tablename__ = "email_classifications"
+    __table_args__ = (
+        CheckConstraint(
+            "valid_to IS NULL OR valid_to > valid_from",
+            name="ck_email_classifications_valid_range",
+        ),
+        CheckConstraint(
+            "source IN ('llm', 'laya', 'human')",
+            name="ck_email_classifications_source",
+        ),
+        CheckConstraint(
+            "recorded_by IN ('app', 'migration', 'import')",
+            name="ck_email_classifications_recorded_by",
+        ),
+        Index(
+            "uq_email_classifications_current",
+            "message_id",
+            unique=True,
+            postgresql_where=text("valid_to IS NULL"),
+            sqlite_where=text("valid_to IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    message_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("email_analyses.message_id"),
+        nullable=False,
+    )
+    category: Mapped[str] = mapped_column(String(32), nullable=False)
+    taxonomy_version: Mapped[str] = mapped_column(String(8), nullable=False)
+    source: Mapped[str] = mapped_column(String(8), nullable=False)
+    recorded_by: Mapped[str] = mapped_column(String(16), nullable=False)
+    valid_from: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    valid_to: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+
+class TaxonomyMapping(Base):
+    """Append-only cross-version category map.
+
+    The primary key makes each (rev, from_version, from_category,
+    to_version) map to exactly one target. Rows are never updated or
+    deleted — a correction adds a new `mapping_rev`, and readers (the
+    `email_category_current` view) pin a rev.
+    """
+
+    __tablename__ = "taxonomy_mappings"
+
+    mapping_rev: Mapped[int] = mapped_column(Integer, primary_key=True)
+    from_version: Mapped[str] = mapped_column(String(8), primary_key=True)
+    from_category: Mapped[str] = mapped_column(String(32), primary_key=True)
+    to_version: Mapped[str] = mapped_column(String(8), primary_key=True)
+    to_category: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_exact: Mapped[bool] = mapped_column(Boolean, nullable=False)

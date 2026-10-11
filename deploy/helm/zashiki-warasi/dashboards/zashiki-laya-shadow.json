@@ -1,8 +1,23 @@
 {
   "annotations": {
-    "list": []
+    "list": [
+      {
+        "name": "Taxonomy cutover",
+        "enable": true,
+        "iconColor": "orange",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "expr": "max by (version) (zashiki_taxonomy_active_info) unless max by (version) (zashiki_taxonomy_active_info offset 10m)",
+        "step": "5m",
+        "titleFormat": "taxonomy → {{version}}",
+        "textFormat": "New mail is classified under taxonomy {{version}} from here. 職涯 / 公共警報 have no v1 predecessor; same-name categories (安全通知, 其他, 社交) changed meaning.",
+        "useValueForTime": false
+      }
+    ]
   },
-  "description": "v1.6.0 laya shadow classifier — LLM vs laya agreement, confusion matrix, shadow health. Observational only: the LLM stays authoritative. Super-class rule (行事曆事件 vs 會議邀請/講座資訊) is already applied inside the agreed label.",
+  "description": "laya shadow classifier — LLM vs laya agreement, confusion matrix, shadow health. Observational only: the LLM stays authoritative. Filter by the `taxonomy` variable: under v1 the super-class rule (laya 行事曆事件 vs LLM 會議邀請/講座資訊) is applied inside the agreed label; under v2 both engines share one vocabulary and agreement is plain equality.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -78,7 +93,7 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(zashiki_classifier_shadow_agreement_total{agreed=\"true\"}[$__range])) / sum(increase(zashiki_classifier_shadow_agreement_total[$__range]))",
+          "expr": "sum(increase(zashiki_classifier_shadow_agreement_total{agreed=\"true\", taxonomy=~\"$taxonomy\"}[$__range])) / sum(increase(zashiki_classifier_shadow_agreement_total{taxonomy=~\"$taxonomy\"}[$__range]))",
           "instant": true,
           "legendFormat": "agreement",
           "refId": "A"
@@ -134,7 +149,7 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(zashiki_classifier_shadow_agreement_total[$__range]))",
+          "expr": "sum(increase(zashiki_classifier_shadow_agreement_total{taxonomy=~\"$taxonomy\"}[$__range]))",
           "instant": true,
           "legendFormat": "scored",
           "refId": "A"
@@ -187,7 +202,7 @@
       },
       "targets": [
         {
-          "expr": "sum(increase(zashiki_classifier_shadow_agreement_total{agreed=\"true\"}[24h])) / sum(increase(zashiki_classifier_shadow_agreement_total[24h]))",
+          "expr": "sum(increase(zashiki_classifier_shadow_agreement_total{agreed=\"true\", taxonomy=~\"$taxonomy\"}[24h])) / sum(increase(zashiki_classifier_shadow_agreement_total{taxonomy=~\"$taxonomy\"}[24h]))",
           "legendFormat": "agreement (24h rolling)",
           "refId": "A"
         }
@@ -266,7 +281,7 @@
       },
       "targets": [
         {
-          "expr": "sum by (llm_category, laya_category) (increase(zashiki_classifier_shadow_agreement_total[$__range]))",
+          "expr": "sum by (llm_category, laya_category) (increase(zashiki_classifier_shadow_agreement_total{taxonomy=~\"$taxonomy\"}[$__range]))",
           "format": "table",
           "instant": true,
           "refId": "A"
@@ -353,13 +368,13 @@
       },
       "targets": [
         {
-          "expr": "sum by (llm_category) (increase(zashiki_classifier_shadow_agreement_total[$__range]))",
+          "expr": "sum by (llm_category) (increase(zashiki_classifier_shadow_agreement_total{taxonomy=~\"$taxonomy\"}[$__range]))",
           "format": "table",
           "instant": true,
           "refId": "A"
         },
         {
-          "expr": "sum by (laya_category) (increase(zashiki_classifier_shadow_agreement_total[$__range]))",
+          "expr": "sum by (laya_category) (increase(zashiki_classifier_shadow_agreement_total{taxonomy=~\"$taxonomy\"}[$__range]))",
           "format": "table",
           "instant": true,
           "refId": "B"
@@ -538,7 +553,33 @@
     "laya-shadow"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "name": "taxonomy",
+        "label": "Taxonomy",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(zashiki_taxonomy_active_info, version)",
+          "refId": "taxonomy"
+        },
+        "definition": "label_values(zashiki_taxonomy_active_info, version)",
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": false,
+        "current": {
+          "selected": true,
+          "text": "All",
+          "value": "$__all"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "hide": 0
+      }
+    ]
   },
   "time": {
     "from": "now-7d",

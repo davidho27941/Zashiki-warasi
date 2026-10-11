@@ -44,6 +44,19 @@ strategy:
     maxSurge: 1
     maxUnavailable: 0
 
+# Seconds Kubernetes waits after SIGTERM before SIGKILL. The app stops
+# polling on SIGTERM but finishes the email in hand (analyze → notify can
+# take tens of seconds on a slow LLM), so the default 30 s is too short
+# to drain cleanly — the taxonomy cutover runbook relies on that drain.
+terminationGracePeriodSeconds: 120
+
+# laya questions dict mounted at /etc/zashiki/laya-questions.json (the
+# file name LAYA_QUESTIONS_PATH points at never changes). Its taxonomy
+# must match TAXONOMY_VERSION or the shadow client refuses to boot:
+#   configs/laya-questions.json     — taxonomy v1 (15 effective labels)
+#   configs/laya-questions-v2.json  — taxonomy v2 (14 labels)
+layaQuestionsFile: configs/laya-questions.json
+
 resources:
   requests:
     cpu: 100m
@@ -83,6 +96,10 @@ env:
   # CALENDAR_ENABLED: "1"
   # CALENDAR_TIMEZONE: "Asia/Taipei"
   # CALENDAR_PRIMARY_ID: "primary"
+  # Category vocabulary for new analyses (openspec adopt-email-taxonomy-v2).
+  # `v1` = 16 classes (default); `v2` = 14 classes. Flip back to `v1` to
+  # roll back — drain pending LangGraph threads first (cutover runbook).
+  # TAXONOMY_VERSION: "v1"
   # Gmail scopes / paths / tuning (all read via GmailSettings env_prefix=GMAIL_)
   GMAIL_CREDENTIALS_PATH: "/secrets/credentials.json"
   GMAIL_TOKEN_PATH: "/data/token.json"

@@ -2,8 +2,12 @@
 
 Graph:
 
-    START → analyze ─┬─ category == "消費支出" → expense_sg ─┐
-                     └─ otherwise ──────────────────────────┴→ notify → END
+    START → analyze ─┬─ expense category  → expense_sg ──┐
+                     ├─ calendar category → calendar_sg ─┤
+                     └─ otherwise ───────────────────────┴→ notify → END
+
+Which categories are expense / calendar depends on the taxonomy
+version (`classifier/taxonomy.py`).
 
 Each email runs in its own thread (thread_id = email.id). The expense
 subgraph shares the same thread, so a crash mid-subgraph resumes at the
@@ -27,8 +31,10 @@ from zashiki_warasi.agents.llm import get_chat_model
 from zashiki_warasi.agents.verticals.calendar import CalendarSubgraph
 from zashiki_warasi.agents.verticals.expense import ExpenseSubgraph
 from zashiki_warasi.calendar.client import GoogleCalendarClient
+from zashiki_warasi.classifier import classification_store
 from zashiki_warasi.classifier.laya_shadow_client import LayaShadowClient
-from zashiki_warasi.core.config import CalendarSettings
+from zashiki_warasi.classifier.taxonomy import get_taxonomy
+from zashiki_warasi.core.config import CalendarSettings, TaxonomySettings
 from zashiki_warasi.agents.verticals.html_text import html_to_text
 from zashiki_warasi.core.config import LLMSettings
 from zashiki_warasi.core.logging import bind_message_context, node_trace
@@ -58,6 +64,7 @@ from zashiki_warasi.observability import (
     llm_calls_total,
     llm_latency_seconds,
     observe_email_end_to_end,
+    taxonomy_active_info,
 )
 from zashiki_warasi.observability.instrumentation import (
     record_call,
@@ -92,125 +99,9 @@ def _current_trace_copy_markup() -> dict | None:
     return build_trace_copy_markup(_current_trace_id_hex())
 
 
-ANALYZE_SYSTEM_PROMPT = """\
-你是電子郵件分析助理。讀完信件後產出結構化分析,涵蓋以下五項。
-
-### 1. 重要度 (importance, 1-5)
-
-1 = 非常不重要 / 2 = 不重要 / 3 = 普通 / 4 = 重要 / 5 = 非常重要
-
-判斷依據:
-- 內容的重要程度
-- 訊息的含金量
-- 對生活的影響程度
-- 對個人資產的影響程度
-
-特例規則:
-- 以下類型 **至少 3 分**:科技新知、技術新知、講座訊息、股票資訊
-- 以下類型 **最多 3 分**:促銷、廣告、信貸
-
-### 2. 摘要 (summary, 50-200 字)
-
-以 5W1H (誰、什麼、何時、何地、為何、如何) 為核心做摘要。
-
-當郵件內容是關於消費 / 點數 / 帳單彙整時,務必在摘要中提及:
-- 消費 / 獲得金額(若是點數則為點數數量)
-- 消費 / 獲得時間或期間
-- 消費地點 / 獲得來源(店家)
-- 交易識別碼、ID 或編號(伝票番号 / 注文番号)
-若信件中未提及某項,可以以「不明」替代。
-
-⚠️ 反幻想(重要):摘要中列出的消費/交易必須是郵件中明確、
-實際發生的交易 — 具體日期時間 + 店家 + 金額三者齊全才算。
-以下 **不算** 實際交易,絕對不要當成一筆消費列進摘要:
-- 手續費說明(例如「海外ATMの利用手数料 110円を加える」、
-  「送金手数料無料」等條件描述)
-- 假設情境或條款(例如「為替影響で変更があった場合...」)
-- 廣告、注意事項、活動預告、客服說明
-
-若信件下方有 boilerplate 條款,只摘要真實交易,忽略條款文字。
-真實交易缺少的欄位用「不明」填,不要用條款裡的數字補位。
-
-例(好):「楽天ポイントカード 通知使用者 2026/06/18-06/24
-期間獲得的點數明細:於『彩家 楽天クリムゾン』獲得 19 點、
-於『東急ストア宮崎台店』獲得 3 點,合計 22 點。」
-
-例(不好,太空泛):「樂天點數卡寄送的每週點數獲得通知,
-旨在告知使用者所累積的點數總額與明細。」
-
-### 3. 分類 (category)
-
-從以下列表選擇 **一項**:
-消費支出、消費資訊彙整、點數資訊彙整、訂閱服務、技術文章、
-講座資訊、會議邀請、帳單通知、廣告、促銷、社交、新聞、
-安全通知、股票資訊、問卷調查、其他
-
-- 「問卷調查」= 請求填寫問卷 / 意見回饋 / 満足度調查的郵件
-  (アンケートご協力、服務應對調查、活動後 feedback survey、
-  「Tell us how ... went」等)。注意:促銷信裡的「回饋/紅利」
-  是 cashback,不是問卷;必須是以「請你填寫調查」為主旨的信
-  才算本類。
-
-分類規則:
-
-- 「講座資訊」的嚴格定義 — 郵件必須**同時**具備以下兩個條件才能
-  分類為「講座資訊」;缺任一 → 歸類為「廣告」/「促銷」(行銷型)
-  或「其他」(一般通知):
-    (a) 明確的活動**日期或時間** — 例如 `2026-09-17`、`9/17 19:30`、
-        `週四 19:30`、`Thursday 7pm` 等具體 datetime,不是「近期」、
-        「即將推出」、「隨時上課」這類模糊時態。
-    (b) 明確的**地點或線上會議連結** — 例如實體地址、場館名稱、
-        Zoom / Google Meet 網址、或「線上」/「online」字樣。
-  * 正例(講座資訊):`GDG 2026 / 09 月會 - WebMCP` 郵件含
-    `2026-09-17 19:30 + 天瓏書局` → 具備 (a)(b) → 分「講座資訊」。
-  * 反例(廣告):`Recommended: Build Batch Data Pipelines on Google Cloud`
-    (Coursera 課程推薦)—— 只在推薦一堆 MOOC 課程,沒有具體舉辦日期、
-    也不是特定場次 → 不算「講座資訊」→ 分「廣告」。
-  * 反例(廣告):Udemy / Coursera / edX 促銷型郵件即使提到「上課」
-    「講師」「線上學習」,只要沒有明確 cohort 開課日期 → 分「廣告」。
-- 金融產品(基金、ETF、信貸、信用卡帳單分期等)的「推銷」郵件
-  一律歸類為「廣告」或「促銷」,不要分到「消費支出」或
-  「帳單通知」。
-- 點數消費 / 獲得通知(楽天ポイント、d ポイント、悠遊付點數等)
-  **不視為「消費支出」**,歸類為「點數資訊彙整」。
-- 信用卡多筆消費彙整(一封信包含多則消費資訊、或多筆刷卡紀錄
-  的彙總)**不要分類為「消費支出」**,歸類為「消費資訊彙整」。
-- 「消費支出」的嚴格定義 — 郵件必須明確包含**至少一筆**同時
-  具備以下 **全部四項** 的真實交易:
-    (a) 具體的日期時間
-    (b) 具體的店家/商戶名稱(**不是**「本人利用」、「カード利用」
-        這種通用敘述)
-    (c) 金額
-    (d) 交易識別碼(承認番号 / 伝票番号 / 注文番号 等)
-  四項**缺任何一項**即不算單筆真實消費 → 分類為「消費資訊彙整」。
-  * 正例(消費支出):SMBC Olive デビット的「ご利用のお知らせ」
-    含 ◇利用日 + ◇利用先 + ◇利用金額 + ◇承認番号 全部四項。
-    即便信件下方寫著「海外ATMでの現地通貨の引き出しは...ATM
-    利用手数料110円を加えて引き落とし致します」這種條款,仍為
-    「消費支出」— 不要把 110 円當成第二筆消費(boilerplate 條款
-    不算獨立交易)。
-  * 反例(消費資訊彙整):楽天カードの「【速報版】カード利用の
-    お知らせ(本人ご利用分)」只有當日消費總額(可能有日期),
-    **沒有具體店家名稱、沒有承認番号/注文番号** — 即便金額看起
-    來只有一筆,也是彙整摘要,**絕對不要**分類為「消費支出」;
-    正確分類是「消費資訊彙整」。
-  * 反例(消費資訊彙整):信用卡多筆消費彙整 — 一封信包含多則
-    刷卡紀錄的彙總 — 也是「消費資訊彙整」,不是「消費支出」。
-
-### 4. 急迫性 (urgency)
-
-very_urgent  = 非常緊急,建議立即處理
-urgent       = 緊急,建議 3 小時內處理
-normal       = 普通,建議一天到一周內處理
-none         = 沒有急迫性
-
-### 5. 關鍵字 (keywords, 至多 5 個)
-
-從信件內容截取至多 5 個關鍵字,每個 2-8 字,
-能代表信件主題或重要實體。
-
-只輸出結構化結果,不要任何說明文字。
-"""
+# Pre-v2 name kept for docs and ad-hoc scripts; the analyze node reads
+# the prompt from the active taxonomy entry.
+ANALYZE_SYSTEM_PROMPT = get_taxonomy("v1").system_prompt
 
 
 # ----- prompt-context-overflow detection -----
@@ -274,7 +165,7 @@ def _extract_context_length_detail(exc: BadRequestError) -> str:
 
 
 def _observe_email_e2e(
-    email: EmailMessage, category: str, outcome: str
+    email: EmailMessage, category: str, outcome: str, taxonomy: str
 ) -> None:
     """Emit one observation into `zashiki_email_end_to_end_duration_seconds`.
 
@@ -292,7 +183,7 @@ def _observe_email_e2e(
     duration = (now - received).total_seconds()
     if duration < 0:
         duration = 0.0
-    observe_email_end_to_end(category, outcome, duration)
+    observe_email_end_to_end(category, outcome, duration, taxonomy=taxonomy)
 
 
 class AgentState(TypedDict):
@@ -313,14 +204,20 @@ class EmailAgent:
         calendar_client: GoogleCalendarClient | None = None,
         calendar_settings: CalendarSettings | None = None,
         laya_shadow: LayaShadowClient | None = None,
+        taxonomy_settings: TaxonomySettings | None = None,
     ) -> None:
         self._session_factory = session_factory
+        self._taxonomy = get_taxonomy(
+            (taxonomy_settings or TaxonomySettings()).version
+        )
+        taxonomy_active_info.labels(version=self._taxonomy.version).set(1)
         self._notifier = notifier
         # v1.6.0 shadow classifier — inert unless LAYA_SHADOW_ENABLED=1
         # (constructing the default reads env; disabled = zero cost,
         # no laya connectivity, no questions-file read).
         self._laya_shadow = laya_shadow or LayaShadowClient(
-            session_factory=session_factory
+            session_factory=session_factory,
+            taxonomy_settings=taxonomy_settings,
         )
 
         # Two model instances against the same server:
@@ -341,7 +238,7 @@ class EmailAgent:
         )
         extract_chat_model = get_chat_model(llm_settings)
         self._analyze_model = analyze_chat_model.with_structured_output(
-            EmailAnalysis
+            self._taxonomy.output_model
         )
         self._expense_subgraph = ExpenseSubgraph(
             checkpointer=checkpointer,
@@ -453,9 +350,11 @@ class EmailAgent:
                         system=self._llm_system,
                         model=self._llm_model_name,
                     )
-                    analysis = self._analyze_model.invoke(
+                    output = self._analyze_model.invoke(
                         [
-                            SystemMessage(content=ANALYZE_SYSTEM_PROMPT),
+                            SystemMessage(
+                                content=self._taxonomy.system_prompt
+                            ),
                             HumanMessage(content=user_text),
                         ]
                     )
@@ -467,7 +366,7 @@ class EmailAgent:
                         _lc.span,
                         system=self._llm_system,
                         model=self._llm_model_name,
-                        response=analysis,
+                        response=output,
                     )
             except LengthFinishReasonError as exc:
                 usage = exc.completion.usage
@@ -502,27 +401,29 @@ class EmailAgent:
                         reason="prompt_too_long", detail=detail
                     ),
                 }
-            if analysis is not None:
+            analysis = None
+            if output is not None:
+                analysis = EmailAnalysis(
+                    **{
+                        **output.model_dump(),
+                        "taxonomy_version": self._taxonomy.version,
+                    }
+                )
                 log.info(f"classified as {analysis.category}")
                 # v1.6.0 shadow: fire-and-forget, never raises, never
                 # read by the pipeline. AnalysisFailed paths return
                 # earlier — no llm_category means no shadow sample.
                 self._laya_shadow.classify_async(
-                    email=email, llm_category=analysis.category
+                    email=email,
+                    llm_category=analysis.category,
+                    taxonomy_version=analysis.taxonomy_version,
                 )
             return {"analysis": analysis}
 
-    # Categories that go through the expense subgraph — where PDF /
-    # HTML attachments are pulled and the LLM extracts structured
-    # payment fields (amount, vendor, transacted_at, …). Kept as a
-    # tuple so a future addition (e.g. 訂閱服務 for recurring charges)
-    # is a one-line change.
-    _EXPENSE_LIKE_CATEGORIES = ("消費支出", "帳單通知")
-
-    # v1.4 — categories that trigger the calendar_sg vertical when
-    # enabled + a Google Calendar client is configured. Frozen for
-    # symmetry with _EXPENSE_LIKE_CATEGORIES.
-    _CALENDAR_LIKE_CATEGORIES = ("會議邀請", "講座資訊")
+    def _active_version(self) -> str:
+        # `getattr`: router / notify unit tests build agents via __new__.
+        taxonomy = getattr(self, "_taxonomy", None)
+        return taxonomy.version if taxonomy is not None else "v1"
 
     def _route_by_category(self, state: AgentState) -> str:
         log = self._log(state)
@@ -530,7 +431,12 @@ class EmailAgent:
         if analysis is None:
             log.info("routing to notify (no analysis)")
             return "notify"
-        if analysis.category in self._EXPENSE_LIKE_CATEGORIES:
+        # Route by the analysis' own taxonomy, not the active one: an
+        # analysis checkpointed under v1 keeps v1 routing after cutover.
+        vertical = get_taxonomy(analysis.taxonomy_version).vertical_for(
+            analysis.category
+        )
+        if vertical == "expense":
             log.info(f"routing to expense (category={analysis.category})")
             return "expense"
         # `getattr` defensive: unit tests exercise `_route_by_category`
@@ -538,10 +444,7 @@ class EmailAgent:
         # `_calendar_subgraph` may not exist. Route calendar-worthy
         # categories to notify in that case (v1.3 behavior).
         calendar_sg = getattr(self, "_calendar_subgraph", None)
-        if (
-            calendar_sg is not None
-            and analysis.category in self._CALENDAR_LIKE_CATEGORIES
-        ):
+        if calendar_sg is not None and vertical == "calendar":
             log.info(f"routing to calendar (category={analysis.category})")
             return "calendar"
         log.info(f"routing to notify (category={analysis.category})")
@@ -566,11 +469,15 @@ class EmailAgent:
                     )
                     self._notifier.send_message(text, reply_markup=markup)
                     log.info("notified user of analyze failure")
-                    _observe_email_e2e(email, "unknown", "error")
+                    _observe_email_e2e(
+                        email, "unknown", "error", self._active_version()
+                    )
                     return {}
                 log.warning("notify: skipping — no analysis")
                 gs.outcome = "skipped"
-                _observe_email_e2e(email, "unknown", "skipped")
+                _observe_email_e2e(
+                    email, "unknown", "skipped", self._active_version()
+                )
                 return {}
             text = _format_message(email, analysis, side_effect)
             # v1.4: when the side_effect is a CalendarCreated, add a
@@ -583,7 +490,10 @@ class EmailAgent:
                 )
             self._notifier.send_message(text, reply_markup=markup)
             log.info("notified user")
-            _observe_email_e2e(email, analysis.category, "success")
+            _observe_email_e2e(
+                email, analysis.category, "success",
+                analysis.taxonomy_version,
+            )
             return {}
 
     # ----- entry point -----
@@ -636,6 +546,8 @@ class EmailAgent:
             importance = 3
 
         with self._session_factory() as session:
+            # Replays, resumes and cached-analysis reuse stop here, so
+            # they never open a classification version.
             if session.get(EmailAnalysisORM, message_id) is not None:
                 return
             session.add(
@@ -644,9 +556,19 @@ class EmailAgent:
                     importance=importance,
                     urgency=analysis.urgency,
                     category=analysis.category,
+                    taxonomy_version=analysis.taxonomy_version,
                     summary=analysis.summary,
                     keywords=list(analysis.keywords),
                 )
+            )
+            session.flush()
+            classification_store.record(
+                session,
+                message_id=message_id,
+                category=analysis.category,
+                taxonomy_version=analysis.taxonomy_version,
+                source="llm",
+                recorded_by="app",
             )
             session.commit()
 

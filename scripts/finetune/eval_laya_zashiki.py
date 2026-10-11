@@ -1,6 +1,7 @@
 """Held-out evaluation for the Zashiki laya fine-tune — the D10 gate.
 
-Runs the merged 15-label question over data/test.jsonl and reports
+Runs the questions-dict question (15 merged labels under v1, 14 under v2)
+over data/test.jsonl and reports
 overall + per-class accuracy, the top confusion pairs, and confidence
 stats for correct vs wrong predictions. The gate: **overall ≥85% with
 no catastrophic class** → GO for Phase 0 deployment with this

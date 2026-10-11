@@ -1,5 +1,6 @@
 """Single-GPU RLCD fine-tune of laya's multilingual checkpoint on the
-Zashiki email-category task (15 effective labels — calendar merged).
+Zashiki email-category task (labels from the questions dict: 15 effective
+under taxonomy v1 with calendar merged, 14 under v2).
 
 Adapted from the official 2xT4 Kaggle notebook
 (NandhaKishorM/laya notebooks/laya_finetune_typed_decisions_2xT4_kaggle

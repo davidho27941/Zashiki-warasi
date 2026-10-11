@@ -48,6 +48,12 @@ helm upgrade zashiki -n zashiki deploy/helm/zashiki-warasi \
     --set image.tag=<sha>
 ```
 
+類別定義檔必須和 `TAXONOMY_VERSION` 同一版分類表(chart value
+`layaQuestionsFile`:v1 用 `configs/laya-questions.json`,v2 用
+`configs/laya-questions-v2.json`),不一致會在啟動時直接失敗。切換流程見
+[`taxonomy-v2.zh.md`](taxonomy-v2.zh.md);切換期間 shadow 會關閉,直到
+laya v2 通過門檻。
+
 Kill switch:`LAYA_SHADOW_ENABLED=0`(預設)或 `LAYA_BASE_URL`
 留空——client 會以惰性狀態建構,完全不碰網路、DB、metrics。
 
@@ -101,12 +107,14 @@ GROUP BY 1, 2 ORDER BY 3 DESC;
 
 ## 解讀 agreement 時的坑
 
-1. **Super-class agreement**:laya 預測合併後的「行事曆事件」
+1. **Super-class agreement(僅限分類表 v1)**:laya 預測合併後的「行事曆事件」
    (calendar_event);LLM 預測細分的「會議邀請」/「講座資訊」。
    agreement metric 把 laya=行事曆事件 vs LLM=任一細分標籤算作
    **agreed**(274 筆稽核顯示細分邊界連人都不穩定——83 筆判定
    翻轉)。直接用 SQL 字串相等會低估 agreement;請用 metric 或
-   複製這條規則。
+   複製這條規則。分類表 v2 下兩邊共用同一套 14 類,agreement 就是
+   字串相等。資料列與 agreement 指標都帶 `taxonomy_version` /
+   `taxonomy`,查詢時請以它過濾,避免 v1、v2 混在一起。
 2. **截斷混淆因子**:LLM 看整封信;laya 只看 `subject + body`
    截到 1500 字(`classifier/truncation.py`,快照存在
    `input_text`)。長信上的分歧可能是資訊差,不是模型差。

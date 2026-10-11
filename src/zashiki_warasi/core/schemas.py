@@ -4,9 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated, Literal
+from typing import Annotated, Literal, get_args
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 # ----- Gmail layer -----
@@ -87,7 +93,7 @@ class TickResult(BaseModel):
 
 Urgency = Literal["very_urgent", "urgent", "normal", "none"]
 
-Category = Literal[
+CategoryV1 = Literal[
     "消費支出",
     "消費資訊彙整",
     "點數資訊彙整",
@@ -106,15 +112,41 @@ Category = Literal[
     "其他",
 ]
 
+# Taxonomy v2 (issue #12): shared by the LLM and laya, no super-class.
+CategoryV2 = Literal[
+    "交易收據",
+    "帳務彙整",
+    "帳單通知",
+    "服務通知",
+    "行事曆事件",
+    "安全通知",
+    "公共警報",
+    "投資帳戶通知",
+    "內容電子報",
+    "行銷",
+    "社交",
+    "職涯",
+    "問卷調查",
+    "其他",
+]
 
-class EmailAnalysis(BaseModel):
-    """High-level analysis produced by the analyze node.
+# Legacy alias — the laya v1 questions dict validates against it.
+Category = CategoryV1
 
-    Importance / urgency / category / summary / keywords come from a
-    single LLM call. Payment-specific details (amount, vendor, etc.)
-    are handled by the expense subgraph and surface via SideEffect —
-    they are intentionally NOT duplicated in `summary` to avoid
-    inconsistency between the two extraction paths.
+TaxonomyVersion = Literal["v1", "v2"]
+
+CATEGORIES_BY_VERSION: dict[str, tuple[str, ...]] = {
+    "v1": get_args(CategoryV1),
+    "v2": get_args(CategoryV2),
+}
+
+
+class _AnalysisFields(BaseModel):
+    """Fields shared by the LLM output models and the domain analysis.
+
+    `category` is declared here (as `str`) so subclasses that narrow it
+    to a version Literal keep its position in the JSON schema the LLM
+    sees: importance, urgency, category, summary, keywords.
     """
 
     model_config = ConfigDict(frozen=True)
@@ -124,7 +156,7 @@ class EmailAnalysis(BaseModel):
         description="重要度 1(非常不重要) 到 5(非常重要)",
     )
     urgency: Urgency = Field(description="急迫性等級")
-    category: Category = Field(description="內容分類")
+    category: str = Field(description="內容分類")
     summary: str = Field(
         ...,
         description="50-200 字以內的 5W1H 高層次摘要,不含具體支付資訊",
@@ -139,6 +171,67 @@ class EmailAnalysis(BaseModel):
     @classmethod
     def _coerce_importance_validator(cls, value: object) -> object:
         return coerce_importance(value)
+
+
+# LLM structured-output schema under taxonomy v1. The docstring
+# and title become the tool description / name the LLM sees, so they
+# stay identical to the pre-v2 `EmailAnalysis` schema.
+class AnalysisOutputV1(_AnalysisFields):
+    """High-level analysis produced by the analyze node.
+
+    Importance / urgency / category / summary / keywords come from a
+    single LLM call. Payment-specific details (amount, vendor, etc.)
+    are handled by the expense subgraph and surface via SideEffect —
+    they are intentionally NOT duplicated in `summary` to avoid
+    inconsistency between the two extraction paths.
+    """
+
+    model_config = ConfigDict(frozen=True, title="EmailAnalysis")
+
+    category: CategoryV1 = Field(description="內容分類")
+
+
+# LLM structured-output schema under taxonomy v2. The docstring
+# and title become the tool description / name the LLM sees, so they
+# stay identical to the pre-v2 `EmailAnalysis` schema.
+class AnalysisOutputV2(_AnalysisFields):
+    """High-level analysis produced by the analyze node.
+
+    Importance / urgency / category / summary / keywords come from a
+    single LLM call. Payment-specific details (amount, vendor, etc.)
+    are handled by the expense subgraph and surface via SideEffect —
+    they are intentionally NOT duplicated in `summary` to avoid
+    inconsistency between the two extraction paths.
+    """
+
+    model_config = ConfigDict(frozen=True, title="EmailAnalysis")
+
+    category: CategoryV2 = Field(description="內容分類")
+
+
+class EmailAnalysis(_AnalysisFields):
+    """High-level analysis produced by the analyze node.
+
+    Importance / urgency / category / summary / keywords come from a
+    single LLM call. Payment-specific details (amount, vendor, etc.)
+    are handled by the expense subgraph and surface via SideEffect —
+    they are intentionally NOT duplicated in `summary` to avoid
+    inconsistency between the two extraction paths.
+
+    `taxonomy_version` names the vocabulary `category` belongs to;
+    analyses checkpointed before the field existed load as v1.
+    """
+
+    taxonomy_version: TaxonomyVersion = "v1"
+
+    @model_validator(mode="after")
+    def _category_in_version(self) -> "EmailAnalysis":
+        if self.category not in CATEGORIES_BY_VERSION[self.taxonomy_version]:
+            raise ValueError(
+                f"category {self.category!r} is not in taxonomy "
+                f"{self.taxonomy_version}"
+            )
+        return self
 
 
 _IMPORTANCE_LABEL_MAP: dict[str, int] = {

@@ -20,6 +20,7 @@ reachable DATABASE_URL) — same flags.
 
 Output: JSONL, one of
     {"message_id","category","analyzed_at","input_text"}   — a usable pair
+                     (category in the newest taxonomy, exact mappings only)
     {"message_id","deleted":true}                          — Gmail 404 tombstone
 Resumable: existing output rows (pairs AND tombstones) are skipped on
 re-run. Transient fetch errors are NOT tombstoned, so a re-run retries
@@ -36,11 +37,10 @@ import sys
 import time
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import text
 
 from zashiki_warasi.classifier import build_classifier_input
 from zashiki_warasi.core.db import get_session_factory
-from zashiki_warasi.core.models import EmailAnalysis
 from zashiki_warasi.gmail.auth import get_credentials
 from zashiki_warasi.gmail.client import GmailClient, MessageNotFoundError
 from zashiki_warasi.core.config import GmailSettings
@@ -92,18 +92,25 @@ def main() -> int:
         settings=settings,
     )
 
-    stmt = select(
-        EmailAnalysis.message_id,
-        EmailAnalysis.category,
-        EmailAnalysis.analyzed_at,
-    ).order_by(EmailAnalysis.analyzed_at)
+    # Labels come from the single read path (taxonomy v2 design D6):
+    # the current classification mapped to the newest taxonomy. Rows
+    # whose v1 → v2 mapping is approximate (is_exact = false) are not
+    # training labels and are skipped.
+    query = (
+        "SELECT v.message_id, v.category, a.analyzed_at "
+        "FROM email_category_current v "
+        "JOIN email_analyses a ON a.message_id = v.message_id "
+        "WHERE v.is_exact"
+    )
+    params: dict = {}
     if args.since:
-        stmt = stmt.where(
-            EmailAnalysis.analyzed_at >= datetime.fromisoformat(args.since)
-        )
+        query += " AND a.analyzed_at >= :since"
+        params["since"] = datetime.fromisoformat(args.since)
+    query += " ORDER BY a.analyzed_at"
     with session_factory() as session:
-        rows = session.execute(stmt).all()
-    print(f"{len(rows)} labeled rows in email_analyses", file=sys.stderr)
+        rows = session.execute(text(query), params).all()
+    print(f"{len(rows)} exact-labeled rows in email_category_current",
+          file=sys.stderr)
 
     fetched = deleted = errors = skipped = 0
     consecutive_errors = 0

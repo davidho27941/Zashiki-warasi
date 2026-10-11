@@ -175,10 +175,14 @@ def api_call(service: str, operation: str) -> Iterator[APICallCtx]:
 
 
 def observe_email_end_to_end(
-    category: str, outcome: str, duration_seconds: float
+    category: str,
+    outcome: str,
+    duration_seconds: float,
+    *,
+    taxonomy: str = "v1",
 ) -> None:
     """Record one observation into
-    `zashiki_email_end_to_end_duration_seconds{category, outcome}`.
+    `zashiki_email_end_to_end_duration_seconds{category, taxonomy, outcome}`.
 
     Called at `_notify` completion with `duration = time.time() -
     internalDate_ms / 1000`. Not a context manager because the start
@@ -186,5 +190,5 @@ def observe_email_end_to_end(
     reading — the duration is computed by the caller and passed in.
     """
     email_end_to_end_duration_seconds.labels(
-        category=category, outcome=outcome
+        category=category, taxonomy=taxonomy, outcome=outcome
     ).observe(duration_seconds)
