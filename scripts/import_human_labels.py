@@ -12,7 +12,9 @@ cutover are v2.
 
 Rejected (reported, not imported):
 - records without `"blind": true` (anchored verdicts are not ground truth);
-- a `verified` category outside the declared version;
+- a record stamped with a different `taxonomy_version` (label_review_web
+  --taxonomy writes it), or a `verified` category outside the declared
+  version;
 - message_ids with no `email_analyses` row.
 
     # copy the file into the pod, then run there (in-cluster DATABASE_URL)
@@ -71,6 +73,11 @@ def import_verdicts(
         category = record.get("verified")
         if record.get("blind") is not True:
             rejected.append(f"{mid}: not a blind verdict")
+        elif record.get("taxonomy_version", taxonomy_version) != taxonomy_version:
+            rejected.append(
+                f"{mid}: labeled under {record['taxonomy_version']}, "
+                f"declared {taxonomy_version}"
+            )
         elif category not in vocabulary:
             rejected.append(
                 f"{mid}: {category!r} not in taxonomy {taxonomy_version}"

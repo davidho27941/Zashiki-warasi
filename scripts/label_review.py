@@ -13,6 +13,9 @@ looks at them. `--suspect-only` targets exactly that population.
     uv run python scripts/label_review.py --suspect-only
     uv run python scripts/label_review.py --category 廣告 --sample 50
     uv run python scripts/label_review.py --sample 100          # random spot-check
+    uv run python scripts/label_review.py --blind \
+        --input data/relabel/phase2_candidates.jsonl \
+        --output data/relabel/phase2_verified.jsonl            # laya Phase 2 review
 
 Keys at the prompt:
     [Enter]  LLM label is correct
@@ -102,6 +105,11 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--body-chars", type=int, default=600,
                     help="input_text preview length")
+    ap.add_argument("--blind", action="store_true",
+                    help="hide all model labels and require an explicit "
+                         "category key (no Enter-to-confirm) — for LLM-vs-"
+                         "laya comparisons, where showing either label "
+                         "anchors the verdict")
     args = ap.parse_args()
 
     done = _load_verified(args.output)
@@ -131,7 +139,9 @@ def main() -> int:
     out = open(args.output, "a", encoding="utf-8")
     try:
         for i, row in enumerate(pool, 1):
-            suspect_tag = f" {YELLOW}[pre-v1.4.1 suspect]{RESET}" if _is_suspect(row) else ""
+            # The suspect tag implies the LLM said 講座資訊 — a label leak.
+            suspect_tag = (f" {YELLOW}[pre-v1.4.1 suspect]{RESET}"
+                           if _is_suspect(row) and not args.blind else "")
             print(f"{DIM}{'─' * 62}{RESET}")
             print(f"{BOLD}#{i}/{len(pool)}{RESET}  {row['message_id']}"
                   f"  {DIM}{row['analyzed_at'][:16]}{RESET}{suspect_tag}")
@@ -141,19 +151,26 @@ def main() -> int:
             if len(row["input_text"]) > args.body_chars:
                 print(f"    {DIM}… ({len(row['input_text'])} chars total){RESET}")
             print()
-            print(f"LLM label: {BOLD}{GREEN}[{row['category']}]{RESET}")
+            if not args.blind:
+                print(f"LLM label: {BOLD}{GREEN}[{row['category']}]{RESET}")
             print(_menu())
 
             note = None
             while True:
                 try:
-                    key = input(
-                        f"[Enter]=正確 [1-9/0/a-f]=更正 [s]kip [n]ote [q]uit > "
-                    ).strip().lower()
+                    prompt = (
+                        "[1-9/0/a-f]=類別 [s]kip [n]ote [q]uit > "
+                        if args.blind else
+                        "[Enter]=正確 [1-9/0/a-f]=更正 [s]kip [n]ote [q]uit > "
+                    )
+                    key = input(prompt).strip().lower()
                 except (EOFError, KeyboardInterrupt):
                     key = "q"
                 if key == "n":
                     note = input("note > ").strip() or None
+                    continue
+                if key == "" and args.blind:
+                    print(f"{YELLOW}blind mode: pick a category key{RESET}")
                     continue
                 break
 
@@ -179,13 +196,19 @@ def main() -> int:
                 "corrected": verified != row["category"],
                 "verified_at": datetime.now(tz=timezone.utc).isoformat(),
             }
+            if args.blind:
+                record["blind"] = True
+            for passthrough in ("laya_category", "laya_confidence", "bucket"):
+                if passthrough in row:
+                    record[passthrough] = row[passthrough]
             if note:
                 record["note"] = note
             out.write(json.dumps(record, ensure_ascii=False) + "\n")
             out.flush()
             if record["corrected"]:
                 corrected += 1
-                print(f"{YELLOW}→ corrected to [{verified}]{RESET}")
+                if not args.blind:
+                    print(f"{YELLOW}→ corrected to [{verified}]{RESET}")
             else:
                 confirmed += 1
     finally:

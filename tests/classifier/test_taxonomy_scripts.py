@@ -126,3 +126,16 @@ def test_find_pending_lists_only_threads_holding_an_analysis():
         saver, ["t-pending", "t-failed", "t-fresh", "t-gone"],
     )
     assert pending == [("t-pending", "消費支出", "v1")]
+
+
+def test_import_rejects_record_from_another_taxonomy(session):
+    script = _load("scripts/import_human_labels.py")
+    line = json.dumps({
+        "message_id": "m1", "verified": "其他", "blind": True,
+        "verified_at": "2026-10-05T00:00:00+00:00", "taxonomy_version": "v2",
+    }, ensure_ascii=False)
+    counts, rejected = script.import_verdicts(
+        session, script.load_verdicts([line]), "v1",
+    )
+    assert counts["rejected"] == 1
+    assert "labeled under v2, declared v1" in rejected[0]
