@@ -10,6 +10,11 @@ model label to the browser — blindness is enforced server-side.
         --output data/relabel/phase2_verified.jsonl
     # then open http://127.0.0.1:8765
 
+`--taxonomy v2` labels against the 14 taxonomy-v2 categories
+(openspec adopt-email-taxonomy-v2) and stamps `taxonomy_version` on
+every record; import with `import_human_labels.py --taxonomy-version`
+matching it. Default `v1` keeps the CLI's 16-category menu.
+
 Verdicts append to --output in the CLI's record format, so the CLI and
 the web UI can share one output file and resume each other. "Undo"
 re-labels by appending a newer record for the same message_id —
@@ -28,10 +33,13 @@ import sys
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from label_review import CATEGORIES, HOTKEYS
+from label_review import HOTKEYS
+
+from zashiki_warasi.core.schemas import CATEGORIES_BY_VERSION
 
 PASSTHROUGH = ("laya_category", "laya_confidence", "bucket")
-FLAGS = ("求職", "不確定")
+# v1 had no home for job mail; v2 has 職涯, so only 不確定 remains.
+FLAGS_BY_VERSION = {"v1": ("求職", "不確定"), "v2": ("不確定",)}
 
 
 def _load_done(path: str) -> set[str]:
@@ -46,7 +54,11 @@ def _load_done(path: str) -> set[str]:
     return done
 
 
-def make_handler(rows: dict[str, dict], order: list[str], output: str):
+def make_handler(rows: dict[str, dict], order: list[str], output: str,
+                 taxonomy: str = "v1"):
+    categories = CATEGORIES_BY_VERSION[taxonomy]
+    flags_allowed = FLAGS_BY_VERSION[taxonomy]
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # keep the terminal quiet
             pass
@@ -79,8 +91,9 @@ def make_handler(rows: dict[str, dict], order: list[str], output: str):
                     "total": len(order), "done": len(order) - len(pending),
                     "rows": pending,
                     "categories": [{"key": k, "name": c}
-                                   for k, c in zip(HOTKEYS, CATEGORIES)],
-                    "flags": list(FLAGS),
+                                   for k, c in zip(HOTKEYS, categories)],
+                    "flags": list(flags_allowed),
+                    "taxonomy": taxonomy,
                 })
             else:
                 self._send(404, b"not found", "text/plain")
@@ -94,20 +107,21 @@ def make_handler(rows: dict[str, dict], order: list[str], output: str):
                 req = json.loads(self.rfile.read(length))
                 row = rows[req["message_id"]]
                 verified = req["verified"]
-                if verified not in CATEGORIES:
+                if verified not in categories:
                     raise ValueError(f"unknown category {verified!r}")
             except (KeyError, ValueError, json.JSONDecodeError) as exc:
                 self._json(400, {"ok": False, "error": str(exc)})
                 return
 
-            flags = [f for f in req.get("flags", []) if f in FLAGS]
+            flags = [f for f in req.get("flags", []) if f in flags_allowed]
             record = {
                 "message_id": row["message_id"],
-                "llm_original": row["category"],
+                "llm_original": row.get("category"),
                 "verified": verified,
-                "corrected": verified != row["category"],
+                "corrected": verified != row.get("category"),
                 "verified_at": datetime.now(tz=timezone.utc).isoformat(),
                 "blind": True,
+                "taxonomy_version": taxonomy,
             }
             for key in PASSTHROUGH:
                 if key in row:
@@ -131,6 +145,8 @@ def main() -> int:
     ap.add_argument("--output", default="data/relabel/phase2_verified.jsonl")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--taxonomy", choices=sorted(CATEGORIES_BY_VERSION),
+                    default="v1", help="category vocabulary to label with")
     args = ap.parse_args()
 
     rows: dict[str, dict] = {}
@@ -144,7 +160,8 @@ def main() -> int:
 
     try:
         server = HTTPServer(("127.0.0.1", args.port),
-                            make_handler(rows, order, args.output))
+                            make_handler(rows, order, args.output,
+                                         args.taxonomy))
     except OSError as exc:
         if exc.errno != errno.EADDRINUSE:
             raise
@@ -155,7 +172,8 @@ def main() -> int:
               file=sys.stderr)
         return 1
     done = len(_load_done(args.output) & set(rows))
-    print(f"{len(rows)} rows ({done} already labeled) → "
+    print(f"taxonomy {args.taxonomy}: {len(rows)} rows "
+          f"({done} already labeled) → "
           f"http://127.0.0.1:{args.port}   (Ctrl-C to stop)")
     try:
         server.serve_forever()
@@ -242,7 +260,7 @@ PAGE = r"""<!doctype html>
 <body>
 <main>
   <header>
-    <h1>Relabel(盲標)</h1>
+    <h1>Relabel(盲標)<span id="tax"></span></h1>
     <div class="progress"><div id="bar" style="width:0"></div></div>
     <div class="count" id="count">…</div>
   </header>
@@ -257,6 +275,7 @@ async function load() {
   const r = await fetch("/api/state");
   const d = await r.json();
   Object.assign(S, { cats: d.categories, flags: d.flags, queue: d.rows, total: d.total, done: d.done });
+  $("#tax").textContent = " · 分類表 " + d.taxonomy;
   render();
 }
 
